@@ -34,16 +34,22 @@ from kcs.jobs.contracts import (
 )
 from kcs.jobs.errors import (
     CredentialDestroyFailedError,
+    DependencyUnavailableError,
     StateConflictError,
 )
 from kcs.jobs.lifecycle import LifecycleGate
 from kcs.jobs.provider import EMPTY_OBJECT_DIGEST, V2JobProvider
+from kcs.jobs.renderer import credential_secret_name
 from kcs.jobs.store import V2JobStore
 from kcs.jobs.transport import AgentRpcResponse, LocalWorkspaceRpcTransport, WorkspaceRpcReply
 from kcs.server.routes.jobs import create_jobs_router
 
 JOB_UID = UUID("00000000-0000-4000-8000-000000000071")
 POD_UID = UUID("00000000-0000-4000-8000-000000000072")
+REPLACEMENT_JOB_UID = UUID("00000000-0000-4000-8000-000000000073")
+SECRET_UID = UUID("00000000-0000-4000-8000-000000000074")
+REPLACEMENT_SECRET_UID = UUID("00000000-0000-4000-8000-000000000075")
+REPLACEMENT_POD_UID = UUID("00000000-0000-4000-8000-000000000076")
 NOW = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
 FIXTURES = Path(__file__).parents[2] / "openapi" / "examples" / "fixtures"
 
@@ -72,6 +78,9 @@ class _FakeKube:
         self.release_secret_create = Event()
         self.owner_gc_completed = False
         self.lifecycle_accesses_after_owner_gc: list[str] = []
+        self.pause_action_phase: tuple[str, str] | None = None
+        self.action_phase_persisted = Event()
+        self.release_action_phase = Event()
 
     def create_config_map(self, body: object) -> object:
         value = deepcopy(body)
@@ -123,6 +132,9 @@ class _FakeKube:
                 "cleanupPhase": value.get("data", {}).get("cleanupPhase"),
             }
         )
+        if self.pause_action_phase == (value.get("data", {}).get("kind"), payload.get("state")):
+            self.action_phase_persisted.set()
+            assert self.release_action_phase.wait(timeout=2)
         return deepcopy(value)
 
     def delete_config_map(self, name: str) -> bool:
@@ -181,9 +193,24 @@ class _FakeKube:
             self.pods[0]["status"]["container_statuses"] = self._statuses()
         return [deepcopy(item) for item in self.pods]
 
-    def delete_job(self, job_ref: str) -> None:
+    def delete_job(self, job_ref: str, job_uid: str | None = None) -> None:
         del job_ref
-        self.events.append({"kind": "Job", "verb": "delete", "propagation": "Foreground"})
+        observed_uid = (
+            str(self.job.get("metadata", {}).get("uid")) if self.job is not None else None
+        )
+        delete_event = {
+            "kind": "Job",
+            "verb": "delete",
+            "propagation": "Foreground",
+            "uidPrecondition": job_uid,
+            "observedUid": observed_uid,
+        }
+        if job_uid is not None and observed_uid is not None and observed_uid != job_uid:
+            delete_event["result"] = "uid-precondition-conflict"
+            self.events.append(delete_event)
+            raise _ConflictError()
+        delete_event["result"] = "accepted" if self.job is not None else "already-absent"
+        self.events.append(delete_event)
         if self.fail_job_delete_once:
             self.fail_job_delete_once = False
             self.job = None
@@ -205,6 +232,7 @@ class _FakeKube:
         value = deepcopy(body)
         assert isinstance(value, dict)
         name = value["metadata"]["name"]
+        value["metadata"].setdefault("uid", str(SECRET_UID))
         if self.pause_secret_create:
             self.secret_create_claimed.set()
             assert self.release_secret_create.wait(timeout=2)
@@ -216,8 +244,23 @@ class _FakeKube:
         value = self.secrets.get(name)
         return deepcopy(value) if value is not None else None
 
-    def delete_secret(self, name: str) -> bool:
-        self.events.append({"kind": "Secret", "verb": "delete", "name": name})
+    def delete_secret(self, name: str, secret_uid: str | None = None) -> bool:
+        observed_uid = (
+            str(self.secrets[name].get("metadata", {}).get("uid")) if name in self.secrets else None
+        )
+        delete_event = {
+            "kind": "Secret",
+            "verb": "delete",
+            "name": name,
+            "uidPrecondition": secret_uid,
+            "observedUid": observed_uid,
+        }
+        if secret_uid is not None and observed_uid is not None and observed_uid != secret_uid:
+            delete_event["result"] = "uid-precondition-conflict"
+            self.events.append(delete_event)
+            raise _ConflictError()
+        delete_event["result"] = "accepted" if observed_uid is not None else "already-absent"
+        self.events.append(delete_event)
         if self.linger_secret_once:
             self.linger_secret_once = False
             return False
@@ -736,16 +779,74 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     )
     with pytest.raises(StateConflictError):
         stale_finalize_close.phase("credentials_revoked")
-    close_gap_report = _provider(
+    reserved_kube.pause_action_phase = ("finalize", "succeeded")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        close_gap_future = pool.submit(
+            _provider(
+                reserved_kube,
+                reserved_store,
+                reserved_agent,
+                reserved_workspace_transport,
+            ).reconcile_all
+        )
+        assert reserved_kube.action_phase_persisted.wait(timeout=2)
+        terminal_finalize_close = LifecycleGate(reserved_store).begin_close(
+            "job-1",
+            str(JOB_UID),
+            str(POD_UID),
+            "finalize",
+            "finalize-close-gap",
+            canonical_digest(retained_finalize),
+            retained_finalize.model_dump_json(by_alias=True),
+        )
+        reserved_kube.release_action_phase.set()
+        close_gap_report = close_gap_future.result(timeout=2)
+        terminal_finalize_close.phase("succeeded", closed=True)
+    assert close_gap_report.indeterminate == 1
+    recovered_finalize = reserved_store.read_runtime("finalize", "job-1", "slot")
+    assert recovered_finalize is not None
+    assert json.loads(recovered_finalize.values["payload"])["state"] == "succeeded"
+    finalize_replay_report = _provider(
         reserved_kube,
         reserved_store,
         reserved_agent,
         reserved_workspace_transport,
     ).reconcile_all()
-    assert close_gap_report.reconciled == 1
-    recovered_finalize = reserved_store.read_runtime("finalize", "job-1", "slot")
-    assert recovered_finalize is not None
-    assert json.loads(recovered_finalize.values["payload"])["state"] == "succeeded"
+    assert finalize_replay_report.indeterminate == 0
+    assert (
+        _provider(
+            reserved_kube,
+            reserved_store,
+            reserved_agent,
+            reserved_workspace_transport,
+        )
+        .inspect("job-1")
+        .finalize_action.state.value
+        == "succeeded"
+    )
+    absent_root = tmp_path / "absent-live-delete"
+    absent_root.mkdir()
+    absent_kube, absent_store, _, _, absent_provider = _setup(absent_root)
+    absent_provider.create(_create_request())
+    absent_kube.job = None
+    absent_kube.pods = []
+    absent_delete_event_start = len(absent_kube.events)
+    for _ in range(2):
+        with pytest.raises(DependencyUnavailableError):
+            absent_provider.delete("job-1", "delete-with-missing-job", EMPTY_OBJECT_DIGEST)
+    absent_record = absent_store.read_create("request-task-7")
+    assert absent_record is not None and absent_record.state == "indeterminate"
+    assert not absent_record.is_deleting and not absent_record.is_tombstone
+    assert not any(
+        event.get("kind") == "ConfigMap"
+        and event.get("verb") == "create"
+        and "lifecycle" in str(event.get("name"))
+        for event in absent_kube.events[absent_delete_event_start:]
+    )
+    assert not any(
+        event.get("kind") == "Job" and event.get("verb") == "delete"
+        for event in absent_kube.events[absent_delete_event_start:]
+    )
     kube, store, agent, workspace, provider = _setup(tmp_path)
     _seed_runtime(tmp_path, store, provider)
     kube.linger_secret_once = True
@@ -759,10 +860,54 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     assert interrupted.indeterminate == 1
     assert agent.stops == 1 and "agent" in kube.terminated
     recovered = _provider(kube, store, agent, workspace)
-    report = recovered.reconcile_all()
+    kube.pause_action_phase = ("cancel", "workspace_stopped")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        replacement_pod_future = pool.submit(recovered.reconcile_all)
+        assert kube.action_phase_persisted.wait(timeout=2)
+        original_pods = deepcopy(kube.pods)
+        kube.pods[0]["metadata"]["uid"] = str(REPLACEMENT_POD_UID)
+        kube.release_action_phase.set()
+        replacement_pod_report = replacement_pod_future.result(timeout=2)
+    assert replacement_pod_report.indeterminate == 1
+    replacement_pod_cancel = store.read_runtime("cancel", "job-1", "slot")
+    assert replacement_pod_cancel is not None
+    assert json.loads(replacement_pod_cancel.values["payload"])["state"] == "indeterminate"
+    kube.pods = original_pods
+    kube.pause_action_phase = ("cancel", "succeeded")
+    kube.action_phase_persisted = Event()
+    kube.release_action_phase = Event()
+    retained_cancel = _cancel()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stale_cancel_future = pool.submit(_provider(kube, store, agent, workspace).reconcile_all)
+        assert kube.action_phase_persisted.wait(timeout=2)
+        terminal_cancel_close = LifecycleGate(store).begin_close(
+            "job-1",
+            str(JOB_UID),
+            str(POD_UID),
+            "cancel",
+            retained_cancel.cancel_ref,
+            retained_cancel.request_digest,
+            retained_cancel.spec.model_dump_json(by_alias=True),
+        )
+        kube.release_action_phase.set()
+        stale_cancel_report = stale_cancel_future.result(timeout=2)
+        terminal_cancel_close.phase("succeeded", closed=True)
+    assert stale_cancel_report.indeterminate == 1
+    terminal_cancel = store.read_runtime("cancel", "job-1", "slot")
+    assert terminal_cancel is not None
+    assert json.loads(terminal_cancel.values["payload"])["state"] == "succeeded"
+    report = _provider(kube, store, agent, workspace).reconcile_all()
     assert report.indeterminate == 0
     assert recovered.inspect("job-1").binding_state == "canceled"
+    assert recovered.inspect("job-1").cancel_action.state.value == "succeeded"
     assert agent.stops == 1 and workspace.stops == 1 and not kube.secrets
+    assert any(
+        event.get("kind") == "Secret"
+        and event.get("verb") == "delete"
+        and event.get("uidPrecondition") == str(SECRET_UID)
+        and event.get("observedUid") == str(SECRET_UID)
+        for event in kube.events
+    )
 
     assert recovered.inspect_operation("job-1", "operation-task-7").state == "succeeded"
     assert recovered.inspect_transfer("job-1", "collect-authorized").state == "completed"
@@ -832,6 +977,57 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     assert kube.lifecycle_accesses_after_owner_gc == []
     assert store.read_runtime("lifecycle", "job-1", "slot") is None
     kube.lifecycle_accesses_after_owner_gc.clear()
+    replacement_secret_name = credential_secret_name("job-1")
+    kube.job = {
+        "metadata": {"name": "job-1", "uid": str(REPLACEMENT_JOB_UID)},
+        "status": {},
+    }
+    kube.secrets[replacement_secret_name] = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": replacement_secret_name,
+            "uid": str(REPLACEMENT_SECRET_UID),
+            "labels": {"researchcosmos.io/managed-by": "v2-attempt-runtime"},
+            "annotations": {"researchcosmos.io/job-uid": str(REPLACEMENT_JOB_UID)},
+            "ownerReferences": [
+                {
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "job-1",
+                    "uid": str(REPLACEMENT_JOB_UID),
+                }
+            ],
+        },
+        "data": {"credential": "replacement"},
+    }
+    replacement_event_start = len(kube.events)
+    replacement_secret_report = _provider(kube, store, agent, workspace).reconcile_all()
+    assert replacement_secret_report.indeterminate == 1
+    assert kube.job is not None
+    assert kube.job["metadata"]["uid"] == str(REPLACEMENT_JOB_UID)
+    assert replacement_secret_name in kube.secrets
+    assert not any(
+        event.get("kind") in {"Job", "Secret"} and event.get("verb") == "delete"
+        for event in kube.events[replacement_event_start:]
+    )
+    kube.secrets.pop(replacement_secret_name)
+    kube.events.append({"kind": "Secret", "verb": "replacement-external-remove"})
+    replacement_job_report = _provider(kube, store, agent, workspace).reconcile_all()
+    assert replacement_job_report.indeterminate == 1
+    assert kube.job is not None
+    assert kube.job["metadata"]["uid"] == str(REPLACEMENT_JOB_UID)
+    assert any(
+        event.get("kind") == "Job"
+        and event.get("verb") == "delete"
+        and event.get("uidPrecondition") == str(JOB_UID)
+        and event.get("observedUid") == str(REPLACEMENT_JOB_UID)
+        and event.get("result") == "uid-precondition-conflict"
+        for event in kube.events[replacement_event_start:]
+    )
+    kube.job = None
+    kube.pods = []
+    kube.events.append({"kind": "Job", "verb": "replacement-external-remove"})
     raw, metadata = _credential()
     with pytest.raises(StateConflictError):
         deletion_gap.grant_credential_result("job-1", metadata, raw)
@@ -886,7 +1082,12 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
         "JOURNEY task7 recovery",
         json.dumps(
             {
+                "absentDeleteEvents": absent_kube.events[absent_delete_event_start:],
                 "events": kube.events,
+                "finalizeEvents": reserved_kube.events,
+                "replacementPodReport": replacement_pod_report.__dict__,
+                "replacementSecretReport": replacement_secret_report.__dict__,
+                "replacementJobReport": replacement_job_report.__dict__,
                 "report": final.__dict__,
                 "tombstone": tombstone.tombstone_payload(),
             },

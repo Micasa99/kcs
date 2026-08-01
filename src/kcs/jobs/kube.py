@@ -44,8 +44,7 @@ class BatchV1Api(Protocol):
         *,
         name: str,
         namespace: str,
-        propagation_policy: str,
-        grace_period_seconds: int | None = None,
+        body: Any,
     ) -> Any: ...
 
     def patch_namespaced_job(self, *, name: str, namespace: str, body: Any) -> Any: ...
@@ -78,7 +77,7 @@ class CoreV1Api(Protocol):
 
     def read_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
 
-    def delete_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
+    def delete_namespaced_secret(self, *, name: str, namespace: str, body: Any) -> Any: ...
 
     def connect_get_namespaced_pod_exec(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
 
@@ -129,17 +128,25 @@ class V2KubeAdapter:
     def delete_job(
         self,
         job_ref: str,
+        job_uid: str,
         *,
         propagation_policy: str = "Foreground",
         grace_period_seconds: int | None = None,
     ) -> None:
         """Delete a Job and its Pod; an already absent Job is successful."""
+        delete_options: dict[str, Any] = {
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": propagation_policy,
+            "preconditions": {"uid": job_uid},
+        }
+        if grace_period_seconds is not None:
+            delete_options["gracePeriodSeconds"] = grace_period_seconds
         try:
             self._batch.delete_namespaced_job(
                 name=job_ref,
                 namespace=self.namespace,
-                propagation_policy=propagation_policy,
-                grace_period_seconds=grace_period_seconds,
+                body=delete_options,
             )
         except Exception as exc:
             if _status(exc) == 404:
@@ -303,10 +310,18 @@ class V2KubeAdapter:
                 return None
             raise
 
-    def delete_secret(self, name: str) -> bool:
+    def delete_secret(self, name: str, secret_uid: str) -> bool:
         """Request deletion and return true only after namespace-bound absence proof."""
         try:
-            self._core.delete_namespaced_secret(name=name, namespace=self.namespace)
+            self._core.delete_namespaced_secret(
+                name=name,
+                namespace=self.namespace,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": secret_uid},
+                },
+            )
         except Exception as exc:
             if _status(exc) != 404:
                 raise

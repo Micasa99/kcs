@@ -143,7 +143,7 @@ class V2KubeAdapterProtocol(Protocol):
 
     def read_job(self, job_ref: str) -> object | None: ...
 
-    def delete_job(self, job_ref: str) -> None: ...
+    def delete_job(self, job_ref: str, job_uid: str) -> None: ...
 
     def list_job_pods(self, job_ref: str, job_uid: str | None = None) -> Sequence[object]: ...
 
@@ -160,7 +160,7 @@ class V2KubeAdapterProtocol(Protocol):
 
     def read_secret(self, name: str) -> object | None: ...
 
-    def delete_secret(self, name: str) -> bool: ...
+    def delete_secret(self, name: str, secret_uid: str) -> bool: ...
 
 
 class V2JobStoreProtocol(Protocol):
@@ -1128,7 +1128,9 @@ class V2JobProvider:
                 close.phase("workspace_stopped")
                 phase = "workspace_stopped"
             if phase == "workspace_stopped":
-                if not self._roles_are_terminal(job_ref):
+                if not self._roles_are_terminal(
+                    job_ref, str(binding.job_uid), str(binding.pod_uid)
+                ):
                     raise DependencyTimeoutError(
                         "Kubernetes has not confirmed both finalized containers terminated"
                     )
@@ -1234,7 +1236,9 @@ class V2JobProvider:
                 close.phase("workspace_stopped")
                 phase = "workspace_stopped"
             if phase == "workspace_stopped":
-                if not self._roles_are_terminal(job_ref):
+                if not self._roles_are_terminal(
+                    job_ref, str(binding.job_uid), str(binding.pod_uid)
+                ):
                     raise DependencyTimeoutError(
                         "Kubernetes has not confirmed both canceled containers terminated"
                     )
@@ -1267,6 +1271,16 @@ class V2JobProvider:
         record = self._store.read_by_job_ref(job_ref)
         if record is None:
             raise JobNotFoundError
+        state = str(_field(record, "state", ""))
+        if (
+            state not in {"deleting", "deleted"}
+            and _field(record, "job_uid", None) is not None
+            and self._read_job(job_ref) is None
+        ):
+            self._mark_indeterminate(record, "the retained Job is no longer observable")
+            raise DependencyUnavailableError(
+                "delete cannot acquire a lifecycle fence after the retained Job disappeared"
+            )
         ownerless_recovery = self._requires_ownerless_delete_recovery(record)
         if _is_deleted(record):
             self._raise_if_delete_conflicts(record, delete_ref, request_digest)
@@ -1339,7 +1353,7 @@ class V2JobProvider:
             grant = self._grant_snapshot(grant_record)
             if grant.secret_present is not False:
                 self._revoke_grant(grant)
-        self._prove_secret_absent(job_ref)
+        self._prove_secret_absent(job_ref, str(_field(record, "job_uid")))
         observed_credentials, observed_transfers = self._deletion_observations(job_ref)
         credential_observations = observed_credentials or credential_observations
         transfer_observations = observed_transfers or transfer_observations
@@ -1395,7 +1409,7 @@ class V2JobProvider:
         """Finish deletion using only the ownerless deleting record after Job delete intent."""
         job_ref = str(_field(record, "job_ref"))
         observed_at = self._now()
-        self._delete_job(job_ref)
+        self._delete_job(job_ref, str(_field(record, "job_uid")))
         if not self._wait_for_job_absence(job_ref):
             raise DependencyTimeoutError("Kubernetes has not yet confirmed Job deletion")
         if self._list_job_pods(job_ref, str(_field(record, "job_uid"))):
@@ -1726,6 +1740,11 @@ class V2JobProvider:
         output_loss_possible: bool,
         reason: str,
     ) -> object:
+        current = self._store.read_runtime(
+            "cancel", str(_field(record, "job_ref")), str(_field(record, "identity"))
+        )
+        if current is not None and read_phase(current)[0] == "succeeded":
+            return current
         return self._cas_runtime_update(
             record,
             {
@@ -1739,24 +1758,28 @@ class V2JobProvider:
             },
         )
 
-    def _roles_are_terminal(self, job_ref: str) -> bool:
-        snapshot = self.inspect(job_ref)
-        roles_terminal = (
-            snapshot.agent is not None
-            and snapshot.workspace is not None
-            and snapshot.agent.state is RoleState.TERMINATED
-            and snapshot.workspace.state is RoleState.TERMINATED
-        )
+    def _roles_are_terminal(self, job_ref: str, job_uid: str, pod_uid: str) -> bool:
+        pods = self._list_job_pods(job_ref, job_uid)
+        if len(pods) != 1 or _required_text(pods[0], "metadata", "uid") != pod_uid:
+            return False
         job = self._read_job(job_ref)
-        return (
-            roles_terminal
-            and job is not None
-            and (
-                _job_condition_true(job, "Complete")
-                or _job_condition_true(job, "Failed")
-                or int(_path(job, "status", "succeeded") or 0) > 0
-                or int(_path(job, "status", "failed") or 0) > 0
-            )
+        if job is None or _required_text(job, "metadata", "uid") != job_uid:
+            return False
+        role_statuses = [
+            status
+            for status in (_path(pods[0], "status", "container_statuses") or ())
+            if _field(status, "name", None) in {"agent", "workspace"}
+        ]
+        roles_terminal = (
+            len(role_statuses) == 2
+            and {str(_field(status, "name")) for status in role_statuses} == {"agent", "workspace"}
+            and all(_path(status, "state", "terminated") is not None for status in role_statuses)
+        )
+        return roles_terminal and (
+            _job_condition_true(job, "Complete")
+            or _job_condition_true(job, "Failed")
+            or int(_path(job, "status", "succeeded") or 0) > 0
+            or int(_path(job, "status", "failed") or 0) > 0
         )
 
     def _reserve_finalize(
@@ -1911,6 +1934,11 @@ class V2JobProvider:
         )
 
     def _set_finalize_indeterminate(self, record: object, resume_from: str, reason: str) -> object:
+        current = self._store.read_runtime(
+            "finalize", str(_field(record, "job_ref")), str(_field(record, "identity"))
+        )
+        if current is not None and _finalize_phase(current) == "succeeded":
+            return current
         return self._cas_runtime_update(
             record,
             {
@@ -2077,15 +2105,9 @@ class V2JobProvider:
                 destroyed_at=grant.destroyed_at or self._now(),
             )
         try:
-            deletion = self._kube.delete_secret(credential_secret_name(grant.job_ref))
+            deletion = self._delete_bound_secret(grant.job_ref, str(grant.job_uid))
             if deletion is not True:
                 raise DependencyUnavailableError("Kubernetes Secret absence was not confirmed")
-            read_secret = getattr(self._kube, "read_secret", None)
-            if (
-                callable(read_secret)
-                and read_secret(credential_secret_name(grant.job_ref)) is not None
-            ):
-                raise DependencyUnavailableError("Kubernetes Secret remains observable")
         except Exception:
             return self._update_grant(
                 record,
@@ -2145,15 +2167,39 @@ class V2JobProvider:
         if destroyed.state is CredentialState.DESTROY_FAILED:
             raise CredentialDestroyFailedError()
 
-    def _prove_secret_absent(self, job_ref: str) -> None:
+    def _delete_bound_secret(self, job_ref: str, job_uid: str) -> bool:
         name = credential_secret_name(job_ref)
+        secret = self._kube.read_secret(name)
+        if secret is None:
+            return True
+        metadata = _field(secret, "metadata", {})
+        labels = _field(metadata, "labels", {})
+        annotations = _field(metadata, "annotations", {})
+        owner_references = _field(metadata, "owner_references", None)
+        if owner_references is None:
+            owner_references = _field(metadata, "ownerReferences", ())
+        job_owners = [owner for owner in owner_references if _field(owner, "kind", None) == "Job"]
+        if (
+            not isinstance(labels, Mapping)
+            or labels.get("researchcosmos.io/managed-by") != "v2-attempt-runtime"
+            or not isinstance(annotations, Mapping)
+            or annotations.get("researchcosmos.io/job-uid") != job_uid
+            or len(job_owners) != 1
+            or _field(job_owners[0], "name", None) != job_ref
+            or str(_field(job_owners[0], "uid", "")) != job_uid
+        ):
+            raise StateConflictError("The credential Secret is not bound to the retained Job UID")
+        secret_uid = _required_text(secret, "metadata", "uid")
+        if self._kube.delete_secret(name, secret_uid) is not True:
+            return False
+        return self._kube.read_secret(name) is None
+
+    def _prove_secret_absent(self, job_ref: str, job_uid: str) -> None:
         try:
-            deleted = self._kube.delete_secret(name)
-            read_secret = getattr(self._kube, "read_secret", None)
-            present = callable(read_secret) and read_secret(name) is not None
+            deleted = self._delete_bound_secret(job_ref, job_uid)
         except Exception as error:
             raise CredentialDestroyFailedError() from error
-        if deleted is not True or present:
+        if deleted is not True:
             raise CredentialDestroyFailedError()
 
     def _deletion_observations(
@@ -2458,9 +2504,9 @@ class V2JobProvider:
         except Exception as error:
             raise DependencyUnavailableError from error
 
-    def _delete_job(self, job_ref: str) -> None:
+    def _delete_job(self, job_ref: str, job_uid: str) -> None:
         try:
-            self._kube.delete_job(job_ref)
+            self._kube.delete_job(job_ref, job_uid)
         except Exception as error:
             if _api_status(error) != 404:
                 raise DependencyUnavailableError from error

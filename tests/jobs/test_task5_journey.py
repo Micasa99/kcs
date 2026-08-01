@@ -96,11 +96,17 @@ class _Kube:
 
     def create_secret(self, body: object) -> object:
         value = json.loads(json.dumps(body))
+        value["metadata"]["uid"] = "00000000-0000-4000-8000-000000000005"
         self.secrets[value["metadata"]["name"]] = value
         self.audit_bytes.append(b"secret-created")
         return value
 
-    def delete_secret(self, name: str) -> bool:
+    def read_secret(self, name: str) -> object | None:
+        return self.secrets.get(name)
+
+    def delete_secret(self, name: str, secret_uid: str) -> bool:
+        if name in self.secrets and self.secrets[name]["metadata"]["uid"] != secret_uid:
+            raise _ConflictError()
         self.secret_deletes += 1
         if self.secret_delete_failures:
             self.secret_delete_failures -= 1
