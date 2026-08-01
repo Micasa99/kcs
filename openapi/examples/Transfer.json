@@ -1,0 +1,9 @@
+{
+  "contentSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "direction": "stage",
+  "jobRef": "job-sanitized-001",
+  "sizeBytes": 1024,
+  "state": "registered",
+  "transferRef": "transfer-sanitized-001",
+  "verified": false
+}

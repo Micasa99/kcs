@@ -1,0 +1,8 @@
+{
+  "jobRef": "job-sanitized-001",
+  "operationRef": "operation-sanitized-001",
+  "result": {},
+  "state": "succeeded",
+  "stderr": "",
+  "stdout": "sanitized output"
+}

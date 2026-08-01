@@ -1,0 +1,7 @@
+{
+  "method": "attempt.run",
+  "spec": {
+    "providerRequestId": "attempt-sanitized-001"
+  },
+  "specDigest": "6666666666666666666666666666666666666666666666666666666666666666"
+}

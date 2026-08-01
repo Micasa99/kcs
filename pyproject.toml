@@ -30,6 +30,7 @@ dev = [
     "httpx>=0.28.0",
     "ruff>=0.3.0",
     "mypy>=1.8",
+    "jsonschema>=4.23",
 ]
 
 [project.scripts]

@@ -1,0 +1,791 @@
+openapi: 3.1.0
+info:
+  title: KCS V2 Hosted Attempt API
+  version: 2.0.0
+  description: >-
+    Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality only;
+    provider references are opaque and no research outcome is inferred.
+  x-kcs-limits:
+    ref_utf8_bytes: 256
+    environment_entries: 32
+    environment_key_utf8_bytes: 64
+    environment_value_utf8_bytes: 2048
+    launch_bytes: 1048576
+    credential_bytes: 65536
+    stdout_bytes: 65536
+    stderr_bytes: 65536
+    logs_default_bytes: 65536
+    logs_max_bytes: 1048576
+    direct_transfer_bytes: 107374182400
+    pagination_default: 50
+    pagination_max: 200
+    tombstone_retention_seconds: 604800
+    credential_ttl_default_seconds: 300
+    credential_ttl_max_seconds: 900
+servers:
+  - url: /
+security:
+  - serviceBearer: []
+tags:
+  - name: Jobs
+  - name: Credentials
+  - name: Transfers
+  - name: Workspace
+  - name: Contract
+paths:
+  /api/v2/jobs:
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateJobRequest'}
+      responses:
+        '201':
+          description: Created from the canonicalized spec digest.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '400': &Error400
+          description: Malformed request.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '401': &Error401
+          description: Missing or invalid service bearer token.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '403': &Error403
+          description: Authenticated caller is not authorized.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '409': &Error409
+          description: Idempotency or current-state conflict.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '413': &Error413
+          description: Payload exceeds a frozen limit.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '415': &Error415
+          description: Unsupported content type.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '422': &Error422
+          description: Semantically invalid request.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '429': &Error429
+          description: Capacity or rate limit reached.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '500': &Error500
+          description: Sanitized internal failure.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '503': &Error503
+          description: Runtime dependency unavailable.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '504': &Error504
+          description: Runtime dependency timed out.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      parameters:
+        - $ref: '#/components/parameters/PageToken'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Namespace-scoped live jobs and retained tombstones.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobList'}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    get:
+      tags: [Jobs]
+      operationId: inspectJob
+      responses:
+        '200':
+          description: Current job or retained tombstone.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': &Error404
+          description: Resource is not known in this namespace.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '410': &Error410
+          description: Resource existed but its retained representation is gone.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '500': *Error500
+        '503': *Error503
+    delete:
+      tags: [Jobs]
+      operationId: deleteJob
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Workload reality removed and tombstone retained.
+          content: {application/json: {schema: {$ref: '#/components/schemas/DeleteJobResponse'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/logs:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    get:
+      tags: [Jobs]
+      operationId: getRoleLogs
+      parameters:
+        - $ref: '#/components/parameters/Container'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/LogLimit'
+      responses:
+        '200':
+          description: Bounded role logs.
+          content: {application/json: {schema: {$ref: '#/components/schemas/RoleLogs'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '413': *Error413
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/agent/credential-grants:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Credentials]
+      operationId: grantCredential
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CredentialGrantRequest'}
+      responses:
+        '201':
+          description: At most one active agent-only credential projection.
+          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrant'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '413': *Error413
+        '415': *Error415
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+      - $ref: '#/components/parameters/CredentialGrantRef'
+    get:
+      tags: [Credentials]
+      operationId: inspectCredentialGrant
+      responses:
+        '200':
+          description: Sanitized grant lifecycle, including deletion failure.
+          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrant'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '410': *Error410
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/agent/start:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Jobs]
+      operationId: startAgent
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AgentStartRequest'}
+      responses:
+        '202':
+          description: Launch accepted by the agent supervisor.
+          content: {application/json: {schema: {$ref: '#/components/schemas/AgentStartResponse'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '413': *Error413
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/transfers:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Transfers]
+      operationId: registerTransfer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransferRegisterRequest'}
+      responses:
+        '201':
+          description: Direct transfer registered.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '413': *Error413
+        '415': *Error415
+        '422': *Error422
+        '429': *Error429
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/transfers/{transferRef}:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+      - $ref: '#/components/parameters/TransferRef'
+    get:
+      tags: [Transfers]
+      operationId: inspectTransfer
+      responses:
+        '200':
+          description: Transfer control state.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '410': *Error410
+        '500': *Error500
+        '503': *Error503
+    delete:
+      tags: [Transfers]
+      operationId: discardTransfer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Staged or snapshot content discarded.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/transfers/{transferRef}/content:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+      - $ref: '#/components/parameters/TransferRef'
+    put:
+      tags: [Transfers]
+      operationId: putTransferContent
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, maxLength: 107374182400}
+      responses:
+        '200':
+          description: Staged, validated, and atomically renamed.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '413': *Error413
+        '415': *Error415
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+    get:
+      tags: [Transfers]
+      operationId: getTransferContent
+      responses:
+        '200':
+          description: Authorized immutable snapshot with verified digest.
+          headers:
+            X-Content-SHA256:
+              schema: {$ref: '#/components/schemas/Sha256'}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary, maxLength: 107374182400}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '410': *Error410
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+      - $ref: '#/components/parameters/TransferRef'
+    post:
+      tags: [Transfers]
+      operationId: cancelTransfer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TransferCancelRequest'}}}
+      responses:
+        '200':
+          description: Transfer cancellation state.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/workspace/invoke:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Workspace]
+      operationId: invokeWorkspace
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceInvokeRequest'}}}
+      responses:
+        '202':
+          description: Invocation accepted by the workspace sidecar.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperation'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '413': *Error413
+        '422': *Error422
+        '429': *Error429
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/operations/{operationRef}:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+      - $ref: '#/components/parameters/OperationRef'
+    get:
+      tags: [Workspace]
+      operationId: inspectWorkspaceOperation
+      responses:
+        '200':
+          description: Current operation state and bounded output.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperation'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '410': *Error410
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/finalize:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Jobs]
+      operationId: finalizeJob
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/FinalizeJobRequest'}}}
+      responses:
+        '200':
+          description: Successful provider work quiesced; terminal reality retained.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobRef'
+    post:
+      tags: [Jobs]
+      operationId: cancelJob
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CancelJobRequest'}}}
+      responses:
+        '200':
+          description: Provider work interrupted; outputs may be incomplete or lost.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/openapi.json:
+    get:
+      tags: [Contract]
+      operationId: getCanonicalOpenApi
+      responses:
+        '200':
+          description: Canonical OpenAPI 3.1 document.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenApiDocument'}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+components:
+  securitySchemes:
+    serviceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque service token
+      description: Fail-closed token from KCS_V2_SERVICE_TOKEN over TLS/private ingress.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {$ref: '#/components/schemas/ActionId'}
+    JobRef:
+      name: jobRef
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/ResourceId'}
+    CredentialGrantRef:
+      name: credentialGrantRef
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/ResourceId'}
+    TransferRef:
+      name: transferRef
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/ResourceId'}
+    OperationRef:
+      name: operationRef
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/ResourceId'}
+    Container:
+      name: container
+      in: query
+      required: true
+      schema: {type: string, enum: [agent, workspace]}
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string, maxLength: 1024}
+    PageToken:
+      name: page_token
+      in: query
+      schema: {type: string, maxLength: 1024}
+    PageSize:
+      name: page_size
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    LogLimit:
+      name: limitBytes
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 1048576, default: 65536}
+  responses:
+    BadRequest: *Error400
+    Unauthorized: *Error401
+    Forbidden: *Error403
+    NotFound: *Error404
+    Gone: *Error410
+    Conflict: *Error409
+    TooLarge: *Error413
+    UnsupportedMediaType: *Error415
+    Unprocessable: *Error422
+    TooManyRequests: *Error429
+    InternalError: *Error500
+    Unavailable: *Error503
+    Timeout: *Error504
+  schemas:
+    ResourceId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9][a-z0-9-]*$'
+    ActionId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
+    OpaqueRef:
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: '^[^\u0000-\u001f\u007f]+$'
+      x-kcs-maxUtf8Bytes: 256
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+    Timestamp:
+      type: string
+      format: date-time
+    Environment:
+      type: object
+      maxProperties: 32
+      propertyNames:
+        type: string
+        maxLength: 64
+        pattern: '^(LANG|LC_ALL|TZ|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|RC_PUBLIC_RUNTIME_BASE_URL)$'
+        x-kcs-maxUtf8Bytes: 64
+      additionalProperties:
+        type: string
+        maxLength: 2048
+        x-kcs-maxUtf8Bytes: 2048
+    AgentResources:
+      type: object
+      additionalProperties: false
+      properties:
+        cpu_millicores: {type: integer, minimum: 1, maximum: 8000, default: 1000}
+        memory_mib: {type: integer, minimum: 1, maximum: 32768, default: 2048}
+        gpu: {type: integer, minimum: 0, maximum: 0, default: 0}
+    WorkspaceResources:
+      type: object
+      additionalProperties: false
+      properties:
+        cpu_millicores: {type: integer, minimum: 1, maximum: 64000, default: 2000}
+        memory_mib: {type: integer, minimum: 1, maximum: 262144, default: 8192}
+        gpu: {type: integer, minimum: 0, maximum: 8, default: 0}
+        storage_gib: {type: integer, minimum: 1, maximum: 100, default: 20}
+    AgentSpec:
+      type: object
+      additionalProperties: false
+      required: [image]
+      properties:
+        image:
+          type: string
+          pattern: '^.+@sha256:[0-9a-f]{64}$'
+          maxLength: 512
+        env: {$ref: '#/components/schemas/Environment'}
+        resources: {$ref: '#/components/schemas/AgentResources'}
+    WorkspaceSpec:
+      type: object
+      additionalProperties: false
+      required: [image]
+      properties:
+        image:
+          type: string
+          pattern: '^.+@sha256:[0-9a-f]{64}$'
+          maxLength: 512
+        env: {$ref: '#/components/schemas/Environment'}
+        resources: {$ref: '#/components/schemas/WorkspaceResources'}
+    JobSpec:
+      type: object
+      additionalProperties: false
+      required: [providerRequestId, agent, workspace]
+      properties:
+        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
+        agent: {$ref: '#/components/schemas/AgentSpec'}
+        workspace: {$ref: '#/components/schemas/WorkspaceSpec'}
+    CreateJobRequest:
+      type: object
+      additionalProperties: false
+      required: [spec]
+      properties:
+        spec: {$ref: '#/components/schemas/JobSpec'}
+        deadlineSeconds: {type: integer, minimum: 1, maximum: 86400, default: 21600}
+    Job:
+      type: object
+      additionalProperties: false
+      required: [jobRef, state, specDigest, createdAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        state:
+          type: string
+          enum: [provisioning, running, finalizing, succeeded, failed, canceling, canceled, indeterminate, deleted]
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        updatedAt: {$ref: '#/components/schemas/Timestamp'}
+        podUid:
+          oneOf:
+            - {type: string, format: uuid}
+            - {type: 'null'}
+        provisioningMessage:
+          oneOf:
+            - {type: string, maxLength: 1024}
+            - {type: 'null'}
+        outputLossPossible: {type: boolean, default: false}
+        tombstoneExpiresAt:
+          oneOf:
+            - {$ref: '#/components/schemas/Timestamp'}
+            - {type: 'null'}
+    JobList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Job'}}
+        nextPageToken:
+          oneOf:
+            - {type: string, maxLength: 1024}
+            - {type: 'null'}
+    RoleLogs:
+      type: object
+      additionalProperties: false
+      required: [jobRef, container, stdout, stderr, truncated]
+      properties:
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        container: {type: string, enum: [agent, workspace]}
+        stdout: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
+        stderr: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
+        truncated: {type: boolean}
+    CredentialGrantRequest:
+      type: object
+      additionalProperties: false
+      required: [credential, credentialSha256]
+      properties:
+        credential:
+          type: string
+          contentEncoding: base64
+          maxLength: 87384
+          x-kcs-maxDecodedBytes: 65536
+        credentialSha256: {$ref: '#/components/schemas/Sha256'}
+        ttlSeconds: {type: integer, minimum: 1, maximum: 900, default: 300}
+    CredentialGrant:
+      type: object
+      additionalProperties: false
+      required: [credentialGrantRef, jobRef, state, expiresAt]
+      properties:
+        credentialGrantRef: {$ref: '#/components/schemas/ResourceId'}
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        state: {type: string, enum: [pending, projected, acknowledged, deletion_failed, expired]}
+        mountPath: {type: string, const: /var/run/kcs/credential}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        deletionError:
+          oneOf:
+            - {type: string, maxLength: 1024}
+            - {type: 'null'}
+    AgentStartRequest:
+      type: object
+      additionalProperties: false
+      required: [launch, launchSha256]
+      properties:
+        launch: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
+        launchSha256: {$ref: '#/components/schemas/Sha256'}
+    AgentStartResponse:
+      type: object
+      additionalProperties: false
+      required: [jobRef, accepted]
+      properties:
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        accepted: {type: boolean, const: true}
+    TransferRegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [direction, path, sizeBytes, contentSha256]
+      properties:
+        direction: {type: string, enum: [stage, collect]}
+        path: {type: string, minLength: 1, maxLength: 4096, pattern: '^/workspace(?:/.*)?$'}
+        sizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
+        contentSha256: {$ref: '#/components/schemas/Sha256'}
+        mode: {type: string, const: direct}
+    Transfer:
+      type: object
+      additionalProperties: false
+      required: [transferRef, jobRef, direction, state, sizeBytes, contentSha256]
+      properties:
+        transferRef: {$ref: '#/components/schemas/ResourceId'}
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        direction: {type: string, enum: [stage, collect]}
+        state: {type: string, enum: [registered, staging, available, streaming, completed, canceling, canceled, discarded, failed]}
+        sizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
+        contentSha256: {$ref: '#/components/schemas/Sha256'}
+        verified: {type: boolean}
+    TransferCancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: {$ref: '#/components/schemas/OpaqueRef'}
+    WorkspaceInvokeRequest:
+      type: object
+      additionalProperties: false
+      required: [method, spec, specDigest]
+      properties:
+        method: {type: string, minLength: 1, maxLength: 128, pattern: '^[a-z][a-z0-9._-]*$'}
+        spec: {type: object, maxProperties: 64}
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+    WorkspaceOperation:
+      type: object
+      additionalProperties: false
+      required: [operationRef, jobRef, state]
+      properties:
+        operationRef: {$ref: '#/components/schemas/ResourceId'}
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        state: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
+        stdout: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
+        stderr: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
+        result: {type: object, maxProperties: 64}
+    FinalizeJobRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        providerResultRef: {$ref: '#/components/schemas/OpaqueRef'}
+    CancelJobRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: {$ref: '#/components/schemas/OpaqueRef'}
+    DeleteJobResponse:
+      type: object
+      additionalProperties: false
+      required: [jobRef, state, tombstoneExpiresAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        state: {type: string, const: deleted}
+        tombstoneExpiresAt: {$ref: '#/components/schemas/Timestamp'}
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [field, reason]
+      properties:
+        field: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 1024}
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable, requestId]
+          properties:
+            code: {type: string, minLength: 1, maxLength: 64, pattern: '^[A-Z][A-Z0-9_]*$'}
+            message: {type: string, minLength: 1, maxLength: 1024}
+            retryable: {type: boolean}
+            requestId: {$ref: '#/components/schemas/ResourceId'}
+            details: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/ErrorDetail'}}
+    OpenApiDocument:
+      type: object
+      additionalProperties: true
+      required: [openapi, info, paths]
+      properties:
+        openapi: {type: string, const: 3.1.0}
+        info: {type: object}
+        paths: {type: object}
