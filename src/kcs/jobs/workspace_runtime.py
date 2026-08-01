@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import os
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,10 +65,30 @@ class RuntimeStoreProtocol(Protocol):
         self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
     ) -> object: ...
 
+    def compare_and_swap_runtime(
+        self,
+        kind: str,
+        job_ref: str,
+        identity: str,
+        values: Mapping[str, str],
+        *,
+        expected_resource_version: str,
+    ) -> object | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class TransferResult:
     snapshot: TransferSnapshot
+    created: bool
+
+    @property
+    def replayed(self) -> bool:
+        return not self.created
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOperationResult:
+    snapshot: WorkspaceOperationSnapshot
     created: bool
 
     @property
@@ -192,7 +213,18 @@ class WorkspaceRuntime:
                     "observed_at": self._clock(),
                 }
             )
-            record = self._write_transfer(record, staging)
+            record, retained_staging, changed = self._cas_transfer(record, staging)
+            if not changed:
+                if retained_staging.state is TransferState.COMPLETED:
+                    if (
+                        retained_staging.actual_size_bytes != actual_size
+                        or retained_staging.actual_sha256 != actual_digest
+                    ):
+                        raise TransferBytesMismatchError()
+                    return retained_staging
+                if retained_staging.state is not TransferState.STAGING:
+                    raise StateConflictError("The transfer changed while content was staged")
+                raise DependencyUnavailableError("transfer staging is already in flight")
             reply = self._rpc_checked(binding, self._transfer_header("stage", snapshot), path)
             return self._complete_transfer(record, staging, reply, snapshot_ref=None)
         finally:
@@ -219,8 +251,12 @@ class WorkspaceRuntime:
                     "observed_at": self._clock(),
                 }
             )
-            record = self._write_transfer(record, streaming)
-            snapshot = streaming
+            record, snapshot, changed = self._cas_transfer(record, streaming)
+            if not changed and snapshot.state not in {
+                TransferState.STREAMING,
+                TransferState.COMPLETED,
+            }:
+                raise StateConflictError("The transfer changed before collection")
         reply = self._rpc_checked(binding, self._transfer_header("collect", snapshot))
         content = reply.content_path
         if content is None:
@@ -286,8 +322,19 @@ class WorkspaceRuntime:
                     ),
                 }
             )
-            record = self._write_transfer(record, accepted)
-            created = True
+            record, retained, created = self._cas_transfer(record, accepted)
+            if not created:
+                current_action = retained.cancel_action
+                if (
+                    current_action.action_ref != request.cancel_ref
+                    or current_action.request_digest != request.request_digest
+                ):
+                    raise TransferIdentityConflictError()
+                if current_action.state is ActionState.SUCCEEDED:
+                    return TransferResult(retained, created=False)
+                if current_action.state is not ActionState.ACCEPTED:
+                    raise StateConflictError("The transfer changed before cancellation")
+                accepted = retained
         self._rpc_checked(
             binding,
             {
@@ -311,9 +358,10 @@ class WorkspaceRuntime:
                 ),
             }
         )
-        return TransferResult(
-            self._transfer_snapshot(self._write_transfer(record, canceled)), created
-        )
+        _, retained, _ = self._cas_transfer(record, canceled)
+        if retained.cancel_action.state is not ActionState.SUCCEEDED:
+            raise DependencyUnavailableError("transfer cancellation changed concurrently")
+        return TransferResult(retained, created)
 
     def discard_transfer(
         self,
@@ -350,7 +398,19 @@ class WorkspaceRuntime:
                     ),
                 }
             )
-            record = self._write_transfer(record, accepted)
+            record, retained, changed = self._cas_transfer(record, accepted)
+            if not changed:
+                current_action = retained.discard_action
+                if (
+                    current_action.action_ref != discard_ref
+                    or current_action.request_digest != request_digest
+                ):
+                    raise TransferIdentityConflictError()
+                if current_action.state is ActionState.SUCCEEDED:
+                    return retained
+                if current_action.state is not ActionState.ACCEPTED:
+                    raise StateConflictError("The transfer changed before discard")
+                accepted = retained
         self._rpc_checked(
             binding,
             {
@@ -373,11 +433,14 @@ class WorkspaceRuntime:
                 ),
             }
         )
-        return self._transfer_snapshot(self._write_transfer(record, discarded))
+        _, retained, _ = self._cas_transfer(record, discarded)
+        if retained.discard_action.state is not ActionState.SUCCEEDED:
+            raise DependencyUnavailableError("transfer discard changed concurrently")
+        return retained
 
     def invoke_workspace(
         self, job_ref: str, request: WorkspaceInvokeRequest
-    ) -> WorkspaceOperationSnapshot:
+    ) -> WorkspaceOperationResult:
         binding = self._live_binding(job_ref)
         if str(binding.job_uid) != str(request.job_uid) or str(_pod_uid(binding)) != str(
             request.pod_uid
@@ -395,8 +458,10 @@ class WorkspaceRuntime:
             }:
                 if retained.state is OperationState.INDETERMINATE:
                     raise OperationIndeterminateError()
-                return retained
-            return self._recover_operation(existing, retained, binding)
+                return WorkspaceOperationResult(retained, created=False)
+            return WorkspaceOperationResult(
+                self._recover_operation(existing, retained, binding), created=False
+            )
         self._assert_binding_accepts_new_work(job_ref, binding)
         now = self._clock()
         accepted = WorkspaceOperationSnapshot(
@@ -437,7 +502,9 @@ class WorkspaceRuntime:
         retained = self._operation_snapshot(record)
         self._validate_operation_identity(retained, request, frame_digest, binding)
         if not created:
-            return self._recover_operation(record, retained, binding)
+            return WorkspaceOperationResult(
+                self._recover_operation(record, retained, binding), created=False
+            )
         try:
             reply = self._rpc_checked(
                 binding,
@@ -455,7 +522,9 @@ class WorkspaceRuntime:
             raise DependencyUnavailableError(
                 "workspace invoke response was not confirmed"
             ) from error
-        return self._record_operation_result(record, retained, reply)
+        return WorkspaceOperationResult(
+            self._record_operation_result(record, retained, reply), created=True
+        )
 
     def inspect_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
         record = self._store.read_runtime("operation", job_ref, operation_ref)
@@ -463,37 +532,190 @@ class WorkspaceRuntime:
             raise JobNotFoundError()
         return self._operation_snapshot(record)
 
+    def reconcile_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
+        record = self._store.read_runtime("operation", job_ref, operation_ref)
+        if record is None:
+            raise JobNotFoundError()
+        retained = self._operation_snapshot(record)
+        binding = self._live_binding(job_ref)
+        if str(retained.binding.job_uid) != str(binding.job_uid) or str(
+            retained.binding.pod_uid
+        ) != str(_pod_uid(binding)):
+            raise StateConflictError("Workspace operation binding is stale")
+        if retained.state in {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.INDETERMINATE,
+        }:
+            return retained
+        return self._recover_operation(record, retained, binding)
+
+    def reconcile_transfer(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
+        record = self._transfer_record(job_ref, transfer_ref)
+        retained = self._transfer_snapshot(record)
+        binding = self._binding_for_existing(retained)
+        pending_action = (
+            retained.cancel_action.state is ActionState.ACCEPTED
+            or retained.discard_action.state is ActionState.ACCEPTED
+        )
+        if retained.state in {
+            TransferState.CANCELED,
+            TransferState.DISCARDED,
+            TransferState.FAILED,
+            TransferState.INDETERMINATE,
+        } or (retained.state is TransferState.COMPLETED and not pending_action):
+            return retained
+        for attempt in range(20):
+            reply = self._rpc_checked(
+                binding,
+                {"action": "inspectTransfer", "transferRef": transfer_ref},
+            )
+            if reply.header.get("known") is True:
+                if reply.header.get("requestDigest") != retained.request_digest:
+                    raise TransferIdentityConflictError()
+                return self._record_transfer_truth(record, retained, reply)
+            if retained.state is TransferState.REGISTERED:
+                return retained
+            if attempt < 19:
+                time.sleep(0.005)
+                refreshed = self._transfer_record(job_ref, transfer_ref)
+                refreshed_snapshot = self._transfer_snapshot(refreshed)
+                if refreshed_snapshot != retained:
+                    record, retained = refreshed, refreshed_snapshot
+                    pending_action = (
+                        retained.cancel_action.state is ActionState.ACCEPTED
+                        or retained.discard_action.state is ActionState.ACCEPTED
+                    )
+                    if retained.state in {
+                        TransferState.CANCELED,
+                        TransferState.DISCARDED,
+                        TransferState.FAILED,
+                        TransferState.INDETERMINATE,
+                    } or (retained.state is TransferState.COMPLETED and not pending_action):
+                        return retained
+                continue
+            now = self._clock()
+            indeterminate = TransferSnapshot.model_validate(
+                {
+                    **retained.model_dump(by_alias=False),
+                    "state": TransferState.INDETERMINATE,
+                    "content_available": False,
+                    "snapshot_ref": None,
+                    "updated_at": now,
+                    "completed_at": now,
+                    "observed_at": now,
+                    "failure_reason": "the surviving workspace sidecar has no transfer truth",
+                }
+            )
+            _, current, _ = self._cas_transfer(record, indeterminate)
+            return current
+        raise DependencyUnavailableError("workspace transfer recovery did not converge")
+
+    def _record_transfer_truth(
+        self,
+        record: object,
+        before: TransferSnapshot,
+        reply: WorkspaceRpcReply,
+    ) -> TransferSnapshot:
+        state = reply.header.get("state")
+        now = self._clock()
+        if state == "completed":
+            snapshot_ref = reply.header.get("snapshotRef")
+            if before.spec.direction is TransferDirection.COLLECT_OUTPUT:
+                snapshot_ref = _required_string(reply.header, "snapshotRef")
+            elif snapshot_ref is not None:
+                raise TransferBytesMismatchError()
+            return self._complete_transfer(record, before, reply, snapshot_ref=snapshot_ref)
+        updates: dict[str, object] = {
+            "content_available": False,
+            "updated_at": now,
+            "completed_at": now,
+            "observed_at": now,
+            "failure_reason": None,
+        }
+        if state == "canceled" and before.cancel_action.state is ActionState.ACCEPTED:
+            updates.update(
+                {
+                    "state": TransferState.CANCELED,
+                    "cancel_action": before.cancel_action.model_copy(
+                        update={"state": ActionState.SUCCEEDED, "observed_at": now}
+                    ),
+                }
+            )
+        elif state == "discarded" and before.discard_action.state is ActionState.ACCEPTED:
+            updates.update(
+                {
+                    "state": TransferState.DISCARDED,
+                    "snapshot_ref": None,
+                    "discard_action": before.discard_action.model_copy(
+                        update={"state": ActionState.SUCCEEDED, "observed_at": now}
+                    ),
+                }
+            )
+        else:
+            raise TransferIndeterminateError()
+        terminal = TransferSnapshot.model_validate({**before.model_dump(by_alias=False), **updates})
+        _, retained, _ = self._cas_transfer(record, terminal)
+        return retained
+
     def _recover_operation(
         self,
         record: object,
         retained: WorkspaceOperationSnapshot,
         binding: JobBindingSnapshot,
     ) -> WorkspaceOperationSnapshot:
-        reply = self._rpc_checked(
-            binding,
-            {"action": "inspectOperation", "operationRef": retained.operation_ref},
-            identity_kind="operation",
-        )
-        if reply.header.get("known") is True:
-            if reply.header.get("requestDigest") != retained.request_digest:
-                raise OperationIdentityConflictError()
-            return self._record_operation_result(record, retained, reply)
-        now = self._clock()
-        indeterminate = retained.model_copy(
-            update={
-                "state": OperationState.INDETERMINATE,
-                "finished_at": now,
-                "observed_at": now,
-                "failure_reason": "the surviving workspace sidecar has no operation truth",
-            }
-        )
-        self._store.update_runtime(
-            "operation",
-            retained.job_ref,
-            retained.operation_ref,
-            {**_values(record), "payload": indeterminate.model_dump_json(by_alias=True)},
-        )
-        raise OperationIndeterminateError()
+        for attempt in range(20):
+            current = self._operation_snapshot(record)
+            if current.state in {
+                OperationState.SUCCEEDED,
+                OperationState.FAILED,
+                OperationState.INDETERMINATE,
+            }:
+                if current.state is OperationState.INDETERMINATE:
+                    raise OperationIndeterminateError()
+                return current
+            reply = self._rpc_checked(
+                binding,
+                {"action": "inspectOperation", "operationRef": current.operation_ref},
+                identity_kind="operation",
+            )
+            if reply.header.get("known") is True:
+                if reply.header.get("requestDigest") != current.request_digest:
+                    raise OperationIdentityConflictError()
+                return self._record_operation_result(record, current, reply)
+            if attempt < 19:
+                time.sleep(0.005)
+                refreshed = self._store.read_runtime(
+                    "operation", current.job_ref, current.operation_ref
+                )
+                if refreshed is None:
+                    raise JobNotFoundError()
+                record = refreshed
+                continue
+            now = self._clock()
+            indeterminate = WorkspaceOperationSnapshot.model_validate(
+                {
+                    **current.model_dump(by_alias=False),
+                    "state": OperationState.INDETERMINATE,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "inline_result_size": None,
+                    "inline_result_digest": None,
+                    "inline_result": None,
+                    "result_transfer_ref": None,
+                    "finished_at": now,
+                    "observed_at": now,
+                    "failure_reason": "the surviving workspace sidecar has no operation truth",
+                }
+            )
+            retained_after_cas = self._cas_operation(record, indeterminate)
+            if retained_after_cas.state is not OperationState.INDETERMINATE:
+                return retained_after_cas
+            raise OperationIndeterminateError()
+        raise DependencyUnavailableError("workspace operation recovery did not converge")
 
     def _record_operation_result(
         self,
@@ -504,53 +726,79 @@ class WorkspaceRuntime:
         header = reply.header
         if header.get("requestDigest") != before.request_digest:
             raise OperationIdentityConflictError()
-        stdout, stdout_truncated = _bounded_utf8(header.get("stdout", ""))
-        stderr, stderr_truncated = _bounded_utf8(header.get("stderr", ""))
-        exit_code = header.get("exitCode")
-        if type(exit_code) is not int:
-            raise DependencyUnavailableError("workspace result exitCode is invalid")
-        state_value = header.get("state")
-        if state_value not in {"succeeded", "failed"}:
-            raise DependencyUnavailableError("workspace result state is invalid")
-        inline = header.get("inlineResult")
-        result_transfer = header.get("resultTransferRef")
-        if inline is not None and not isinstance(inline, dict):
-            raise DependencyUnavailableError("workspace inline result must be an object")
-        if inline is not None and result_transfer is not None:
-            raise DependencyUnavailableError("workspace result locations are ambiguous")
-        encoded = canonical_bytes(inline) if inline is not None else None
-        if encoded is not None and len(encoded) > 65536:
-            raise PayloadTooLargeError("Workspace inline result exceeds 64 KiB")
-        now = self._clock()
-        result = before.model_copy(
-            update={
-                "state": OperationState(str(state_value)),
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-                "inline_result_size": len(encoded) if encoded is not None else None,
-                "inline_result_digest": hashlib.sha256(encoded).hexdigest()
-                if encoded is not None
-                else None,
-                "inline_result": inline,
-                "result_transfer_ref": result_transfer,
-                "started_at": before.started_at or now,
-                "finished_at": now,
-                "observed_at": now,
-                "failure_reason": None
-                if state_value == "succeeded"
-                else "workspace exit was nonzero",
-            }
-        )
-        written = self._store.update_runtime(
-            "operation",
-            before.job_ref,
-            before.operation_ref,
-            {**_values(record), "payload": result.model_dump_json(by_alias=True)},
-        )
-        return self._operation_snapshot(written)
+        try:
+            stdout, stdout_truncated = _bounded_utf8(header.get("stdout", ""))
+            stderr, stderr_truncated = _bounded_utf8(header.get("stderr", ""))
+            exit_code = header.get("exitCode")
+            if type(exit_code) is not int:
+                raise ValueError("workspace result exitCode is invalid")
+            state_value = header.get("state")
+            if state_value not in {"succeeded", "failed"}:
+                raise ValueError("workspace result state is invalid")
+            inline = header.get("inlineResult")
+            result_transfer = header.get("resultTransferRef")
+            if inline is not None and not isinstance(inline, dict):
+                raise ValueError("workspace inline result must be an object")
+            if inline is not None and result_transfer is not None:
+                raise ValueError("workspace result locations are ambiguous")
+            encoded = canonical_bytes(inline) if inline is not None else None
+            if encoded is not None and len(encoded) > 65536:
+                raise PayloadTooLargeError("Workspace inline result exceeds 64 KiB")
+            now = self._clock()
+            result = WorkspaceOperationSnapshot.model_validate(
+                {
+                    **before.model_dump(by_alias=False),
+                    "state": OperationState(str(state_value)),
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
+                    "inline_result_size": len(encoded) if encoded is not None else None,
+                    "inline_result_digest": hashlib.sha256(encoded).hexdigest()
+                    if encoded is not None
+                    else None,
+                    "inline_result": inline,
+                    "result_transfer_ref": result_transfer,
+                    "started_at": before.started_at or now,
+                    "finished_at": now,
+                    "observed_at": now,
+                    "failure_reason": None
+                    if state_value == "succeeded"
+                    else "workspace exit was nonzero",
+                }
+            )
+        except (KcsV2Error, TypeError, ValueError) as error:
+            now = self._clock()
+            indeterminate = WorkspaceOperationSnapshot.model_validate(
+                {
+                    **before.model_dump(by_alias=False),
+                    "state": OperationState.INDETERMINATE,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "inline_result_size": None,
+                    "inline_result_digest": None,
+                    "inline_result": None,
+                    "result_transfer_ref": None,
+                    "started_at": before.started_at or now,
+                    "finished_at": now,
+                    "observed_at": now,
+                    "failure_reason": "workspace returned an invalid terminal result",
+                }
+            )
+            retained = self._cas_operation(record, indeterminate)
+            if retained.state is not OperationState.INDETERMINATE:
+                return retained
+            raise DependencyUnavailableError(
+                "workspace returned an invalid terminal result"
+            ) from error
+        retained = self._cas_operation(record, result)
+        if retained.state is OperationState.INDETERMINATE:
+            raise OperationIndeterminateError()
+        return retained
 
     def _complete_transfer(
         self,
@@ -580,7 +828,18 @@ class WorkspaceRuntime:
                 "failure_reason": None,
             }
         )
-        return self._transfer_snapshot(self._write_transfer(record, completed))
+        _, retained, changed = self._cas_transfer(record, completed)
+        if changed:
+            return retained
+        if retained.state is TransferState.COMPLETED:
+            if (
+                retained.actual_size_bytes != before.spec.declared_size_bytes
+                or retained.actual_sha256 != before.spec.content_sha256
+                or retained.snapshot_ref != snapshot_ref
+            ):
+                raise TransferBytesMismatchError()
+            return retained
+        raise StateConflictError("The transfer reached a conflicting terminal state")
 
     def _rpc_checked(
         self,
@@ -644,13 +903,47 @@ class WorkspaceRuntime:
             raise JobNotFoundError()
         return record
 
-    def _write_transfer(self, record: object, snapshot: TransferSnapshot) -> object:
-        return self._store.update_runtime(
+    def _cas_transfer(
+        self, record: object, snapshot: TransferSnapshot
+    ) -> tuple[object, TransferSnapshot, bool]:
+        written = self._store.compare_and_swap_runtime(
             "transfer",
             snapshot.job_ref,
             snapshot.transfer_ref,
             {**_values(record), "payload": snapshot.model_dump_json(by_alias=True)},
+            expected_resource_version=_resource_version(record),
         )
+        if written is not None:
+            return written, self._transfer_snapshot(written), True
+        current = self._store.read_runtime("transfer", snapshot.job_ref, snapshot.transfer_ref)
+        if current is None:
+            raise JobNotFoundError()
+        return current, self._transfer_snapshot(current), False
+
+    def _cas_operation(
+        self, record: object, snapshot: WorkspaceOperationSnapshot
+    ) -> WorkspaceOperationSnapshot:
+        resource_version = _resource_version(record)
+        written = self._store.compare_and_swap_runtime(
+            "operation",
+            snapshot.job_ref,
+            snapshot.operation_ref,
+            {**_values(record), "payload": snapshot.model_dump_json(by_alias=True)},
+            expected_resource_version=resource_version,
+        )
+        if written is not None:
+            return self._operation_snapshot(written)
+        current = self._store.read_runtime("operation", snapshot.job_ref, snapshot.operation_ref)
+        if current is None:
+            raise JobNotFoundError()
+        retained = self._operation_snapshot(current)
+        if retained.state in {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.INDETERMINATE,
+        }:
+            return retained
+        raise DependencyUnavailableError("workspace operation changed concurrently")
 
     @staticmethod
     def _transfer_snapshot(record: object) -> TransferSnapshot:
@@ -776,6 +1069,17 @@ def _values(record: object) -> dict[str, str]:
     if not isinstance(values, Mapping):
         raise DependencyUnavailableError("runtime record values are invalid")
     return {str(key): str(value) for key, value in values.items()}
+
+
+def _resource_version(record: object) -> str:
+    value = (
+        record.get("resource_version")
+        if isinstance(record, Mapping)
+        else getattr(record, "resource_version", None)
+    )
+    if not isinstance(value, str) or not value:
+        raise DependencyUnavailableError("runtime record resourceVersion is absent")
+    return value
 
 
 def _pod_uid(binding: JobBindingSnapshot) -> UUID:

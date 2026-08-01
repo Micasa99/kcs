@@ -88,7 +88,12 @@ from .transport import (
     AgentRpcTransportProtocol,
     WorkspaceRpcTransportProtocol,
 )
-from .workspace_runtime import TransferResult, VerifiedContent, WorkspaceRuntime
+from .workspace_runtime import (
+    TransferResult,
+    VerifiedContent,
+    WorkspaceOperationResult,
+    WorkspaceRuntime,
+)
 
 EMPTY_OBJECT_DIGEST = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 DEFAULT_PAGE_SIZE = 50
@@ -179,6 +184,16 @@ class V2JobStoreProtocol(Protocol):
     def update_runtime(
         self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
     ) -> object: ...
+
+    def compare_and_swap_runtime(
+        self,
+        kind: str,
+        job_ref: str,
+        identity: str,
+        values: Mapping[str, str],
+        *,
+        expected_resource_version: str,
+    ) -> object | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,7 +601,7 @@ class V2JobProvider:
 
     def invoke_workspace(
         self, job_ref: str, request: WorkspaceInvokeRequest
-    ) -> WorkspaceOperationSnapshot:
+    ) -> WorkspaceOperationResult:
         return self._workspace_runtime.invoke_workspace(job_ref, request)
 
     def inspect_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
@@ -901,6 +916,22 @@ class V2JobProvider:
         if record is None:
             raise StateConflictError(f"finalize {kind} reference is not registered")
         _validate_runtime_binding(record, str(binding.job_uid), str(binding.pod_uid))
+        values = _runtime_values(record)
+        if kind == "operation" and "frameDigest" in values:
+            return self._workspace_runtime.reconcile_operation(job_ref, identity).state.value
+        if kind == "transfer":
+            try:
+                workspace_managed = "transferRef" in json.loads(values["payload"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                workspace_managed = False
+            if workspace_managed:
+                transfer = self._workspace_runtime.reconcile_transfer(job_ref, identity)
+                if (
+                    transfer.cancel_action.state is ActionState.ACCEPTED
+                    or transfer.discard_action.state is ActionState.ACCEPTED
+                ):
+                    return "active_action"
+                return transfer.state.value
         state, _ = _validated_runtime_state(record, kind)
         return state
 

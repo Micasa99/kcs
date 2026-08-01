@@ -434,6 +434,45 @@ class V2JobStore:
             return _runtime_record_from_config_map(written)
         raise DependencyUnavailableError("runtime record changed concurrently")
 
+    def compare_and_swap_runtime(
+        self,
+        kind: str,
+        job_ref: str,
+        identity: str,
+        values: Mapping[str, str],
+        *,
+        expected_resource_version: str,
+    ) -> RuntimeRecord | None:
+        """Write exactly the runtime version the caller inspected, or report a lost CAS."""
+        current = self.read_runtime(kind, job_ref, identity)
+        if current is None:
+            raise JobNotFoundError()
+        if current.resource_version != expected_resource_version:
+            return None
+        storage_name = current.storage_name or _runtime_record_name(kind, job_ref, identity)
+        desired = RuntimeRecord(
+            kind=kind,
+            identity=identity,
+            job_ref=current.job_ref,
+            values=dict(values),
+            resource_version=current.resource_version,
+            storage_name=storage_name,
+        )
+        try:
+            written = self._kube.replace_config_map(
+                storage_name,
+                _runtime_config_map_body(
+                    desired,
+                    resource_version=expected_resource_version,
+                    storage_name=storage_name,
+                ),
+            )
+        except Exception as exc:
+            if _status(exc) == 409:
+                return None
+            raise
+        return _runtime_record_from_config_map(written)
+
     # Clear aliases used by some provider call sites.
     bind_job = mark_created
     bind_pod = bind_first_pod

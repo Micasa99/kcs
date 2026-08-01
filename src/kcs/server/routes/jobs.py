@@ -680,11 +680,6 @@ def create_jobs_router(
         job_uid: Annotated[UUID, Header(alias="KCS-Job-UID")],
         pod_uid: Annotated[UUID, Header(alias="KCS-Pod-UID")],
     ) -> Response:
-        existed = True
-        try:
-            provider.inspect_operation(job_ref, operation_ref)
-        except KcsV2Error:
-            existed = False
         result = provider.invoke_workspace(
             job_ref,
             WorkspaceInvokeRequest(
@@ -695,7 +690,7 @@ def create_jobs_router(
                 frame=payload,
             ),
         )
-        return _json_model(result, status_code=200 if existed else 202)
+        return _json_model(result.snapshot, status_code=202 if result.created else 200)
 
     @router.get(
         "/api/v2/jobs/{jobRef}/operations/{operationRef}",

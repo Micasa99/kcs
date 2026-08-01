@@ -5,19 +5,25 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import struct
 import warnings
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any, Literal
 from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
 
-from kcs.conformance.workspace_sidecar import WorkspaceSidecar
+from kcs.conformance.workspace_sidecar import WorkspaceSidecar, _serve_connection
 from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.contracts import (
+    FinalizeJobRequest,
+    FinalizeSpec,
     OperationState,
     TransferCancelRequest,
     TransferCancelSpec,
@@ -37,7 +43,12 @@ from kcs.jobs.errors import (
 )
 from kcs.jobs.provider import V2JobProvider
 from kcs.jobs.store import V2JobStore
-from kcs.jobs.transport import LocalWorkspaceRpcTransport, WorkspaceRpcReply
+from kcs.jobs.transport import (
+    AgentRpcResponse,
+    LocalWorkspaceRpcTransport,
+    WorkspaceRpcReply,
+    decode_workspace_header,
+)
 from kcs.server.routes.jobs import create_jobs_router
 
 JOB_UID = UUID("00000000-0000-4000-8000-000000000001")
@@ -70,6 +81,10 @@ class _Kube:
 
     def replace_config_map(self, name: str, body: object) -> object:
         value = json.loads(json.dumps(body))
+        if value["metadata"].get("resourceVersion") != self.maps[name]["metadata"].get(
+            "resourceVersion"
+        ):
+            raise _ConflictError()
         value["metadata"]["resourceVersion"] = str(
             int(self.maps[name]["metadata"]["resourceVersion"]) + 1
         )
@@ -115,6 +130,40 @@ class _Renderer:
         return {}
 
 
+class _GuardedSocket:
+    def __init__(self, incoming: bytes) -> None:
+        self.incoming = bytearray(incoming)
+        self.receive_sizes: list[int] = []
+        self.sent = bytearray()
+
+    def recv(self, size: int) -> bytes:
+        self.receive_sizes.append(size)
+        if not self.incoming:
+            raise AssertionError("sidecar attempted to read a rejected request body")
+        chunk = bytes(self.incoming[:size])
+        del self.incoming[:size]
+        return chunk
+
+    def sendall(self, value: bytes) -> None:
+        self.sent.extend(value)
+
+
+def _provider(
+    kube: _Kube,
+    store: V2JobStore,
+    workspace_transport: object,
+    **options: Any,
+) -> V2JobProvider:
+    return V2JobProvider(
+        kube,  # type: ignore[arg-type]
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        workspace_transport=workspace_transport,  # type: ignore[arg-type]
+        **options,
+    )
+
+
 def _setup(workspace: Path) -> tuple[_Kube, V2JobStore, WorkspaceSidecar, V2JobProvider]:
     kube = _Kube()
     store = V2JobStore(kube, clock=lambda: NOW)  # type: ignore[arg-type]
@@ -127,13 +176,7 @@ def _setup(workspace: Path) -> tuple[_Kube, V2JobStore, WorkspaceSidecar, V2JobP
     store.mark_created("request-1", str(JOB_UID))
     store.bind_first_pod("request-1", str(POD_UID))
     sidecar = WorkspaceSidecar(workspace)
-    provider = V2JobProvider(
-        kube,  # type: ignore[arg-type]
-        store,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=LocalWorkspaceRpcTransport(sidecar.dispatch),
-    )
+    provider = _provider(kube, store, LocalWorkspaceRpcTransport(sidecar.dispatch))
     return kube, store, sidecar, provider
 
 
@@ -163,6 +206,7 @@ def _transfer(
 
 def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kube, store, sidecar, provider = _setup(tmp_path)
     content = b"\x00trusted\xff\n" * 8192
@@ -180,25 +224,13 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
         provider.register_transfer("job-1", changed)
     local = LocalWorkspaceRpcTransport(sidecar.dispatch)
     lost = _LostReply(local, "stage")
-    interrupted = V2JobProvider(
-        kube,  # type: ignore[arg-type]
-        store,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=lost,
-    )
+    interrupted = _provider(kube, store, lost)
     with pytest.raises(DependencyUnavailableError, match="not confirmed"):
         interrupted.stage_transfer_content(
             "job-1", "stage-1", io.BytesIO(content), content_length=len(content)
         )
     assert interrupted.inspect_transfer("job-1", "stage-1").state == "staging"
-    provider = V2JobProvider(
-        kube,  # type: ignore[arg-type]
-        store,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=local,
-    )
+    provider = _provider(kube, store, local)
     completed = provider.stage_transfer_content(
         "job-1", "stage-1", io.BytesIO(content), content_length=len(content)
     )
@@ -214,6 +246,29 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     )
     assert sidecar.stats()["stageInstalls"] == 1
 
+    race_content = b"atomic-install"
+    race = _transfer("stage-race", TransferDirection.STAGE_INPUT, "inputs/race.bin", race_content)
+    provider.register_transfer("job-1", race)
+    real_link = os.link
+
+    def concurrent_link(source: object, target: object, **keywords: object) -> None:
+        target_fd = keywords.get("dst_dir_fd")
+        assert isinstance(target_fd, int)
+        descriptor = os.open(
+            str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=target_fd
+        )
+        with os.fdopen(descriptor, "wb") as competitor:
+            competitor.write(b"concurrent-winner")
+        real_link(source, target, **keywords)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "link", concurrent_link)
+    with pytest.raises(OverwriteForbiddenError):
+        provider.stage_transfer_content(
+            "job-1", "stage-race", io.BytesIO(race_content), content_length=len(race_content)
+        )
+    monkeypatch.undo()
+    assert (tmp_path / "inputs/race.bin").read_bytes() == b"concurrent-winner"
+
     output = b"immutable-output\x00\xff"
     (tmp_path / "outputs").mkdir()
     (tmp_path / "outputs/result.bin").write_bytes(output)
@@ -222,16 +277,26 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     first = provider.open_collected_content("job-1", "collect-1")
     assert first.path.read_bytes() == output
     (tmp_path / "outputs/result.bin").write_bytes(b"changed-after-snapshot")
-    second = provider.open_collected_content("job-1", "collect-1")
+    restarted_sidecar = WorkspaceSidecar(tmp_path)
+    restarted_provider = _provider(
+        kube, store, LocalWorkspaceRpcTransport(restarted_sidecar.dispatch)
+    )
+    second = restarted_provider.open_collected_content("job-1", "collect-1")
     assert second.snapshot_ref == first.snapshot_ref
     assert second.path.read_bytes() == output
+    receipts = list((tmp_path / ".kcs/receipts").glob("*.json"))
+    receipt = next(
+        item for item in receipts if json.loads(item.read_text())["transferRef"] == "collect-1"
+    )
+    assert receipt.stat().st_mode & 0o777 == 0o600
     first.cleanup()
     second.cleanup()
-    provider.discard_transfer("job-1", "collect-1", "discard-1", canonical_digest({}))
+    restarted_provider.discard_transfer("job-1", "collect-1", "discard-1", canonical_digest({}))
     assert (tmp_path / "outputs/result.bin").read_bytes() == b"changed-after-snapshot"
     assert not first.path.exists() and not second.path.exists()
     assert not list(tmp_path.rglob("*.partial"))
-    assert not list((tmp_path / ".kcs-transfers/snapshots").iterdir())
+    assert not list((tmp_path / ".kcs/snapshots").iterdir())
+    assert json.loads(receipt.read_text())["state"] == "discarded"
 
     print(
         "JOURNEY transfer",
@@ -283,6 +348,10 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
     with pytest.raises(UnsafePathError):
         provider.register_transfer(
             "job-1", _transfer("symlink", TransferDirection.STAGE_INPUT, "link/file", content)
+        )
+    with pytest.raises(UnsafePathError):
+        provider.register_transfer(
+            "job-1", _transfer("private", TransferDirection.STAGE_INPUT, ".kcs/receipts/x", content)
         )
     (tmp_path / "exists.bin").write_bytes(b"existing")
     with pytest.raises(OverwriteForbiddenError):
@@ -353,6 +422,30 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
     assert response.headers["x-kcs-snapshot-ref"]
     assert response.headers["cache-control"] == "no-store"
 
+    oversized = _GuardedSocket(struct.pack(">I", 4 * 1024 * 1024 + 1))
+    with pytest.raises(DependencyUnavailableError, match="header"):
+        _serve_connection(oversized, WorkspaceSidecar(tmp_path / "hostile-header"))  # type: ignore[arg-type]
+    assert oversized.receive_sizes == [4]
+
+    hostile_header = json.dumps(
+        {
+            "action": "stage",
+            "transferRef": "hostile-body",
+            "requestDigest": "b" * 64,
+            "declaredSizeBytes": 1,
+            "authorizedMaxSizeBytes": 1,
+            "contentSha256": hashlib.sha256(b"x").hexdigest(),
+            "bodySize": 2,
+        },
+        separators=(",", ":"),
+    ).encode()
+    hostile = _GuardedSocket(struct.pack(">I", len(hostile_header)) + hostile_header)
+    _serve_connection(hostile, WorkspaceSidecar(tmp_path / "hostile-body"))  # type: ignore[arg-type]
+    assert hostile.receive_sizes == [4, len(hostile_header)]
+    reply_size = struct.unpack(">I", hostile.sent[:4])[0]
+    reply = decode_workspace_header(bytes(hostile.sent[: reply_size + 4]))
+    assert reply["ok"] is False and reply["code"] == "INVALID_REQUEST"
+
 
 class _LostReply:
     def __init__(self, transport: LocalWorkspaceRpcTransport, action: str = "invoke") -> None:
@@ -369,21 +462,82 @@ class _LostReply:
         reply = self.transport.rpc(binding, header, body)
         if header["action"] == self.action and not self.lost:
             self.lost = True
+            if reply.content_path is not None:
+                reply.content_path.unlink(missing_ok=True)
             raise RuntimeError("simulated response loss")
         return reply
+
+
+class _HeldInvoke:
+    def __init__(self, transport: LocalWorkspaceRpcTransport) -> None:
+        self.transport = transport
+        self.winner_started = Event()
+        self.inspected = Event()
+        self.release = Event()
+        self.invocations = 0
+
+    def rpc(
+        self,
+        binding: Mapping[str, str],
+        header: Mapping[str, object],
+        body: Path | None = None,
+    ) -> WorkspaceRpcReply:
+        if header["action"] == "invoke":
+            self.invocations += 1
+            self.winner_started.set()
+            assert self.release.wait(2)
+        elif header["action"] == "inspectOperation":
+            self.inspected.set()
+        return self.transport.rpc(binding, header, body)
+
+
+class _InvalidOperationResult:
+    def rpc(
+        self,
+        binding: Mapping[str, str],
+        header: Mapping[str, object],
+        body: Path | None = None,
+    ) -> WorkspaceRpcReply:
+        del binding, body
+        return WorkspaceRpcReply(
+            header={
+                "ok": True,
+                "operationRef": header["operationRef"],
+                "requestDigest": header["requestDigest"],
+                "state": "succeeded",
+                "exitCode": 7,
+                "stdout": "",
+                "stderr": "",
+                "inlineResult": None,
+                "resultTransferRef": 9,
+            },
+            content_path=None,
+        )
+
+
+class _StopTransport:
+    def agent_rpc(
+        self, binding: Mapping[str, str], request: Mapping[str, object]
+    ) -> AgentRpcResponse:
+        raise AssertionError("finalize must not start an agent")
+
+    def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse:
+        del binding, container
+        return AgentRpcResponse(
+            protocol_version=1,
+            generation=0,
+            agent_run_ref="",
+            launch_bundle_digest="",
+            state="stopped",
+            supervisor_alive=False,
+        )
 
 
 def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Path) -> None:
     kube, store, sidecar, _ = _setup(tmp_path)
     local = LocalWorkspaceRpcTransport(sidecar.dispatch)
     lost = _LostReply(local)
-    provider = V2JobProvider(
-        kube,  # type: ignore[arg-type]
-        store,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=lost,
-    )
+    provider = _provider(kube, store, lost)
     frame = WorkspaceFrame.model_validate(
         {
             "protocol": "cosmos.workspace/1",
@@ -406,14 +560,10 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     assert provider.inspect_operation("job-1", "operation-1").state == "accepted"
     assert sidecar.stats()["operationSideEffects"] == 1
 
-    restarted = V2JobProvider(
-        kube,  # type: ignore[arg-type]
-        store,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=local,
-    )
-    result = restarted.invoke_workspace("job-1", request)
+    restarted = _provider(kube, store, local)
+    replay = restarted.invoke_workspace("job-1", request)
+    result = replay.snapshot
+    assert replay.created is False
     assert result.state == "succeeded" and result.exit_code == 0
     assert len(result.stdout.encode()) == 65536 and result.stdout_truncated is True
     assert len(result.stderr.encode()) <= 65536 and result.stderr_truncated is True
@@ -421,7 +571,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     assert result.inline_result_size == len(b'{"value":7}')
     assert result.inline_result_digest == hashlib.sha256(b'{"value":7}').hexdigest()
     assert sidecar.stats()["operationSideEffects"] == 1
-    assert restarted.invoke_workspace("job-1", request) == result
+    assert restarted.invoke_workspace("job-1", request).snapshot == result
 
     changed = request.model_copy(update={"request_digest": "b" * 64})
     with pytest.raises(IdentityDigestConflict):
@@ -438,17 +588,85 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
         .model_dump_json(by_alias=True)
     )
     store2.reserve_runtime("operation", "operation-1", "job-1", values)
-    provider2 = V2JobProvider(
-        kube2,  # type: ignore[arg-type]
-        store2,
-        _Renderer(),
-        clock=lambda: NOW,
-        workspace_transport=local,
-    )
+    provider2 = _provider(kube2, store2, local)
     with pytest.raises(OperationIndeterminateError):
         provider2.invoke_workspace("job-1", request)
     assert provider2.inspect_operation("job-1", "operation-1").state == "indeterminate"
 
+    race_sidecar = WorkspaceSidecar(tmp_path / "race")
+    race_transport = _HeldInvoke(LocalWorkspaceRpcTransport(race_sidecar.dispatch))
+    race_kube, race_store, _, _ = _setup(tmp_path / "race")
+    race_provider = _provider(race_kube, race_store, race_transport)
+    race_request = request.model_copy(update={"operation_ref": "operation-race"})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner = pool.submit(race_provider.invoke_workspace, "job-1", race_request)
+        assert race_transport.winner_started.wait(1)
+        loser = pool.submit(race_provider.invoke_workspace, "job-1", race_request)
+        assert race_transport.inspected.wait(1)
+        race_transport.release.set()
+        outcomes = [winner.result(timeout=2), loser.result(timeout=2)]
+    assert sorted(item.created for item in outcomes) == [False, True]
+    assert all(item.snapshot.state is OperationState.SUCCEEDED for item in outcomes)
+    assert race_transport.invocations == 1
+
+    bad_request = request.model_copy(update={"operation_ref": "operation-invalid"})
+    bad_provider = _provider(kube, store, _InvalidOperationResult())
+    with pytest.raises(DependencyUnavailableError):
+        bad_provider.invoke_workspace("job-1", bad_request)
+    invalid = bad_provider.inspect_operation("job-1", "operation-invalid")
+    assert invalid.state is OperationState.INDETERMINATE and invalid.failure_reason
+
+    finalize_root = tmp_path / "finalize-recovery"
+    finalize_kube, finalize_store, finalize_sidecar, _ = _setup(finalize_root)
+    finalize_local = LocalWorkspaceRpcTransport(finalize_sidecar.dispatch)
+    finalize_operation = request.model_copy(update={"operation_ref": "operation-finalize"})
+    lost_operation = _provider(finalize_kube, finalize_store, _LostReply(finalize_local))
+    with pytest.raises(DependencyUnavailableError):
+        lost_operation.invoke_workspace("job-1", finalize_operation)
+
+    discarded_bytes = b"finalize-discard"
+    (finalize_root / "discard.bin").write_bytes(discarded_bytes)
+    discard_request = _transfer(
+        "discard-finalize",
+        TransferDirection.COLLECT_OUTPUT,
+        "discard.bin",
+        discarded_bytes,
+    )
+    lost_operation.register_transfer("job-1", discard_request)
+    lost_collect = _provider(finalize_kube, finalize_store, _LostReply(finalize_local, "collect"))
+    with pytest.raises(DependencyUnavailableError):
+        lost_collect.open_collected_content("job-1", "discard-finalize")
+    lost_discard = _provider(
+        finalize_kube, finalize_store, _LostReply(finalize_local, "discardTransfer")
+    )
+    with pytest.raises(DependencyUnavailableError):
+        lost_discard.discard_transfer(
+            "job-1", "discard-finalize", "discard-finalize-action", canonical_digest({})
+        )
+
+    finalizer = _provider(
+        finalize_kube,
+        finalize_store,
+        finalize_local,
+        sleeper=lambda _: None,
+        transport=_StopTransport(),
+    )
+    finalize_spec = FinalizeSpec(
+        operation_refs=["operation-finalize"],
+        transfer_refs=["discard-finalize"],
+        drain_timeout_seconds=1,
+    )
+    finalized = finalizer.finalize(
+        "job-1",
+        FinalizeJobRequest(
+            finalize_ref="finalize-recovery",
+            request_digest=canonical_digest(finalize_spec),
+            spec=finalize_spec,
+        ),
+    )
+    assert finalized.snapshot.terminal_operation_refs == ["operation-finalize"]
+    discarded = finalizer.inspect_transfer("job-1", "discard-finalize")
+    assert discarded.state == "discarded" and discarded.discard_action.state == "succeeded"
     print(
         "JOURNEY operation",
         json.dumps(

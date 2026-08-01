@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import socket
@@ -17,6 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from kcs.jobs.errors import DependencyUnavailableError
 from kcs.jobs.policy import validate_safe_relative_path
 from kcs.jobs.transport import (
     decode_workspace_header,
@@ -24,6 +26,7 @@ from kcs.jobs.transport import (
 )
 
 _COPY_CHUNK = 1024 * 1024
+_MAX_RPC_HEADER = 4 * 1024 * 1024
 
 
 class _RpcRejectedError(Exception):
@@ -39,9 +42,10 @@ class WorkspaceSidecar:
     def __init__(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         self.workspace = workspace.resolve(strict=True)
-        self._private = _private_directory(self.workspace, ".kcs-transfers")
+        self._private = _private_directory(self.workspace, ".kcs")
         self._partials = _private_directory(self._private, "partials")
         self._snapshots = _private_directory(self._private, "snapshots")
+        self._receipts = _private_directory(self._private, "receipts")
         self._transfers: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, dict[str, Any]] = {}
         self._stage_installs = 0
@@ -130,10 +134,12 @@ class WorkspaceSidecar:
         if overwrite not in {"forbid", "replace_authorized"}:
             raise _RpcRejectedError("INVALID_REQUEST", "overwrite policy is invalid")
         parts = PurePosixPath(raw_path).parts
+        if unicodedata.normalize("NFC", parts[0]).casefold() == ".kcs":
+            raise _RpcRejectedError("UNSAFE_PATH", "workspace path enters KCS private storage")
         parent = self.workspace
         for component in parts[:-1]:
-            collision = self._casefold_entry(parent, component)
-            if collision is not None and collision.name != component:
+            collisions = self._casefold_entries(parent, component)
+            if len(collisions) > 1 or (collisions and collisions[0].name != component):
                 raise _RpcRejectedError("UNSAFE_PATH", "workspace path has a casefold collision")
             candidate = parent / component
             if candidate.exists() or candidate.is_symlink():
@@ -141,8 +147,8 @@ class WorkspaceSidecar:
                 if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                     raise _RpcRejectedError("UNSAFE_PATH", "workspace path traverses a symlink")
             parent = candidate
-        collision = self._casefold_entry(parent, parts[-1]) if parent.is_dir() else None
-        if collision is not None and collision.name != parts[-1]:
+        collisions = self._casefold_entries(parent, parts[-1]) if parent.is_dir() else []
+        if len(collisions) > 1 or (collisions and collisions[0].name != parts[-1]):
             raise _RpcRejectedError("UNSAFE_PATH", "workspace target has a casefold collision")
         target = parent / parts[-1]
         if target.is_symlink():
@@ -166,7 +172,7 @@ class WorkspaceSidecar:
         actual_size, actual_digest = _hash_file(body)
         if actual_size != size or actual_digest != content_digest:
             raise _RpcRejectedError("TRANSFER_BYTES_MISMATCH", "staged bytes failed verification")
-        retained = self._transfers.get(transfer_ref)
+        retained = self._transfers.get(transfer_ref) or self._load_receipt(transfer_ref)
         if retained is not None:
             _same_digest(retained, digest)
             if retained.get("state") == "completed":
@@ -175,25 +181,16 @@ class WorkspaceSidecar:
                         "TRANSFER_BYTES_MISMATCH", "transfer replay bytes differ"
                     )
                 return dict(retained)
+            if retained.get("state") in {"canceled", "discarded"}:
+                raise _RpcRejectedError(
+                    "STATE_CONFLICT", "the transfer already reached a terminal state"
+                )
 
         self._validate_transfer_path(request, allow_stage_existing=True)
         parent_fd, target_name = self._open_parent(str(request["path"]), create=True)
         partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
         partial.unlink(missing_ok=True)
         try:
-            existing = _stat_at(parent_fd, target_name)
-            if existing is not None:
-                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                    raise _RpcRejectedError("UNSAFE_PATH", "workspace target is not a regular file")
-                if request.get("overwritePolicy") == "forbid":
-                    existing_size, existing_digest = _hash_at(parent_fd, target_name)
-                    if existing_size == size and existing_digest == content_digest:
-                        result = _completed_transfer(transfer_ref, digest, size, content_digest)
-                        self._transfers[transfer_ref] = result
-                        return result
-                    raise _RpcRejectedError(
-                        "OVERWRITE_FORBIDDEN", "workspace target already exists"
-                    )
             descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "wb") as output, body.open("rb") as source:
                 shutil.copyfileobj(source, output, length=_COPY_CHUNK)
@@ -202,12 +199,39 @@ class WorkspaceSidecar:
             verified_size, verified_digest = _hash_file(partial)
             if verified_size != size or verified_digest != content_digest:
                 raise _RpcRejectedError("TRANSFER_BYTES_MISMATCH", "private staged bytes changed")
-            os.replace(partial, target_name, dst_dir_fd=parent_fd)
+            matches = _casefold_entries_at(parent_fd, target_name)
+            if len(matches) > 1 or (matches and matches[0] != target_name):
+                raise _RpcRejectedError("UNSAFE_PATH", "workspace target is ambiguous")
+            if request.get("overwritePolicy") == "forbid":
+                if matches:
+                    raise _RpcRejectedError(
+                        "OVERWRITE_FORBIDDEN", "workspace target already exists"
+                    )
+                try:
+                    os.link(partial, target_name, dst_dir_fd=parent_fd, follow_symlinks=False)
+                except FileExistsError as error:
+                    raise _RpcRejectedError(
+                        "OVERWRITE_FORBIDDEN", "workspace target already exists"
+                    ) from error
+                partial.unlink()
+            else:
+                if matches:
+                    existing = _stat_at(parent_fd, target_name)
+                    if (
+                        existing is None
+                        or stat.S_ISLNK(existing.st_mode)
+                        or not stat.S_ISREG(existing.st_mode)
+                    ):
+                        raise _RpcRejectedError(
+                            "UNSAFE_PATH", "workspace target is not a regular file"
+                        )
+                os.replace(partial, target_name, dst_dir_fd=parent_fd)
             os.fsync(parent_fd)
         finally:
             partial.unlink(missing_ok=True)
             os.close(parent_fd)
         result = _completed_transfer(transfer_ref, digest, size, content_digest)
+        self._write_receipt(result)
         self._transfers[transfer_ref] = dict(result)
         self._stage_installs += 1
         return result
@@ -215,18 +239,22 @@ class WorkspaceSidecar:
     def _collect(self, request: Mapping[str, Any]) -> tuple[dict[str, object], Path | None]:
         transfer_ref, digest = _identity(request, "transferRef", "requestDigest")
         size, content_digest = _byte_contract(request)
-        retained = self._transfers.get(transfer_ref)
+        retained = self._transfers.get(transfer_ref) or self._load_receipt(transfer_ref)
         if retained is not None:
             _same_digest(retained, digest)
             snapshot_path = retained.get("snapshotPath")
             if retained.get("state") == "completed" and isinstance(snapshot_path, str):
                 path = Path(snapshot_path)
-                actual_size, actual_digest = _hash_file(path)
+                actual_size, actual_digest = _hash_nofollow(path)
                 if actual_size != size or actual_digest != content_digest:
                     raise _RpcRejectedError(
                         "TRANSFER_BYTES_MISMATCH", "snapshot verification failed"
                     )
                 return _public_transfer(retained), path
+            if retained.get("state") in {"canceled", "discarded"}:
+                raise _RpcRejectedError(
+                    "STATE_CONFLICT", "the transfer already reached a terminal state"
+                )
 
         self._validate_transfer_path(request)
         parent_fd, target_name = self._open_parent(str(request["path"]), create=False)
@@ -239,42 +267,36 @@ class WorkspaceSidecar:
         if not stat.S_ISREG(os.fstat(source_fd).st_mode):
             os.close(source_fd)
             raise _RpcRejectedError("UNSAFE_PATH", "workspace output is not a regular file")
-        with os.fdopen(source_fd, "rb") as source:
-            actual_size, actual_digest = _hash_stream(source)
-        if actual_size != size or actual_digest != content_digest:
-            raise _RpcRejectedError(
-                "TRANSFER_BYTES_MISMATCH", "workspace output failed verification"
-            )
         snapshot_ref = (
             "snapshot-"
             + hashlib.sha256(f"{transfer_ref}:{digest}:{content_digest}".encode()).hexdigest()
         )
         snapshot = self._snapshots / hashlib.sha256(snapshot_ref.encode()).hexdigest()
-        if not snapshot.exists():
-            descriptor, raw_partial = tempfile.mkstemp(dir=self._snapshots, prefix=".partial-")
-            partial = Path(raw_partial)
-            try:
-                os.chmod(partial, 0o600)
-                snapshot_parent_fd, snapshot_target_name = self._open_parent(
-                    str(request["path"]), create=False
+        descriptor, raw_partial = tempfile.mkstemp(dir=self._snapshots, prefix=".partial-")
+        partial = Path(raw_partial)
+        try:
+            os.chmod(partial, 0o600)
+            copied_digest = hashlib.sha256()
+            copied_size = 0
+            with os.fdopen(descriptor, "wb") as output, os.fdopen(source_fd, "rb") as source:
+                while chunk := source.read(_COPY_CHUNK):
+                    copied_size += len(chunk)
+                    if copied_size > size:
+                        raise _RpcRejectedError(
+                            "TRANSFER_BYTES_MISMATCH", "workspace output exceeded its contract"
+                        )
+                    copied_digest.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if copied_size != size or copied_digest.hexdigest() != content_digest:
+                raise _RpcRejectedError(
+                    "TRANSFER_BYTES_MISMATCH", "workspace output failed verification"
                 )
-                source_fd = os.open(
-                    snapshot_target_name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=snapshot_parent_fd,
-                )
-                os.close(snapshot_parent_fd)
-                with os.fdopen(descriptor, "wb") as output, os.fdopen(source_fd, "rb") as source:
-                    shutil.copyfileobj(source, output, length=_COPY_CHUNK)
-                    output.flush()
-                    os.fsync(output.fileno())
-                copied_size, copied_digest = _hash_file(partial)
-                if copied_size != size or copied_digest != content_digest:
-                    raise _RpcRejectedError("TRANSFER_BYTES_MISMATCH", "snapshot copy changed")
-                os.replace(partial, snapshot)
-                _fsync_directory(self._snapshots)
-            finally:
-                partial.unlink(missing_ok=True)
+            os.replace(partial, snapshot)
+            _fsync_directory(self._snapshots)
+        finally:
+            partial.unlink(missing_ok=True)
         result = {
             "ok": True,
             "transferRef": transfer_ref,
@@ -283,19 +305,21 @@ class WorkspaceSidecar:
             "actualSizeBytes": size,
             "actualSha256": content_digest,
             "snapshotRef": snapshot_ref,
+            "snapshotName": snapshot.name,
             "snapshotPath": str(snapshot),
         }
+        self._write_receipt(result)
         self._transfers[transfer_ref] = result
         return _public_transfer(result), snapshot
 
     def _inspect_transfer(self, request: Mapping[str, Any]) -> dict[str, object]:
         transfer_ref = request.get("transferRef")
-        retained = self._transfers.get(str(transfer_ref))
+        retained = self._transfers.get(str(transfer_ref)) or self._load_receipt(str(transfer_ref))
         return {"ok": True, "known": retained is not None, **_public_transfer(retained or {})}
 
     def _cancel_transfer(self, request: Mapping[str, Any]) -> dict[str, object]:
         transfer_ref, digest = _identity(request, "transferRef", "requestDigest")
-        retained = self._transfers.get(transfer_ref)
+        retained = self._transfers.get(transfer_ref) or self._load_receipt(transfer_ref)
         if retained is not None and retained.get("state") == "completed":
             raise _RpcRejectedError("STATE_CONFLICT", "completed transfer cannot be canceled")
         partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
@@ -306,6 +330,7 @@ class WorkspaceSidecar:
             "requestDigest": digest,
             "state": "canceled",
         }
+        self._write_receipt(result)
         self._transfers[transfer_ref] = result
         return result
 
@@ -313,7 +338,10 @@ class WorkspaceSidecar:
         transfer_ref = request.get("transferRef")
         if not isinstance(transfer_ref, str):
             raise _RpcRejectedError("INVALID_REQUEST", "transferRef is absent")
-        retained = self._transfers.get(transfer_ref, {})
+        retained = self._transfers.get(transfer_ref) or self._load_receipt(transfer_ref) or {}
+        request_digest = request.get("requestDigest")
+        if retained and isinstance(request_digest, str):
+            _same_digest(retained, request_digest)
         snapshot_path = retained.get("snapshotPath")
         if isinstance(snapshot_path, str):
             candidate = Path(snapshot_path)
@@ -323,8 +351,71 @@ class WorkspaceSidecar:
         partial.unlink(missing_ok=True)
         result = {**retained, "ok": True, "transferRef": transfer_ref, "state": "discarded"}
         result.pop("snapshotPath", None)
+        result.pop("snapshotName", None)
+        self._write_receipt(result)
         self._transfers[transfer_ref] = result
         return _public_transfer(result)
+
+    def _receipt_path(self, transfer_ref: str) -> Path:
+        return self._receipts / f"{hashlib.sha256(transfer_ref.encode()).hexdigest()}.json"
+
+    def _load_receipt(self, transfer_ref: str) -> dict[str, Any] | None:
+        path = self._receipt_path(transfer_ref)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return None
+        try:
+            mode = os.fstat(descriptor).st_mode
+            if not stat.S_ISREG(mode):
+                raise _RpcRejectedError("UNSAFE_PATH", "transfer receipt is unsafe")
+            with os.fdopen(descriptor, "rb") as source:
+                raw = source.read(65537)
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _RpcRejectedError(
+                "TRANSFER_INDETERMINATE", "transfer receipt is invalid"
+            ) from error
+        if (
+            not isinstance(value, dict)
+            or value.get("receiptVersion") != 1
+            or value.get("transferRef") != transfer_ref
+            or not isinstance(value.get("requestDigest"), str)
+            or value.get("state") not in {"completed", "canceled", "discarded"}
+        ):
+            raise _RpcRejectedError("TRANSFER_INDETERMINATE", "transfer receipt is invalid")
+        snapshot_name = value.get("snapshotName")
+        if snapshot_name is not None:
+            expected = hashlib.sha256(str(value.get("snapshotRef")).encode()).hexdigest()
+            if snapshot_name != expected:
+                raise _RpcRejectedError(
+                    "TRANSFER_INDETERMINATE", "transfer snapshot identity is invalid"
+                )
+            value["snapshotPath"] = str(self._snapshots / snapshot_name)
+        value["ok"] = True
+        return value
+
+    def _write_receipt(self, retained: Mapping[str, Any]) -> None:
+        value = {key: item for key, item in retained.items() if key not in {"ok", "snapshotPath"}}
+        value["receiptVersion"] = 1
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        descriptor, raw_partial = tempfile.mkstemp(dir=self._receipts, prefix=".partial-")
+        partial = Path(raw_partial)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(partial, self._receipt_path(str(retained["transferRef"])))
+            _fsync_directory(self._receipts)
+        finally:
+            partial.unlink(missing_ok=True)
 
     def _invoke(self, request: Mapping[str, Any]) -> dict[str, object]:
         operation_ref, digest = _identity(request, "operationRef", "requestDigest")
@@ -369,14 +460,15 @@ class WorkspaceSidecar:
         return {"ok": True, "known": True, **retained}
 
     @staticmethod
-    def _casefold_entry(parent: Path, name: str) -> Path | None:
+    def _casefold_entries(parent: Path, name: str) -> list[Path]:
         if not parent.is_dir():
-            return None
+            return []
         folded = unicodedata.normalize("NFC", name).casefold()
-        for child in parent.iterdir():
-            if unicodedata.normalize("NFC", child.name).casefold() == folded:
-                return child
-        return None
+        return [
+            child
+            for child in parent.iterdir()
+            if unicodedata.normalize("NFC", child.name).casefold() == folded
+        ]
 
     def _open_parent(self, raw_path: str, *, create: bool) -> tuple[int, str]:
         """Walk parents by descriptor so a concurrent symlink swap cannot escape."""
@@ -386,19 +478,16 @@ class WorkspaceSidecar:
             for component in parts[:-1]:
                 folded = unicodedata.normalize("NFC", component).casefold()
                 entries = os.listdir(descriptor)
-                collision = next(
-                    (
-                        entry
-                        for entry in entries
-                        if unicodedata.normalize("NFC", entry).casefold() == folded
-                    ),
-                    None,
-                )
-                if collision is not None and collision != component:
+                collisions = [
+                    entry
+                    for entry in entries
+                    if unicodedata.normalize("NFC", entry).casefold() == folded
+                ]
+                if len(collisions) > 1 or (collisions and collisions[0] != component):
                     raise _RpcRejectedError(
                         "UNSAFE_PATH", "workspace path has a casefold collision"
                     )
-                if collision is None:
+                if not collisions:
                     if not create:
                         raise _RpcRejectedError("NOT_FOUND", "workspace parent does not exist")
                     os.mkdir(component, 0o700, dir_fd=descriptor)
@@ -411,15 +500,8 @@ class WorkspaceSidecar:
                 descriptor = next_descriptor
             target_name = parts[-1]
             folded = unicodedata.normalize("NFC", target_name).casefold()
-            collision = next(
-                (
-                    entry
-                    for entry in os.listdir(descriptor)
-                    if unicodedata.normalize("NFC", entry).casefold() == folded
-                ),
-                None,
-            )
-            if collision is not None and collision != target_name:
+            collisions = _casefold_entries_at(descriptor, target_name)
+            if len(collisions) > 1 or (collisions and collisions[0] != target_name):
                 raise _RpcRejectedError("UNSAFE_PATH", "workspace target has a casefold collision")
             return descriptor, target_name
         except Exception:
@@ -444,12 +526,25 @@ def serve(socket_path: Path, workspace: Path) -> None:
 def _serve_connection(connection: socket.socket, sidecar: WorkspaceSidecar) -> None:
     prefix = _recv_exact(connection, 4)
     header_size = struct.unpack(">I", prefix)[0]
+    if header_size > _MAX_RPC_HEADER:
+        raise DependencyUnavailableError("workspace RPC header exceeded its bound")
     frame = prefix + _recv_exact(connection, header_size)
     header = decode_workspace_header(frame)
     body_size = header["bodySize"]
     body_path: Path | None = None
     response_path = _private_path("kcs-sidecar-response-")
     try:
+        try:
+            _validate_ingress_body(header)
+        except _RpcRejectedError as error:
+            write_workspace_response(
+                response_path,
+                {"ok": False, "code": error.code, "message": error.message},
+            )
+            with response_path.open("rb") as response:
+                while chunk := response.read(_COPY_CHUNK):
+                    connection.sendall(chunk)
+            return
         if body_size:
             body_path = _private_path("kcs-sidecar-body-")
             with body_path.open("wb") as output:
@@ -478,11 +573,14 @@ def rpc(socket_path: Path) -> None:
         if len(prefix) != 4:
             raise EOFError("workspace RPC header was truncated")
         header_size = struct.unpack(">I", prefix)[0]
+        if header_size > _MAX_RPC_HEADER:
+            raise DependencyUnavailableError("workspace RPC header exceeded its bound")
         encoded_header = sys.stdin.buffer.read(header_size)
         if len(encoded_header) != header_size:
             raise EOFError("workspace RPC header was truncated")
         frame = prefix + encoded_header
         header = decode_workspace_header(frame)
+        _validate_ingress_body(header)
         connection.sendall(frame)
         remaining = header["bodySize"]
         while remaining:
@@ -523,6 +621,20 @@ def _byte_contract(request: Mapping[str, Any]) -> tuple[int, str]:
     return size, digest
 
 
+def _validate_ingress_body(request: Mapping[str, Any]) -> None:
+    body_size = request.get("bodySize")
+    if type(body_size) is not int or body_size < 0:
+        raise _RpcRejectedError("INVALID_REQUEST", "RPC body size is invalid")
+    if request.get("action") == "stage":
+        declared_size, _ = _byte_contract(request)
+        if body_size != declared_size:
+            raise _RpcRejectedError(
+                "INVALID_REQUEST", "stage body size differs from its authorized contract"
+            )
+    elif body_size != 0:
+        raise _RpcRejectedError("INVALID_REQUEST", "this RPC action does not accept a body")
+
+
 def _hash_file(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
@@ -549,19 +661,22 @@ def _stat_at(parent_fd: int, name: str) -> os.stat_result | None:
         return None
 
 
-def _hash_at(parent_fd: int, name: str) -> tuple[int, str]:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent_fd,
-    )
-    digest = hashlib.sha256()
-    size = 0
+def _hash_nofollow(path: Path) -> tuple[int, str]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise _RpcRejectedError("UNSAFE_PATH", "transfer snapshot is not a regular file")
     with os.fdopen(descriptor, "rb") as source:
-        while chunk := source.read(_COPY_CHUNK):
-            size += len(chunk)
-            digest.update(chunk)
-    return size, digest.hexdigest()
+        return _hash_stream(source)
+
+
+def _casefold_entries_at(parent_fd: int, name: str) -> list[str]:
+    folded = unicodedata.normalize("NFC", name).casefold()
+    return [
+        entry
+        for entry in os.listdir(parent_fd)
+        if unicodedata.normalize("NFC", entry).casefold() == folded
+    ]
 
 
 def _completed_transfer(
@@ -579,7 +694,11 @@ def _completed_transfer(
 
 
 def _public_transfer(value: Mapping[str, Any]) -> dict[str, object]:
-    return {key: item for key, item in value.items() if key != "snapshotPath"}
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in {"receiptVersion", "snapshotName", "snapshotPath"}
+    }
 
 
 def _fsync_directory(path: Path) -> None:
