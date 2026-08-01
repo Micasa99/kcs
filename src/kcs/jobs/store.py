@@ -1,4 +1,5 @@
 """Durable create reservation and deletion tombstones backed by ConfigMaps."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -115,6 +116,17 @@ class CreateReservation:
     @property
     def replayed(self) -> bool:
         return not self.created
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRecord:
+    """A small non-secret ConfigMap record for grants, generations, or finalize."""
+
+    kind: str
+    identity: str
+    job_ref: str
+    values: Mapping[str, str]
+    resource_version: str | None = None
 
 
 class V2JobStore:
@@ -340,6 +352,69 @@ class V2JobStore:
         records = [_record_from_config_map(item) for item in self._kube.list_config_maps(selector)]
         return sorted(records, key=lambda item: (item.created_at, item.job_ref))
 
+    def reserve_runtime(
+        self, kind: str, identity: str, job_ref: str, values: Mapping[str, str]
+    ) -> tuple[RuntimeRecord, bool]:
+        """Reserve one non-secret runtime identity before side effects."""
+        record = RuntimeRecord(kind=kind, identity=identity, job_ref=job_ref, values=dict(values))
+        try:
+            created = self._kube.create_config_map(_runtime_config_map_body(record))
+        except Exception as exc:
+            if _status(exc) != 409:
+                raise
+            existing = self.read_runtime(kind, identity)
+            if existing is None:
+                raise DependencyUnavailableError(
+                    "runtime record conflict was not readable"
+                ) from exc
+            if existing.job_ref != job_ref or existing.values.get("identityDigest") != values.get(
+                "identityDigest"
+            ):
+                raise IdentityDigestConflict() from exc
+            return existing, False
+        return _runtime_record_from_config_map(created), True
+
+    def read_runtime(self, kind: str, identity: str) -> RuntimeRecord | None:
+        config_map = self._kube.read_config_map(_runtime_record_name(kind, identity))
+        if config_map is None:
+            return None
+        record = _runtime_record_from_config_map(config_map)
+        if record.kind != kind or record.identity != identity:
+            raise DependencyUnavailableError("runtime record hash collision")
+        return record
+
+    def list_runtime(self, kind: str, job_ref: str) -> list[RuntimeRecord]:
+        selector = f"{RECORD_KIND_LABEL}=runtime-{kind},{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
+        return [
+            record
+            for item in self._kube.list_config_maps(selector)
+            if (record := _runtime_record_from_config_map(item)).job_ref == job_ref
+        ]
+
+    def update_runtime(self, kind: str, identity: str, values: Mapping[str, str]) -> RuntimeRecord:
+        for _ in range(_UPDATE_ATTEMPTS):
+            current = self.read_runtime(kind, identity)
+            if current is None:
+                raise JobNotFoundError()
+            desired = RuntimeRecord(
+                kind=kind,
+                identity=identity,
+                job_ref=current.job_ref,
+                values=dict(values),
+                resource_version=current.resource_version,
+            )
+            try:
+                written = self._kube.replace_config_map(
+                    _runtime_record_name(kind, identity),
+                    _runtime_config_map_body(desired, resource_version=current.resource_version),
+                )
+            except Exception as exc:
+                if _status(exc) == 409:
+                    continue
+                raise
+            return _runtime_record_from_config_map(written)
+        raise DependencyUnavailableError("runtime record changed concurrently")
+
     # Clear aliases used by some provider call sites.
     bind_job = mark_created
     bind_pod = bind_first_pod
@@ -417,6 +492,10 @@ def _normalize_spec(
 
 def _record_name(provider_request_id: str) -> str:
     return f"kcs-v2-create-{_short_hash(provider_request_id, 32)}"
+
+
+def _runtime_record_name(kind: str, identity: str) -> str:
+    return f"kcs-v2-{kind}-{_short_hash(identity, 32)}"
 
 
 def _short_hash(value: str, length: int = 40) -> str:
@@ -509,6 +588,50 @@ def _record_from_config_map(config_map: Any) -> CreateRecord:
         indeterminate_reason=data.get("indeterminateReason"),
         deleted_at=data.get("deletedAt"),
         expires_at=data.get("expiresAt"),
+        resource_version=_value(metadata, "resource_version")
+        or _value(metadata, "resourceVersion"),
+    )
+
+
+def _runtime_config_map_body(
+    record: RuntimeRecord, *, resource_version: str | None = None
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "name": _runtime_record_name(record.kind, record.identity),
+        "labels": {
+            MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+            RECORD_KIND_LABEL: f"runtime-{record.kind}",
+            JOB_REF_HASH_LABEL: _short_hash(record.job_ref),
+        },
+        "ownerReferences": [],
+    }
+    if resource_version is not None:
+        metadata["resourceVersion"] = resource_version
+    data = {
+        "recordVersion": _RECORD_VERSION,
+        "kind": record.kind,
+        "identity": record.identity,
+        "jobRef": record.job_ref,
+    }
+    data.update(dict(record.values))
+    return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata, "data": data}
+
+
+def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:
+    data = _data(config_map)
+    if data.get("recordVersion") != _RECORD_VERSION:
+        raise DependencyUnavailableError("unsupported ConfigMap runtime record version")
+    metadata = _value(config_map, "metadata")
+    values = {
+        key: value
+        for key, value in data.items()
+        if key not in {"recordVersion", "kind", "identity", "jobRef"}
+    }
+    return RuntimeRecord(
+        kind=_required(data, "kind"),
+        identity=_required(data, "identity"),
+        job_ref=_required(data, "jobRef"),
+        values=MappingProxyType(values),
         resource_version=_value(metadata, "resource_version")
         or _value(metadata, "resourceVersion"),
     )

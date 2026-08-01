@@ -110,6 +110,40 @@ class StateConflictError(KcsV2Error):
     default_message = "The job is not in a state that permits this operation"
 
 
+class IllegalGenerationError(KcsV2Error):
+    code = "ILLEGAL_GENERATION"
+    status_code = 409
+    recovery_action = "inspect_job"
+    default_message = "The requested agent generation is not legal for this supervisor"
+
+
+class CredentialActiveError(KcsV2Error):
+    code = "CREDENTIAL_ACTIVE"
+    status_code = 409
+    recovery_action = "inspect_grant"
+    default_message = "Another credential grant is still active"
+
+
+class CredentialExpiredError(KcsV2Error):
+    code = "CREDENTIAL_EXPIRED"
+    status_code = 409
+    recovery_action = "inspect_grant"
+    default_message = "The credential grant is no longer usable"
+
+
+class CredentialDestroyFailedError(KcsV2Error):
+    code = "CREDENTIAL_DESTROY_FAILED"
+    status_code = 500
+    recovery_action = "reconcile"
+    default_message = "The projected credential could not be destroyed"
+
+
+class PayloadTooLargeError(KcsV2Error):
+    code = "PAYLOAD_TOO_LARGE"
+    status_code = 413
+    default_message = "The request body exceeds the allowed size"
+
+
 class ReplacementPodError(KcsV2Error):
     code = "REPLACEMENT_POD"
     status_code = 409

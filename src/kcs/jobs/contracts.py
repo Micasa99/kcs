@@ -1,4 +1,5 @@
 """Strict Pydantic contracts for the first executable KCS V2 Job journey."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -321,6 +322,62 @@ class CredentialObservation(ContractModel):
     observed_at: Timestamp
 
 
+class CredentialGrantMetadata(ContractModel):
+    """Non-secret identity supplied alongside an octet-stream credential body."""
+
+    credential_grant_ref: OpaqueRef
+    credential_sha256: Sha256
+    grant_metadata_digest: Sha256
+    agent_run_ref: OpaqueRef
+    generation: Annotated[StrictInt, Field(ge=1)]
+    launch_bundle_digest: Sha256
+    audience: OpaqueRef
+    ttl_seconds: Annotated[StrictInt, Field(ge=1, le=900)]
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "agentRunRef": self.agent_run_ref,
+            "generation": self.generation,
+            "launchBundleDigest": self.launch_bundle_digest,
+            "audience": self.audience,
+            "credentialSha256": self.credential_sha256,
+            "ttlSeconds": self.ttl_seconds,
+            "jobUid": str(self.job_uid),
+            "podUid": str(self.pod_uid),
+        }
+
+
+class CredentialGrantSnapshot(ContractModel):
+    """A restart-readable observation of a credential without its bytes."""
+
+    credential_grant_ref: OpaqueRef
+    credential_sha256: Sha256
+    grant_metadata_digest: Sha256
+    agent_run_ref: OpaqueRef
+    generation: Annotated[StrictInt, Field(ge=1)]
+    launch_bundle_digest: Sha256
+    audience: OpaqueRef
+    ttl_seconds: Annotated[StrictInt, Field(ge=1, le=900)]
+    job_ref: OpaqueRef
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    state: CredentialState
+    accepted_at: Timestamp
+    available_at: Timestamp | None
+    acknowledged_at: Timestamp | None
+    ack_agent_run_ref: OpaqueRef | None
+    ack_generation: Annotated[StrictInt, Field(ge=1)] | None
+    consumed_at: Timestamp | None
+    destroyed_at: Timestamp | None
+    expires_at: Timestamp
+    tombstone_expires_at: Timestamp
+    secret_present: StrictBool | None
+    destroy_failure_reason: StrictStr | None
+    observed_at: Timestamp
+
+
 class TransferObservation(ContractModel):
     transfer_ref: OpaqueRef
     state: TransferState
@@ -359,6 +416,35 @@ class GenerationSnapshot(ContractModel):
         ):
             raise ValueError("exited generation requires exitCode and finishedAt")
         return self
+
+
+class AgentStartRequest(ContractModel):
+    execution_envelope_ref: OpaqueRef
+    execution_envelope_digest: Sha256
+    agent_run_ref: OpaqueRef
+    generation: Annotated[StrictInt, Field(ge=1)]
+    launch_bundle_path: SafeRelativePath
+    launch_bundle_digest: Sha256
+    launch_bundle_size_bytes: Annotated[StrictInt, Field(ge=0, le=1048576)]
+    material_paths: Annotated[
+        list[SafeRelativePath], AfterValidator(validate_casefold_unique_paths)
+    ]
+    credential_grant_ref: OpaqueRef
+
+    def digest_payload(self) -> dict[str, object]:
+        return self.model_dump(mode="json", by_alias=True, exclude={"generation"})
+
+
+class FinalizeSpec(ContractModel):
+    operation_refs: list[OpaqueRef]
+    transfer_refs: list[OpaqueRef]
+    drain_timeout_seconds: Annotated[StrictInt, Field(ge=1, le=86400)]
+
+
+class FinalizeJobRequest(ContractModel):
+    finalize_ref: OpaqueRef
+    request_digest: Sha256
+    spec: FinalizeSpec
 
 
 class JobBindingSnapshot(ContractModel):

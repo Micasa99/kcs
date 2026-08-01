@@ -66,6 +66,10 @@ class CoreV1Api(Protocol):
         self, *, namespace: str, label_selector: str | None = None
     ) -> Any: ...
 
+    def create_namespaced_secret(self, *, namespace: str, body: Any) -> Any: ...
+
+    def delete_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
+
 
 @dataclass(frozen=True, slots=True)
 class LogRead:
@@ -274,6 +278,18 @@ class V2KubeAdapter:
             label_selector=label_selector,
         )
         return list(_value(result, "items") or ())
+
+    def create_secret(self, body: Any) -> Any:
+        return self._core.create_namespaced_secret(namespace=self.namespace, body=body)
+
+    def delete_secret(self, name: str) -> bool:
+        try:
+            self._core.delete_namespaced_secret(name=name, namespace=self.namespace)
+        except Exception as exc:
+            if _status(exc) == 404:
+                return False
+            raise
+        return True
 
     def _pod_with_uid(self, job_ref: str, pod_uid: str) -> Any:
         matches = [

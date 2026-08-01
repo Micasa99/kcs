@@ -4,6 +4,7 @@ The provider is deliberately limited to physical Kubernetes facts.  It reserves 
 stable create identity before dispatch, reconciles a possibly lost create response,
 and treats the first observed Pod UID as immutable binding reality.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -25,9 +26,16 @@ from .contracts import (
     AgentObservedResources,
     AgentRequestedResources,
     AgentRoleSnapshot,
+    AgentStartRequest,
     CleanupObservation,
     CleanupState,
     CreateJobRequest,
+    CredentialGrantMetadata,
+    CredentialGrantSnapshot,
+    CredentialObservation,
+    CredentialState,
+    FinalizeJobRequest,
+    GenerationSnapshot,
     JobBindingSnapshot,
     JobBindingSnapshotList,
     JobBindingState,
@@ -36,26 +44,34 @@ from .contracts import (
     ProviderTerminalState,
     RoleLogs,
     RoleState,
+    RunnerState,
     WorkspaceObservedResources,
     WorkspaceRequestedResources,
     WorkspaceRoleSnapshot,
 )
 from .errors import (
+    CredentialActiveError,
+    CredentialDestroyFailedError,
+    CredentialExpiredError,
     DependencyTimeoutError,
     DependencyUnavailableError,
     DigestMismatchError,
     IdentityDigestConflict,
+    IllegalGenerationError,
     InvalidCursorError,
     InvalidPageTokenError,
     InvalidRequestError,
     JobNotFoundError,
     KcsV2Error,
+    PayloadTooLargeError,
     ReplacementPodError,
     StaleCursorError,
     StalePageTokenError,
     StateConflictError,
     TombstonedError,
 )
+from .renderer import credential_secret_name
+from .transport import AgentRpcResponse, AgentRpcTransportProtocol
 
 EMPTY_OBJECT_DIGEST = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 DEFAULT_PAGE_SIZE = 50
@@ -96,6 +112,10 @@ class V2KubeAdapterProtocol(Protocol):
         limit_bytes: int,
     ) -> object: ...
 
+    def create_secret(self, body: object) -> object: ...
+
+    def delete_secret(self, name: str) -> bool: ...
+
 
 class V2JobStoreProtocol(Protocol):
     """Durable create/tombstone record operations used by this provider."""
@@ -121,6 +141,16 @@ class V2JobStoreProtocol(Protocol):
     def mark_deleted(self, provider_request_id: str, **values: object) -> object: ...
 
     def list_create(self) -> Sequence[object]: ...
+
+    def reserve_runtime(
+        self, kind: str, identity: str, job_ref: str, values: Mapping[str, str]
+    ) -> tuple[object, bool]: ...
+
+    def read_runtime(self, kind: str, identity: str) -> object | None: ...
+
+    def list_runtime(self, kind: str, job_ref: str) -> Sequence[object]: ...
+
+    def update_runtime(self, kind: str, identity: str, values: Mapping[str, str]) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +191,7 @@ class V2JobProvider:
         delete_poll_attempts: int = DEFAULT_DELETE_POLL_ATTEMPTS,
         delete_poll_interval_seconds: float = DEFAULT_DELETE_POLL_INTERVAL_SECONDS,
         sleeper: Callable[[float], None] | None = None,
+        transport: AgentRpcTransportProtocol | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -178,6 +209,7 @@ class V2JobProvider:
         self._delete_poll_attempts = delete_poll_attempts
         self._delete_poll_interval_seconds = delete_poll_interval_seconds
         self._sleeper = sleeper or time.sleep
+        self._transport = transport
 
     def create(self, request: CreateJobRequest) -> CreateResult:
         """Reserve before create and reconcile a response lost after API acceptance."""
@@ -386,6 +418,213 @@ class V2JobProvider:
             observed_at=self._now(),
         )
 
+    def grant_credential(
+        self, job_ref: str, metadata: CredentialGrantMetadata, raw_bytes: bytes
+    ) -> CredentialGrantSnapshot:
+        """Persist a non-secret grant then create the fixed agent-only Secret."""
+        if len(raw_bytes) > 65536:
+            raise PayloadTooLargeError()
+        if not hmac.compare_digest(
+            hashlib.sha256(raw_bytes).hexdigest(), metadata.credential_sha256
+        ):
+            raise DigestMismatchError()
+        if not hmac.compare_digest(
+            canonical_digest(metadata.digest_payload()), metadata.grant_metadata_digest
+        ):
+            raise DigestMismatchError()
+        binding = self._live_binding(job_ref)
+        if str(binding.job_uid) != str(metadata.job_uid) or str(binding.pod_uid) != str(
+            metadata.pod_uid
+        ):
+            raise ReplacementPodError()
+        self._assert_not_finalizing(job_ref)
+        identity_digest = hashlib.sha256(
+            f"{metadata.grant_metadata_digest}:{metadata.credential_sha256}".encode()
+        ).hexdigest()
+        existing = self._store.read_runtime("credential", metadata.credential_grant_ref)
+        if existing is not None:
+            if _runtime_values(existing).get("identityDigest") != identity_digest:
+                raise IdentityDigestConflict()
+            grant = self._grant_snapshot(existing)
+            self._expire_grant_if_needed(grant)
+            if grant.state is CredentialState.ACCEPTED:
+                try:
+                    self._kube.create_secret(self._credential_secret(job_ref, metadata, raw_bytes))
+                except Exception as error:
+                    raise DependencyUnavailableError(
+                        "Kubernetes did not accept the credential projection"
+                    ) from error
+                return self._update_grant(
+                    existing, state=CredentialState.AVAILABLE, secret_present=True
+                )
+            return self.inspect_credential_grant(job_ref, metadata.credential_grant_ref)
+        active = [
+            self._grant_snapshot(item) for item in self._store.list_runtime("credential", job_ref)
+        ]
+        if any(
+            item.state
+            in {
+                CredentialState.ACCEPTED,
+                CredentialState.AVAILABLE,
+                CredentialState.ACKNOWLEDGED,
+                CredentialState.CONSUMED,
+            }
+            for item in active
+        ):
+            raise CredentialActiveError()
+        values = self._grant_values(
+            job_ref, metadata, state=CredentialState.ACCEPTED, identity_digest=identity_digest
+        )
+        record, created = self._store.reserve_runtime(
+            "credential", metadata.credential_grant_ref, job_ref, values
+        )
+        if not created:
+            grant = self._grant_snapshot(record)
+            self._expire_grant_if_needed(grant)
+            return self.inspect_credential_grant(job_ref, metadata.credential_grant_ref)
+        try:
+            self._kube.create_secret(self._credential_secret(job_ref, metadata, raw_bytes))
+        except Exception as error:
+            raise DependencyUnavailableError(
+                "Kubernetes did not accept the credential projection"
+            ) from error
+        return self._update_grant(record, state=CredentialState.AVAILABLE, secret_present=True)
+
+    def inspect_credential_grant(
+        self, job_ref: str, credential_grant_ref: str
+    ) -> CredentialGrantSnapshot:
+        record = self._store.read_runtime("credential", credential_grant_ref)
+        if record is None or str(_field(record, "job_ref")) != job_ref:
+            raise JobNotFoundError()
+        snapshot = self._grant_snapshot(record)
+        self._expire_grant_if_needed(snapshot)
+        record = self._store.read_runtime("credential", credential_grant_ref)
+        if record is None:
+            raise DependencyUnavailableError()
+        return self._grant_snapshot(record)
+
+    def start_agent(self, job_ref: str, request: AgentStartRequest) -> GenerationSnapshot:
+        """Dispatch exactly one legal generation to the bound live supervisor."""
+        binding = self._live_binding(job_ref)
+        self._assert_not_finalizing(job_ref)
+        digest = canonical_digest(request.digest_payload())
+        existing = self._store.read_runtime("generation", f"{job_ref}:{request.generation}")
+        if existing is not None:
+            if _runtime_values(existing).get("identityDigest") != digest:
+                raise IdentityDigestConflict()
+            return self._generation_snapshot(existing, replayed=True)
+        previous = self._latest_generation(job_ref)
+        expected = 1 if previous is None else previous.generation + 1
+        if request.generation != expected or (
+            previous is not None
+            and (previous.runner_state is not RunnerState.EXITED or not previous.supervisor_alive)
+        ):
+            raise IllegalGenerationError()
+        grant = self.inspect_credential_grant(job_ref, request.credential_grant_ref)
+        if grant.state is not CredentialState.AVAILABLE or self._now() >= grant.expires_at:
+            self._expire_grant_if_needed(grant)
+            raise CredentialExpiredError()
+        if (
+            grant.agent_run_ref != request.agent_run_ref
+            or grant.generation != request.generation
+            or grant.launch_bundle_digest != request.launch_bundle_digest
+            or str(grant.job_uid) != str(binding.job_uid)
+            or str(grant.pod_uid) != str(binding.pod_uid)
+        ):
+            raise StateConflictError("The credential grant is not bound to this start request")
+        values = self._generation_values(job_ref, request, digest, binding)
+        record, created = self._store.reserve_runtime(
+            "generation", f"{job_ref}:{request.generation}", job_ref, values
+        )
+        if not created:
+            return self._generation_snapshot(record, replayed=True)
+        if self._transport is None:
+            raise DependencyUnavailableError("agent RPC transport is not configured")
+        rpc = self._agent_rpc(binding, request)
+        if (
+            rpc.protocol_version != 1
+            or rpc.generation != request.generation
+            or rpc.agent_run_ref != request.agent_run_ref
+            or rpc.launch_bundle_digest != request.launch_bundle_digest
+        ):
+            raise StateConflictError(
+                "The supervisor acknowledgement does not match the start request"
+            )
+        now = self._now()
+        self._acknowledge_grant(grant, request, now)
+        state = RunnerState.EXITED if rpc.state == "exited" else RunnerState.RUNNING
+        generation = self._generation_snapshot(record, replayed=False).model_copy(
+            update={
+                "runner_state": state,
+                "supervisor_alive": rpc.supervisor_alive,
+                "pid": rpc.pid,
+                "exit_code": rpc.exit_code,
+                "started_at": now,
+                "finished_at": now if state is RunnerState.EXITED else None,
+                "observed_at": now,
+                "credential_acknowledged_at": now,
+                "credential_destroyed_at": self.inspect_credential_grant(
+                    job_ref, grant.credential_grant_ref
+                ).destroyed_at,
+            }
+        )
+        self._store.update_runtime(
+            "generation",
+            str(_field(record, "identity")),
+            _runtime_values_with(record, {"payload": generation.model_dump_json(by_alias=True)}),
+        )
+        return generation
+
+    def finalize(self, job_ref: str, request: FinalizeJobRequest) -> JobBindingSnapshot:
+        """Quiesce supervisors and revoke credentials without deleting Job/Pod/log reality."""
+        if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
+            raise DigestMismatchError()
+        binding = self._live_binding(job_ref)
+        if request.spec.operation_refs or request.spec.transfer_refs:
+            raise StateConflictError(
+                "registered operations and transfers must be drained before finalize"
+            )
+        values = {
+            "identityDigest": request.request_digest,
+            "payload": json.dumps({"state": "accepted", "observedAt": self._now().isoformat()}),
+        }
+        record, created = self._store.reserve_runtime(
+            "finalize", request.finalize_ref, job_ref, values
+        )
+        if not created:
+            return self.inspect(job_ref)
+        for grant_record in self._store.list_runtime("credential", job_ref):
+            grant = self._grant_snapshot(grant_record)
+            if grant.state not in {
+                CredentialState.DESTROYED,
+                CredentialState.EXPIRED,
+                CredentialState.REVOKED,
+            }:
+                self._revoke_grant(grant)
+        if self._transport is None:
+            raise DependencyUnavailableError("supervisor RPC transport is not configured")
+        identity = {
+            "jobRef": job_ref,
+            "jobUid": str(binding.job_uid),
+            "podUid": str(binding.pod_uid),
+        }
+        try:
+            self._transport.stop_supervisor(identity, "agent")
+            self._transport.stop_supervisor(identity, "workspace")
+        except Exception as error:
+            raise DependencyUnavailableError("supervisor quiesce did not complete") from error
+        self._store.update_runtime(
+            "finalize",
+            str(_field(record, "identity")),
+            {
+                "identityDigest": request.request_digest,
+                "payload": json.dumps(
+                    {"state": "succeeded", "observedAt": self._now().isoformat()}
+                ),
+            },
+        )
+        return self.inspect(job_ref)
+
     def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
         """Persist deletion identity before removing workload reality."""
 
@@ -451,6 +690,255 @@ class V2JobProvider:
             raise
         except Exception as error:
             raise DependencyUnavailableError from error
+
+    def _live_binding(self, job_ref: str) -> JobBindingSnapshot:
+        binding = self.inspect(job_ref)
+        if binding.pod_uid is None or binding.binding_state is JobBindingState.INDETERMINATE:
+            raise ReplacementPodError()
+        return binding
+
+    def _assert_not_finalizing(self, job_ref: str) -> None:
+        if self._runtime_records("finalize", job_ref):
+            raise StateConflictError("The provider is already quiescing this Job")
+
+    def _grant_values(
+        self,
+        job_ref: str,
+        metadata: CredentialGrantMetadata,
+        *,
+        state: CredentialState,
+        identity_digest: str,
+    ) -> dict[str, str]:
+        now = self._now()
+        snapshot = CredentialGrantSnapshot(
+            credential_grant_ref=metadata.credential_grant_ref,
+            credential_sha256=metadata.credential_sha256,
+            grant_metadata_digest=metadata.grant_metadata_digest,
+            agent_run_ref=metadata.agent_run_ref,
+            generation=metadata.generation,
+            launch_bundle_digest=metadata.launch_bundle_digest,
+            audience=metadata.audience,
+            ttl_seconds=metadata.ttl_seconds,
+            job_ref=job_ref,
+            job_uid=metadata.job_uid,
+            pod_uid=metadata.pod_uid,
+            state=state,
+            accepted_at=now,
+            available_at=None,
+            acknowledged_at=None,
+            ack_agent_run_ref=None,
+            ack_generation=None,
+            consumed_at=None,
+            destroyed_at=None,
+            expires_at=now + timedelta(seconds=metadata.ttl_seconds),
+            tombstone_expires_at=now + self._tombstone_ttl,
+            secret_present=False,
+            destroy_failure_reason=None,
+            observed_at=now,
+        )
+        return {
+            "identityDigest": identity_digest,
+            "payload": snapshot.model_dump_json(by_alias=True),
+        }
+
+    @staticmethod
+    def _grant_snapshot(record: object) -> CredentialGrantSnapshot:
+        return CredentialGrantSnapshot.model_validate_json(_runtime_values(record)["payload"])
+
+    def _update_grant(
+        self,
+        record: object,
+        *,
+        state: CredentialState,
+        secret_present: bool | None,
+        reason: str | None = None,
+        acknowledged_at: datetime | None = None,
+        ack_agent_run_ref: str | None = None,
+        ack_generation: int | None = None,
+        consumed_at: datetime | None = None,
+        destroyed_at: datetime | None = None,
+    ) -> CredentialGrantSnapshot:
+        before = self._grant_snapshot(record)
+        now = self._now()
+        after = before.model_copy(
+            update={
+                "state": state,
+                "available_at": now if state is CredentialState.AVAILABLE else before.available_at,
+                "acknowledged_at": acknowledged_at
+                if acknowledged_at is not None
+                else before.acknowledged_at,
+                "ack_agent_run_ref": ack_agent_run_ref
+                if ack_agent_run_ref is not None
+                else before.ack_agent_run_ref,
+                "ack_generation": ack_generation
+                if ack_generation is not None
+                else before.ack_generation,
+                "consumed_at": consumed_at if consumed_at is not None else before.consumed_at,
+                "destroyed_at": destroyed_at if destroyed_at is not None else before.destroyed_at,
+                "secret_present": secret_present,
+                "destroy_failure_reason": reason,
+                "observed_at": now,
+            }
+        )
+        written = self._store.update_runtime(
+            "credential",
+            str(_field(record, "identity")),
+            _runtime_values_with(record, {"payload": after.model_dump_json(by_alias=True)}),
+        )
+        return self._grant_snapshot(written)
+
+    def _expire_grant_if_needed(self, grant: CredentialGrantSnapshot) -> None:
+        if self._now() < grant.expires_at or grant.state not in {
+            CredentialState.ACCEPTED,
+            CredentialState.AVAILABLE,
+        }:
+            return
+        record = self._store.read_runtime("credential", grant.credential_grant_ref)
+        if record is None:
+            return
+        self._destroy_grant(record, CredentialState.EXPIRED)
+
+    def _destroy_grant(self, record: object, state: CredentialState) -> CredentialGrantSnapshot:
+        grant = self._grant_snapshot(record)
+        try:
+            self._kube.delete_secret(credential_secret_name(grant.job_ref))
+        except Exception:
+            return self._update_grant(
+                record,
+                state=CredentialState.DESTROY_FAILED,
+                secret_present=True,
+                reason="Kubernetes Secret delete failed",
+            )
+        return self._update_grant(
+            record,
+            state=state,
+            secret_present=False,
+            destroyed_at=self._now(),
+        )
+
+    def _acknowledge_grant(
+        self, grant: CredentialGrantSnapshot, request: AgentStartRequest, now: datetime
+    ) -> None:
+        record = self._store.read_runtime("credential", grant.credential_grant_ref)
+        if record is None:
+            raise DependencyUnavailableError()
+        acknowledged = self._update_grant(
+            record,
+            state=CredentialState.ACKNOWLEDGED,
+            secret_present=True,
+            acknowledged_at=now,
+            ack_agent_run_ref=request.agent_run_ref,
+            ack_generation=request.generation,
+        )
+        record = self._store.read_runtime("credential", acknowledged.credential_grant_ref)
+        if record is None:
+            raise DependencyUnavailableError()
+        destroyed = self._destroy_grant(record, CredentialState.DESTROYED)
+        if destroyed.state is CredentialState.DESTROY_FAILED:
+            raise CredentialDestroyFailedError()
+
+    def _revoke_grant(self, grant: CredentialGrantSnapshot) -> None:
+        record = self._store.read_runtime("credential", grant.credential_grant_ref)
+        if record is None:
+            return
+        destroyed = self._destroy_grant(record, CredentialState.REVOKED)
+        if destroyed.state is CredentialState.DESTROY_FAILED:
+            raise CredentialDestroyFailedError()
+
+    def _credential_secret(
+        self, job_ref: str, metadata: CredentialGrantMetadata, raw_bytes: bytes
+    ) -> dict[str, object]:
+        return {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": credential_secret_name(job_ref),
+                "labels": {"researchcosmos.io/managed-by": "v2-attempt-runtime"},
+                "ownerReferences": [],
+                "annotations": {
+                    "researchcosmos.io/job-uid": str(metadata.job_uid),
+                    "researchcosmos.io/pod-uid": str(metadata.pod_uid),
+                    "researchcosmos.io/grant-ref": metadata.credential_grant_ref,
+                },
+            },
+            "type": "Opaque",
+            "data": {"credential": base64.b64encode(raw_bytes).decode("ascii")},
+        }
+
+    def _generation_values(
+        self, job_ref: str, request: AgentStartRequest, digest: str, binding: JobBindingSnapshot
+    ) -> dict[str, str]:
+        now = self._now()
+        snapshot = GenerationSnapshot(
+            job_ref=job_ref,
+            generation=request.generation,
+            agent_run_ref=request.agent_run_ref,
+            execution_envelope_ref=request.execution_envelope_ref,
+            execution_envelope_digest=request.execution_envelope_digest,
+            launch_bundle_path=request.launch_bundle_path,
+            launch_bundle_digest=request.launch_bundle_digest,
+            launch_bundle_size_bytes=request.launch_bundle_size_bytes,
+            material_paths=request.material_paths,
+            credential_grant_ref=request.credential_grant_ref,
+            start_metadata_digest=digest,
+            runner_state=RunnerState.ACCEPTED,
+            supervisor_alive=True,
+            pid=None,
+            exit_code=None,
+            started_at=None,
+            finished_at=None,
+            observed_at=now,
+            replayed=False,
+            credential_acknowledged_at=None,
+            credential_destroyed_at=None,
+        )
+        return {
+            "identityDigest": digest,
+            "jobUid": str(binding.job_uid),
+            "podUid": str(binding.pod_uid),
+            "payload": snapshot.model_dump_json(by_alias=True),
+        }
+
+    @staticmethod
+    def _generation_snapshot(record: object, *, replayed: bool) -> GenerationSnapshot:
+        result = GenerationSnapshot.model_validate_json(_runtime_values(record)["payload"])
+        return result.model_copy(update={"replayed": replayed})
+
+    def _latest_generation(self, job_ref: str) -> GenerationSnapshot | None:
+        generations = [
+            self._generation_snapshot(item, replayed=False)
+            for item in self._store.list_runtime("generation", job_ref)
+        ]
+        return max(generations, key=lambda item: item.generation) if generations else None
+
+    def _agent_rpc(
+        self, binding: JobBindingSnapshot, request: AgentStartRequest
+    ) -> AgentRpcResponse:
+        if self._transport is None or binding.pod_uid is None:
+            raise DependencyUnavailableError()
+        return self._transport.agent_rpc(
+            {
+                "jobRef": binding.job_ref,
+                "jobUid": str(binding.job_uid),
+                "podUid": str(binding.pod_uid),
+            },
+            {
+                "protocolVersion": 1,
+                "generation": request.generation,
+                "agentRunRef": request.agent_run_ref,
+                "executionEnvelopeRef": request.execution_envelope_ref,
+                "executionEnvelopeDigest": request.execution_envelope_digest,
+                "launchBundlePath": request.launch_bundle_path,
+                "launchBundleDigest": request.launch_bundle_digest,
+                "launchBundleSizeBytes": request.launch_bundle_size_bytes,
+                "materialPaths": request.material_paths,
+                "credentialGrantRef": request.credential_grant_ref,
+            },
+        )
+
+    def _runtime_records(self, kind: str, job_ref: str) -> Sequence[object]:
+        method = getattr(self._store, "list_runtime", None)
+        return tuple(method(kind, job_ref)) if callable(method) else ()
 
     def _create_or_reconcile_job(self, rendered_job: object, job_ref: str) -> object:
         try:
@@ -549,6 +1037,22 @@ class V2JobProvider:
         gpu_release_state = (
             CleanupState.PENDING if _workspace_gpu(record) > 0 else CleanupState.NOT_REQUIRED
         )
+        grants = [
+            self._grant_snapshot(item)
+            for item in self._runtime_records("credential", str(_field(record, "job_ref")))
+        ]
+        generations = [
+            self._generation_snapshot(item, replayed=False)
+            for item in self._runtime_records("generation", str(_field(record, "job_ref")))
+        ]
+        finalizations = self._runtime_records("finalize", str(_field(record, "job_ref")))
+        latest = max(generations, key=lambda item: item.generation) if generations else None
+        finalize_action = _finalize_action(finalizations)
+        if finalizations and binding_state not in {
+            JobBindingState.SUCCEEDED,
+            JobBindingState.FAILED,
+        }:
+            binding_state = JobBindingState.FINALIZING
         return JobBindingSnapshot(
             job_ref=str(_field(record, "job_ref")),
             provider_handle=str(_field(record, "job_ref")),
@@ -570,12 +1074,20 @@ class V2JobProvider:
             observed_at=observed_at,
             agent=agent,
             workspace=workspace,
-            latest_agent_generation=None,
+            latest_agent_generation=latest,
             active_operation_refs=[],
             terminal_operation_refs=[],
-            credential_observations=[],
+            credential_observations=[
+                CredentialObservation(
+                    credential_grant_ref=item.credential_grant_ref,
+                    state=item.state,
+                    secret_present=item.secret_present,
+                    observed_at=item.observed_at,
+                )
+                for item in grants
+            ],
             transfer_observations=[],
-            finalize_action=_not_requested_action(),
+            finalize_action=finalize_action,
             cancel_action=_not_requested_action(),
             delete_action=_not_requested_action(),
             output_loss_possible=False,
@@ -618,7 +1130,9 @@ class V2JobProvider:
             terminal_operation_refs=[],
             credential_observations=[],
             transfer_observations=[],
-            finalize_action=_not_requested_action(),
+            finalize_action=_finalize_action(
+                self._runtime_records("finalize", str(_field(record, "job_ref")))
+            ),
             cancel_action=_not_requested_action(),
             delete_action=_not_requested_action(),
             output_loss_possible=False,
@@ -741,6 +1255,41 @@ def _field(value: object, name: str, default: object = _MISSING) -> Any:
     if default is _MISSING:
         raise DependencyUnavailableError(f"Provider record is missing required field {name}")
     return default
+
+
+def _runtime_values(record: object) -> Mapping[str, str]:
+    values = _field(record, "values", {})
+    if not isinstance(values, Mapping):
+        raise DependencyUnavailableError("runtime record values are invalid")
+    return {str(key): str(value) for key, value in values.items()}
+
+
+def _runtime_values_with(record: object, changes: Mapping[str, str]) -> dict[str, str]:
+    values = dict(_runtime_values(record))
+    values.update(changes)
+    return values
+
+
+def _finalize_action(records: Sequence[object]) -> ActionSnapshot:
+    if not records:
+        return _not_requested_action()
+    record = records[-1]
+    values = _runtime_values(record)
+    try:
+        payload = json.loads(values["payload"])
+        observed_at = _as_datetime(payload["observedAt"], datetime.now(UTC))
+        state = (
+            ActionState.SUCCEEDED if payload.get("state") == "succeeded" else ActionState.ACCEPTED
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        state = ActionState.INDETERMINATE
+        observed_at = datetime.now(UTC)
+    return ActionSnapshot(
+        action_ref=str(_field(record, "identity")),
+        request_digest=values.get("identityDigest"),
+        state=state,
+        observed_at=observed_at,
+    )
 
 
 def _path(value: object, *names: str) -> Any:

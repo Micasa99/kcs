@@ -1,4 +1,5 @@
 """Authenticated FastAPI adapter for the first executable KCS V2 Job journey."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi import Path as ApiPath
@@ -21,7 +22,12 @@ from pydantic import BaseModel
 
 from kcs.jobs.canonical import DigestMismatchError as CanonicalDigestMismatchError
 from kcs.jobs.contracts import (
+    AgentStartRequest,
     CreateJobRequest,
+    CredentialGrantMetadata,
+    CredentialGrantSnapshot,
+    FinalizeJobRequest,
+    GenerationSnapshot,
     JobBindingSnapshot,
     JobBindingSnapshotList,
     JobBindingState,
@@ -142,6 +148,10 @@ def _require_json_media_type(request: Request) -> None:
     if request.method not in {"POST", "PUT", "PATCH"}:
         return
     media_type = request.headers.get("content-type", "").partition(";")[0].strip()
+    if request.url.path.endswith("/agent/credential-grants"):
+        if media_type.lower() != "application/octet-stream":
+            raise _UnsupportedMediaTypeError
+        return
     if media_type.lower() != "application/json":
         raise _UnsupportedMediaTypeError
 
@@ -289,6 +299,130 @@ def create_jobs_router(
         ] = DEFAULT_LOG_LIMIT_BYTES,
     ) -> Response:
         return _json_model(provider.logs(job_ref, container, cursor, limit_bytes))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/agent/credential-grants",
+        operation_id="grantCredential",
+        tags=["Credentials"],
+        status_code=201,
+        response_model=CredentialGrantSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503),
+    )
+    async def grant_credential(
+        request: Request,
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential_grant_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Credential-Grant-Ref",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        credential_sha256: Annotated[
+            str, Header(alias="KCS-Credential-SHA256", pattern=_SHA256_PATTERN)
+        ],
+        grant_metadata_digest: Annotated[
+            str, Header(alias="KCS-Grant-Metadata-Digest", pattern=_SHA256_PATTERN)
+        ],
+        agent_run_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Agent-Run-Ref", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN
+            ),
+        ],
+        generation: Annotated[int, Header(alias="KCS-Generation", ge=1)],
+        launch_bundle_digest: Annotated[
+            str, Header(alias="KCS-Launch-Bundle-Digest", pattern=_SHA256_PATTERN)
+        ],
+        audience: Annotated[
+            str,
+            Header(alias="KCS-Audience", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        ttl_seconds: Annotated[int, Header(alias="KCS-Credential-TTL-Seconds", ge=1, le=900)],
+        job_uid: Annotated[UUID, Header(alias="KCS-Job-UID")],
+        pod_uid: Annotated[UUID, Header(alias="KCS-Pod-UID")],
+    ) -> Response:
+        try:
+            provider.inspect_credential_grant(job_ref, credential_grant_ref)
+            replay = True
+        except KcsV2Error:
+            replay = False
+        metadata = CredentialGrantMetadata(
+            credential_grant_ref=credential_grant_ref,
+            credential_sha256=credential_sha256,
+            grant_metadata_digest=grant_metadata_digest,
+            agent_run_ref=agent_run_ref,
+            generation=generation,
+            launch_bundle_digest=launch_bundle_digest,
+            audience=audience,
+            ttl_seconds=ttl_seconds,
+            job_uid=job_uid,
+            pod_uid=pod_uid,
+        )
+        return _json_model(
+            provider.grant_credential(job_ref, metadata, await request.body()),
+            status_code=200 if replay else 201,
+        )
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",
+        operation_id="inspectCredentialGrant",
+        tags=["Credentials"],
+        response_model=CredentialGrantSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 500, 503),
+    )
+    def inspect_credential_grant(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential_grant_ref: Annotated[
+            str,
+            ApiPath(
+                alias="credentialGrantRef",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(provider.inspect_credential_grant(job_ref, credential_grant_ref))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/agent/start",
+        operation_id="startAgent",
+        tags=["Jobs"],
+        status_code=202,
+        response_model=GenerationSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503, 504),
+    )
+    def start_agent(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: AgentStartRequest,
+    ) -> Response:
+        result = provider.start_agent(job_ref, payload)
+        return _json_model(result, status_code=200 if result.replayed else 202)
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/finalize",
+        operation_id="finalizeJob",
+        tags=["Jobs"],
+        status_code=202,
+        response_model=JobBindingSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
+    )
+    def finalize_job(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: FinalizeJobRequest,
+    ) -> Response:
+        return _json_model(provider.finalize(job_ref, payload), status_code=202)
 
     @router.delete(
         "/api/v2/jobs/{jobRef}",
