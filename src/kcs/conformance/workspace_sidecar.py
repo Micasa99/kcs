@@ -16,7 +16,8 @@ import tempfile
 import unicodedata
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any
+from threading import RLock
+from typing import Any, NoReturn
 
 from kcs.jobs.errors import DependencyUnavailableError
 from kcs.jobs.policy import validate_safe_relative_path
@@ -48,6 +49,9 @@ class WorkspaceSidecar:
         self._receipts = _private_directory(self._private, "receipts")
         self._transfers: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, dict[str, Any]] = {}
+        self._operation_claims: dict[str, dict[str, str]] = {}
+        self._operation_fences: dict[str, dict[str, str]] = {}
+        self._operation_lock = RLock()
         self._stage_installs = 0
         self._operation_side_effects = 0
 
@@ -88,7 +92,10 @@ class WorkspaceSidecar:
 
     def forget_operations(self) -> None:
         """Model a surviving Pod whose replacement sidecar lost runtime truth."""
-        self._operations.clear()
+        with self._operation_lock:
+            self._operations.clear()
+            self._operation_claims.clear()
+            self._operation_fences.clear()
 
     def _handle(
         self, request: Mapping[str, Any], body: Path | None
@@ -109,6 +116,8 @@ class WorkspaceSidecar:
             return self._discard_transfer(request), None
         if action == "invoke":
             return self._invoke(request), None
+        if action == "fenceOperation":
+            return self._fence_operation(request), None
         if action == "inspectOperation":
             return self._inspect_operation(request), None
         if action in {"cancelOperation", "discardOperation"}:
@@ -184,6 +193,10 @@ class WorkspaceSidecar:
             if retained.get("state") in {"canceled", "discarded"}:
                 raise _RpcRejectedError(
                     "STATE_CONFLICT", "the transfer already reached a terminal state"
+                )
+            if retained.get("state") == "indeterminate":
+                raise _RpcRejectedError(
+                    "TRANSFER_INDETERMINATE", "the transfer has indeterminate retained state"
                 )
 
         self._validate_transfer_path(request, allow_stage_existing=True)
@@ -266,6 +279,8 @@ class WorkspaceSidecar:
         parent_fd: int,
         target_name: str,
         partial: Path,
+        *,
+        canceling: bool = False,
     ) -> dict[str, Any] | None:
         if (
             retained.get("direction") != "stage_input"
@@ -281,9 +296,20 @@ class WorkspaceSidecar:
             )
         matches = _casefold_entries_at(parent_fd, target_name)
         if len(matches) > 1 or (matches and matches[0] != target_name):
+            if canceling:
+                self._reject_installing_indeterminate(
+                    retained, "installing target publication is ambiguous"
+                )
             raise _RpcRejectedError("UNSAFE_PATH", "workspace target is ambiguous")
         if matches:
-            target_stat, target_size, target_digest = _inspect_at(parent_fd, target_name)
+            try:
+                target_stat, target_size, target_digest = _inspect_at(parent_fd, target_name)
+            except (OSError, _RpcRejectedError):
+                if canceling:
+                    self._reject_installing_indeterminate(
+                        retained, "installing target publication is unsafe"
+                    )
+                raise
             if (
                 target_stat.st_dev == retained["installDevice"]
                 and target_stat.st_ino == retained["installInode"]
@@ -294,6 +320,10 @@ class WorkspaceSidecar:
                 os.fsync(parent_fd)
                 self._write_receipt(completed)
                 return completed
+            if canceling:
+                self._reject_installing_indeterminate(
+                    retained, "installing target differs from retained intent"
+                )
             code = (
                 "OVERWRITE_FORBIDDEN"
                 if request.get("overwritePolicy") == "forbid"
@@ -304,6 +334,10 @@ class WorkspaceSidecar:
             partial_stat = partial.stat(follow_symlinks=False)
             partial_size, partial_digest = _hash_nofollow(partial)
         except FileNotFoundError as error:
+            if canceling:
+                self._reject_installing_indeterminate(
+                    retained, "installing private bytes cannot be reconciled"
+                )
             raise _RpcRejectedError(
                 "TRANSFER_INDETERMINATE", "installing bytes cannot be reconciled"
             ) from error
@@ -313,10 +347,22 @@ class WorkspaceSidecar:
             or partial_size != retained["actualSizeBytes"]
             or partial_digest != retained["actualSha256"]
         ):
+            if canceling:
+                self._reject_installing_indeterminate(
+                    retained, "installing private bytes differ from retained intent"
+                )
             raise _RpcRejectedError(
                 "TRANSFER_INDETERMINATE", "installing bytes differ from retained intent"
             )
         return None
+
+    def _reject_installing_indeterminate(
+        self, retained: Mapping[str, Any], message: str
+    ) -> NoReturn:
+        result = {**retained, "ok": True, "state": "indeterminate"}
+        self._write_receipt(result)
+        self._transfers[str(retained["transferRef"])] = result
+        raise _RpcRejectedError("TRANSFER_INDETERMINATE", message)
 
     def _collect(self, request: Mapping[str, Any]) -> tuple[dict[str, object], Path | None]:
         transfer_ref, digest = _identity(request, "transferRef", "requestDigest")
@@ -402,10 +448,48 @@ class WorkspaceSidecar:
     def _cancel_transfer(self, request: Mapping[str, Any]) -> dict[str, object]:
         transfer_ref, digest = _identity(request, "transferRef", "requestDigest")
         retained = self._transfers.get(transfer_ref) or self._load_receipt(transfer_ref)
+        if retained is not None:
+            _same_digest(retained, digest)
+        partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
+        if retained is not None and retained.get("state") == "installing":
+            raw_path = retained.get("path")
+            if not isinstance(raw_path, str):
+                raise _RpcRejectedError(
+                    "TRANSFER_INDETERMINATE", "installing receipt has no workspace path"
+                )
+            try:
+                parent_fd, target_name = self._open_parent(raw_path, create=False)
+            except _RpcRejectedError:
+                self._reject_installing_indeterminate(
+                    retained, "installing target publication is ambiguous"
+                )
+            try:
+                reconciled = self._reconcile_installing(
+                    {
+                        "path": raw_path,
+                        "overwritePolicy": retained.get("overwritePolicy"),
+                        "declaredSizeBytes": retained.get("actualSizeBytes"),
+                        "contentSha256": retained.get("actualSha256"),
+                    },
+                    retained,
+                    parent_fd,
+                    target_name,
+                    partial,
+                    canceling=True,
+                )
+            finally:
+                os.close(parent_fd)
+            if reconciled is not None:
+                self._transfers[transfer_ref] = reconciled
+                raise _RpcRejectedError("STATE_CONFLICT", "completed transfer cannot be canceled")
         if retained is not None and retained.get("state") == "completed":
             raise _RpcRejectedError("STATE_CONFLICT", "completed transfer cannot be canceled")
-        partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
+        if retained is not None and retained.get("state") == "indeterminate":
+            raise _RpcRejectedError(
+                "TRANSFER_INDETERMINATE", "the transfer has indeterminate retained state"
+            )
         partial.unlink(missing_ok=True)
+        _fsync_directory(self._partials)
         result = {
             "ok": True,
             "transferRef": transfer_ref,
@@ -469,7 +553,8 @@ class WorkspaceSidecar:
             or value.get("receiptVersion") != 1
             or value.get("transferRef") != transfer_ref
             or not isinstance(value.get("requestDigest"), str)
-            or value.get("state") not in {"installing", "completed", "canceled", "discarded"}
+            or value.get("state")
+            not in {"installing", "completed", "canceled", "discarded", "indeterminate"}
         ):
             raise _RpcRejectedError("TRANSFER_INDETERMINATE", "transfer receipt is invalid")
         snapshot_name = value.get("snapshotName")
@@ -502,45 +587,97 @@ class WorkspaceSidecar:
 
     def _invoke(self, request: Mapping[str, Any]) -> dict[str, object]:
         operation_ref, digest = _identity(request, "operationRef", "requestDigest")
+        dispatch_token = _dispatch_token(request)
         frame = request.get("frame")
         if not isinstance(frame, dict) or frame.get("protocol") != "cosmos.workspace/1":
             raise _RpcRejectedError("INVALID_REQUEST", "workspace frame is invalid")
-        retained = self._operations.get(operation_ref)
-        if retained is not None:
-            _same_digest(retained, digest)
-            return dict(retained)
-        subprocess.run([sys.executable, "-c", "pass"], check=True)
-        self._operation_side_effects += 1
-        exit_code = frame.get("exitCode", 0)
-        if type(exit_code) is not int:
-            raise _RpcRejectedError("INVALID_REQUEST", "echo exitCode must be an integer")
-        result = {
-            "ok": True,
-            "operationRef": operation_ref,
-            "requestDigest": digest,
-            "state": "succeeded" if exit_code == 0 else "failed",
-            "exitCode": exit_code,
-            "stdout": str(frame.get("stdout", "")),
-            "stderr": str(frame.get("stderr", "")),
-            "inlineResult": frame.get("result"),
-            "resultTransferRef": frame.get("resultTransferRef"),
-        }
-        self._operations[operation_ref] = result
-        return dict(result)
+        with self._operation_lock:
+            retained = self._operations.get(operation_ref)
+            if retained is not None:
+                _same_digest(retained, digest)
+                return dict(retained)
+            fence = self._operation_fences.get(operation_ref)
+            if fence is not None:
+                _same_digest(fence, digest)
+                raise _RpcRejectedError(
+                    "OPERATION_INDETERMINATE", "workspace operation dispatch was fenced"
+                )
+            claim = self._operation_claims.get(operation_ref)
+            if claim is not None:
+                _same_digest(claim, digest)
+                if claim.get("dispatchToken") != dispatch_token:
+                    raise _RpcRejectedError(
+                        "OPERATION_INDETERMINATE", "workspace dispatch token was superseded"
+                    )
+            else:
+                self._operation_claims[operation_ref] = {
+                    "requestDigest": digest,
+                    "dispatchToken": dispatch_token,
+                }
+            subprocess.run([sys.executable, "-c", "pass"], check=True)
+            self._operation_side_effects += 1
+            exit_code = frame.get("exitCode", 0)
+            if type(exit_code) is not int:
+                raise _RpcRejectedError("INVALID_REQUEST", "echo exitCode must be an integer")
+            result = {
+                "ok": True,
+                "operationRef": operation_ref,
+                "requestDigest": digest,
+                "state": "succeeded" if exit_code == 0 else "failed",
+                "exitCode": exit_code,
+                "stdout": str(frame.get("stdout", "")),
+                "stderr": str(frame.get("stderr", "")),
+                "inlineResult": frame.get("result"),
+                "resultTransferRef": frame.get("resultTransferRef"),
+            }
+            self._operations[operation_ref] = result
+            return dict(result)
+
+    def _fence_operation(self, request: Mapping[str, Any]) -> dict[str, object]:
+        operation_ref, digest = _identity(request, "operationRef", "requestDigest")
+        dispatch_token = _dispatch_token(request)
+        with self._operation_lock:
+            retained = self._operations.get(operation_ref)
+            if retained is not None:
+                _same_digest(retained, digest)
+                return {"ok": True, "known": True, **retained}
+            claim = self._operation_claims.get(operation_ref)
+            if claim is not None:
+                _same_digest(claim, digest)
+                if claim.get("dispatchToken") != dispatch_token:
+                    raise _RpcRejectedError("IDENTITY_CONFLICT", "workspace dispatch token differs")
+            fence = self._operation_fences.get(operation_ref)
+            if fence is not None:
+                _same_digest(fence, digest)
+            else:
+                self._operation_fences[operation_ref] = {
+                    "requestDigest": digest,
+                    "dispatchToken": dispatch_token,
+                }
+            return {
+                "ok": True,
+                "known": False,
+                "fenced": True,
+                "operationRef": operation_ref,
+                "requestDigest": digest,
+            }
 
     def _inspect_operation(self, request: Mapping[str, Any]) -> dict[str, object]:
         operation_ref = request.get("operationRef")
-        retained = self._operations.get(str(operation_ref))
-        return {"ok": True, "known": retained is not None, **(retained or {})}
+        with self._operation_lock:
+            retained = self._operations.get(str(operation_ref))
+            return {"ok": True, "known": retained is not None, **(retained or {})}
 
     def _end_operation(self, request: Mapping[str, Any], action: str) -> dict[str, object]:
         operation_ref = request.get("operationRef")
-        retained = self._operations.get(str(operation_ref))
-        if retained is None:
-            return {"ok": True, "known": False}
-        if action == "discardOperation":
-            self._operations.pop(str(operation_ref), None)
-        return {"ok": True, "known": True, **retained}
+        with self._operation_lock:
+            retained = self._operations.get(str(operation_ref))
+            if retained is None:
+                return {"ok": True, "known": False}
+            if action == "discardOperation":
+                self._operations.pop(str(operation_ref), None)
+                self._operation_claims.pop(str(operation_ref), None)
+            return {"ok": True, "known": True, **retained}
 
     @staticmethod
     def _casefold_entries(parent: Path, name: str) -> list[Path]:
@@ -688,6 +825,13 @@ def _identity(request: Mapping[str, Any], ref_field: str, digest_field: str) -> 
 def _same_digest(retained: Mapping[str, Any], digest: str) -> None:
     if retained.get("requestDigest") != digest:
         raise _RpcRejectedError("IDENTITY_CONFLICT", "retained identity digest differs")
+
+
+def _dispatch_token(request: Mapping[str, Any]) -> str:
+    value = request.get("dispatchToken")
+    if not isinstance(value, str) or len(value) != 32:
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace dispatch token is invalid")
+    return value
 
 
 def _byte_contract(request: Mapping[str, Any]) -> tuple[int, str]:

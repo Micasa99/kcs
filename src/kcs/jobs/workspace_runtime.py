@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, BinaryIO, Protocol
 from uuid import UUID, uuid4
 
@@ -125,7 +126,9 @@ class WorkspaceRuntime:
         self._live_binding = live_binding
         self._assert_accepting = assert_accepting
         self._clock = clock
-        self._dispatch_owner = uuid4().hex
+        self._runtime_id = uuid4().hex
+        self._active_dispatch_tokens: set[str] = set()
+        self._active_dispatch_lock = Lock()
 
     def register_transfer(self, job_ref: str, request: TransferRegisterRequest) -> TransferResult:
         binding = self._live_binding(job_ref)
@@ -336,16 +339,71 @@ class WorkspaceRuntime:
                 if current_action.state is not ActionState.ACCEPTED:
                     raise StateConflictError("The transfer changed before cancellation")
                 accepted = retained
-        self._rpc_checked(
-            binding,
-            {
-                "action": "cancelTransfer",
-                "transferRef": transfer_ref,
-                "requestDigest": before.request_digest,
-                "cancelRef": request.cancel_ref,
-                "cancelDigest": request.request_digest,
-            },
-        )
+        try:
+            self._rpc_checked(
+                binding,
+                {
+                    "action": "cancelTransfer",
+                    "transferRef": transfer_ref,
+                    "requestDigest": before.request_digest,
+                    "cancelRef": request.cancel_ref,
+                    "cancelDigest": request.request_digest,
+                },
+            )
+        except TransferIndeterminateError:
+            observed_at = self._clock()
+            indeterminate = accepted.model_copy(
+                update={
+                    "state": TransferState.INDETERMINATE,
+                    "content_available": False,
+                    "completed_at": observed_at,
+                    "updated_at": observed_at,
+                    "observed_at": observed_at,
+                    "failure_reason": "workspace transfer cancellation is indeterminate",
+                    "cancel_action": accepted.cancel_action.model_copy(
+                        update={
+                            "state": ActionState.INDETERMINATE,
+                            "observed_at": observed_at,
+                        }
+                    ),
+                }
+            )
+            self._cas_transfer(record, indeterminate)
+            raise
+        except StateConflictError as error:
+            truth = self._rpc_checked(
+                binding,
+                {"action": "inspectTransfer", "transferRef": transfer_ref},
+            )
+            if (
+                truth.header.get("known") is True
+                and truth.header.get("state") == "completed"
+                and truth.header.get("requestDigest") == before.request_digest
+            ):
+                if (
+                    truth.header.get("actualSizeBytes") != before.spec.declared_size_bytes
+                    or truth.header.get("actualSha256") != before.spec.content_sha256
+                ):
+                    raise TransferBytesMismatchError() from error
+                observed_at = self._clock()
+                completed = accepted.model_copy(
+                    update={
+                        "state": TransferState.COMPLETED,
+                        "actual_size_bytes": before.spec.declared_size_bytes,
+                        "actual_sha256": before.spec.content_sha256,
+                        "verified": True,
+                        "content_available": True,
+                        "completed_at": observed_at,
+                        "updated_at": observed_at,
+                        "observed_at": observed_at,
+                        "failure_reason": None,
+                        "cancel_action": accepted.cancel_action.model_copy(
+                            update={"state": ActionState.FAILED, "observed_at": observed_at}
+                        ),
+                    }
+                )
+                self._cas_transfer(record, completed)
+            raise
         completed_at = self._clock()
         canceled = accepted.model_copy(
             update={
@@ -465,6 +523,7 @@ class WorkspaceRuntime:
             )
         self._assert_binding_accepts_new_work(job_ref, binding)
         now = self._clock()
+        dispatch_token = uuid4().hex
         accepted = WorkspaceOperationSnapshot(
             job_ref=job_ref,
             operation_ref=request.operation_ref,
@@ -492,52 +551,67 @@ class WorkspaceRuntime:
             "frameDigest": frame_digest,
             "jobUid": str(binding.job_uid),
             "podUid": str(_pod_uid(binding)),
-            "dispatchOwner": self._dispatch_owner,
+            "dispatchRuntime": self._runtime_id,
+            "dispatchToken": dispatch_token,
             "dispatchPhase": "reserved",
             "payload": accepted.model_dump_json(by_alias=True),
         }
+        record: object | None = None
+        created = False
+        self._activate_dispatch(dispatch_token)
         try:
-            record, created = self._store.reserve_runtime(
-                "operation", request.operation_ref, job_ref, values
-            )
-        except IdentityDigestConflictError as error:
-            raise OperationIdentityConflictError() from error
-        retained = self._operation_snapshot(record)
-        self._validate_operation_identity(retained, request, frame_digest, binding)
-        if not created:
+            try:
+                record, created = self._store.reserve_runtime(
+                    "operation", request.operation_ref, job_ref, values
+                )
+            except IdentityDigestConflictError as error:
+                raise OperationIdentityConflictError() from error
+            retained = self._operation_snapshot(record)
+            self._validate_operation_identity(retained, request, frame_digest, binding)
+            if not created:
+                return WorkspaceOperationResult(
+                    self._recover_operation(record, retained, binding), created=False
+                )
+            record = self._claim_operation_dispatch(record, retained, dispatch_token)
+            record, retained = self._prove_operation_dispatch_owner(record, dispatch_token)
+            try:
+                reply = self._rpc_checked(
+                    binding,
+                    {
+                        "action": "invoke",
+                        "operationRef": request.operation_ref,
+                        "requestDigest": request.request_digest,
+                        "dispatchToken": dispatch_token,
+                        "frame": request.frame.root,
+                    },
+                    identity_kind="operation",
+                )
+            except (StateConflictError, DependencyUnavailableError):
+                raise
+            except Exception as error:
+                raise DependencyUnavailableError(
+                    "workspace invoke response was not confirmed"
+                ) from error
             return WorkspaceOperationResult(
-                self._recover_operation(record, retained, binding), created=False
+                self._record_operation_result(record, retained, reply), created=True
             )
-        record = self._claim_operation_dispatch(record, retained)
-        record, retained = self._prove_operation_dispatch_owner(record)
-        try:
-            reply = self._rpc_checked(
-                binding,
-                {
-                    "action": "invoke",
-                    "operationRef": request.operation_ref,
-                    "requestDigest": request.request_digest,
-                    "frame": request.frame.root,
-                },
-                identity_kind="operation",
-            )
-        except (StateConflictError, DependencyUnavailableError):
-            raise
-        except Exception as error:
-            raise DependencyUnavailableError(
-                "workspace invoke response was not confirmed"
-            ) from error
-        return WorkspaceOperationResult(
-            self._record_operation_result(record, retained, reply), created=True
-        )
+        finally:
+            self._deactivate_dispatch(dispatch_token)
+            if created and record is not None:
+                self._relinquish_operation_dispatch(record, dispatch_token)
 
     def _claim_operation_dispatch(
-        self, record: object, retained: WorkspaceOperationSnapshot
+        self,
+        record: object,
+        retained: WorkspaceOperationSnapshot,
+        dispatch_token: str,
     ) -> object:
         values = _values(record)
         if (
-            values.get("dispatchOwner") != self._dispatch_owner
+            values.get("dispatchRuntime") != self._runtime_id
+            or values.get("dispatchToken") != dispatch_token
             or values.get("dispatchPhase") != "reserved"
+            or not self._dispatch_is_active(dispatch_token)
         ):
             raise OperationIndeterminateError()
         written = self._store.compare_and_swap_runtime(
@@ -558,7 +632,7 @@ class WorkspaceRuntime:
         raise DependencyUnavailableError("workspace dispatch ownership changed")
 
     def _prove_operation_dispatch_owner(
-        self, record: object
+        self, record: object, dispatch_token: str
     ) -> tuple[object, WorkspaceOperationSnapshot]:
         retained = self._operation_snapshot(record)
         current = self._store.read_runtime("operation", retained.job_ref, retained.operation_ref)
@@ -567,14 +641,53 @@ class WorkspaceRuntime:
         current_snapshot = self._operation_snapshot(current)
         values = _values(current)
         if (
-            values.get("dispatchOwner") == self._dispatch_owner
+            values.get("dispatchRuntime") == self._runtime_id
+            and values.get("dispatchToken") == dispatch_token
             and values.get("dispatchPhase") == "dispatching"
             and current_snapshot.state is OperationState.ACCEPTED
+            and self._dispatch_is_active(dispatch_token)
         ):
             return current, current_snapshot
         if current_snapshot.state is OperationState.INDETERMINATE:
             raise OperationIndeterminateError()
         raise DependencyUnavailableError("workspace dispatch ownership was superseded")
+
+    def _activate_dispatch(self, dispatch_token: str) -> None:
+        with self._active_dispatch_lock:
+            self._active_dispatch_tokens.add(dispatch_token)
+
+    def _deactivate_dispatch(self, dispatch_token: str) -> None:
+        with self._active_dispatch_lock:
+            self._active_dispatch_tokens.discard(dispatch_token)
+
+    def _dispatch_is_active(self, dispatch_token: str) -> bool:
+        with self._active_dispatch_lock:
+            return dispatch_token in self._active_dispatch_tokens
+
+    def _relinquish_operation_dispatch(self, record: object, dispatch_token: str) -> None:
+        claimed = self._operation_snapshot(record)
+        current = self._store.read_runtime(
+            "operation",
+            claimed.job_ref,
+            claimed.operation_ref,
+        )
+        if current is None:
+            return
+        retained = self._operation_snapshot(current)
+        values = _values(current)
+        if (
+            retained.state is not OperationState.ACCEPTED
+            or values.get("dispatchToken") != dispatch_token
+            or values.get("dispatchPhase") not in {"reserved", "dispatching"}
+        ):
+            return
+        self._store.compare_and_swap_runtime(
+            "operation",
+            retained.job_ref,
+            retained.operation_ref,
+            {**values, "dispatchPhase": "relinquished"},
+            expected_resource_version=_resource_version(current),
+        )
 
     def inspect_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
         record = self._store.read_runtime("operation", job_ref, operation_ref)
@@ -733,23 +846,43 @@ class WorkspaceRuntime:
             if current.state is OperationState.INDETERMINATE:
                 raise OperationIndeterminateError()
             return current
+        values = _values(record)
+        dispatch_token = values.get("dispatchToken")
+        dispatch_runtime = values.get("dispatchRuntime")
+        if not isinstance(dispatch_token, str) or len(dispatch_token) != 32:
+            raise DependencyUnavailableError("retained workspace dispatch token is invalid")
+        if (
+            dispatch_runtime == self._runtime_id
+            and values.get("dispatchPhase") in {"reserved", "dispatching"}
+            and self._dispatch_is_active(dispatch_token)
+        ):
+            return current
+        if values.get("dispatchPhase") not in {
+            "reserved",
+            "dispatching",
+            "relinquished",
+        }:
+            raise DependencyUnavailableError("retained workspace dispatch phase is invalid")
         reply = self._rpc_checked(
             binding,
-            {"action": "inspectOperation", "operationRef": current.operation_ref},
+            {
+                "action": "fenceOperation",
+                "operationRef": current.operation_ref,
+                "requestDigest": current.request_digest,
+                "dispatchToken": dispatch_token,
+            },
             identity_kind="operation",
         )
         if reply.header.get("known") is True:
             if reply.header.get("requestDigest") != current.request_digest:
                 raise OperationIdentityConflictError()
             return self._record_operation_result(record, current, reply)
-        values = _values(record)
-        if values.get("dispatchOwner") == self._dispatch_owner and values.get("dispatchPhase") in {
-            "reserved",
-            "dispatching",
-        }:
-            return current
-        if values.get("dispatchPhase") not in {None, "reserved", "dispatching"}:
-            raise DependencyUnavailableError("retained workspace dispatch phase is invalid")
+        if (
+            reply.header.get("known") is not False
+            or reply.header.get("fenced") is not True
+            or reply.header.get("requestDigest") != current.request_digest
+        ):
+            raise DependencyUnavailableError("workspace operation fence was not confirmed")
         now = self._clock()
         indeterminate = WorkspaceOperationSnapshot.model_validate(
             {
@@ -775,7 +908,6 @@ class WorkspaceRuntime:
             current.operation_ref,
             {
                 **values,
-                "dispatchOwner": self._dispatch_owner,
                 "dispatchPhase": "indeterminate",
                 "payload": indeterminate.model_dump_json(by_alias=True),
             },
@@ -1200,6 +1332,8 @@ def _raise_sidecar_error(code: str, identity_kind: str) -> None:
         raise TransferIdentityConflictError()
     if code == "TRANSFER_INDETERMINATE":
         raise TransferIndeterminateError()
+    if code == "OPERATION_INDETERMINATE":
+        raise OperationIndeterminateError()
     if code == "STATE_CONFLICT":
         raise StateConflictError()
     if code == "NOT_FOUND":

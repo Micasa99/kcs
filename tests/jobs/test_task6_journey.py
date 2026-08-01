@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event, get_ident
+from threading import Event
 from typing import Any, Literal
 from uuid import UUID
 
@@ -39,6 +39,7 @@ from kcs.jobs.errors import (
     IdentityDigestConflict,
     OperationIndeterminateError,
     OverwriteForbiddenError,
+    StateConflictError,
     TransferBytesMismatchError,
     TransferIndeterminateError,
     UnsafePathError,
@@ -68,11 +69,6 @@ class _Kube:
 
     def __init__(self) -> None:
         self.maps: dict[str, dict[str, Any]] = {}
-        self.hold_dispatch_proof = False
-        self.dispatch_claimed = Event()
-        self.dispatch_proof_waiting = Event()
-        self.release_dispatch_proof = Event()
-        self.dispatch_thread: int | None = None
 
     def create_config_map(self, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -84,17 +80,7 @@ class _Kube:
         return value
 
     def read_config_map(self, name: str) -> object | None:
-        value = self.maps.get(name)
-        if (
-            self.hold_dispatch_proof
-            and self.dispatch_thread == get_ident()
-            and value is not None
-            and value["data"].get("dispatchPhase") == "dispatching"
-        ):
-            self.dispatch_proof_waiting.set()
-            assert self.release_dispatch_proof.wait(2)
-            value = self.maps.get(name)
-        return value
+        return self.maps.get(name)
 
     def replace_config_map(self, name: str, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -106,9 +92,6 @@ class _Kube:
             int(self.maps[name]["metadata"]["resourceVersion"]) + 1
         )
         self.maps[name] = value
-        if self.hold_dispatch_proof and value["data"].get("dispatchPhase") == "dispatching":
-            self.dispatch_thread = get_ident()
-            self.dispatch_claimed.set()
         return value
 
     def list_config_maps(self, selector: str | None = None) -> list[object]:
@@ -407,7 +390,7 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
         warnings.simplefilter("ignore")
         from starlette.testclient import TestClient
 
-    _, _, _, provider = _setup(tmp_path)
+    _, _, sidecar, provider = _setup(tmp_path)
     content = b"http-stream-body" * 4096
     with pytest.raises(ValueError, match="dot-dot"):
         _transfer("traversal", TransferDirection.STAGE_INPUT, "../escape", content)
@@ -461,6 +444,70 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
     )
     assert provider.cancel_transfer("job-1", "stage-http", cancel).created is True
     assert provider.cancel_transfer("job-1", "stage-http", cancel).created is False
+
+    def retain_installing(ref: str, path: str, payload: bytes) -> tuple[Path, Path, Path]:
+        transfer = _transfer(ref, TransferDirection.STAGE_INPUT, path, payload)
+        provider.register_transfer("job-1", transfer)
+        partial = tmp_path / ".kcs/partials" / hashlib.sha256(ref.encode()).hexdigest()
+        partial.write_bytes(payload)
+        installed_stat = partial.stat()
+        sidecar._write_receipt(
+            {
+                "transferRef": ref,
+                "requestDigest": transfer.request_digest,
+                "state": "installing",
+                "actualSizeBytes": len(payload),
+                "actualSha256": hashlib.sha256(payload).hexdigest(),
+                "direction": "stage_input",
+                "path": path,
+                "overwritePolicy": "forbid",
+                "installDevice": installed_stat.st_dev,
+                "installInode": installed_stat.st_ino,
+            }
+        )
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        receipt = tmp_path / ".kcs/receipts" / f"{hashlib.sha256(ref.encode()).hexdigest()}.json"
+        return partial, target, receipt
+
+    installed_partial, installed_target, installed_receipt = retain_installing(
+        "cancel-installed", "cancel/installed.bin", b"published-before-cancel"
+    )
+    os.link(installed_partial, installed_target)
+    installed_partial.unlink()
+    installed_cancel = cancel.model_copy(update={"cancel_ref": "cancel-installed"})
+    with pytest.raises(StateConflictError):
+        provider.cancel_transfer("job-1", "cancel-installed", installed_cancel)
+    installed = provider.inspect_transfer("job-1", "cancel-installed")
+    assert installed.state == "completed" and installed.cancel_action.state == "failed"
+    assert json.loads(installed_receipt.read_text())["state"] == "completed"
+
+    absent_partial, absent_target, absent_receipt = retain_installing(
+        "cancel-absent", "cancel/absent.bin", b"not-published"
+    )
+    absent = provider.cancel_transfer(
+        "job-1", "cancel-absent", cancel.model_copy(update={"cancel_ref": "cancel-absent"})
+    )
+    assert absent.snapshot.state == "canceled"
+    assert not absent_partial.exists() and not absent_target.exists()
+    assert json.loads(absent_receipt.read_text())["state"] == "canceled"
+
+    ambiguous_partial, ambiguous_target, ambiguous_receipt = retain_installing(
+        "cancel-ambiguous", "cancel/STRASSE.bin", b"ambiguous-publication"
+    )
+    (ambiguous_target.parent / "Strasse.bin").write_bytes(b"first")
+    (ambiguous_target.parent / "Straße.bin").write_bytes(b"second")
+    with pytest.raises(TransferIndeterminateError):
+        provider.cancel_transfer(
+            "job-1",
+            "cancel-ambiguous",
+            cancel.model_copy(update={"cancel_ref": "cancel-ambiguous"}),
+        )
+    ambiguous = provider.inspect_transfer("job-1", "cancel-ambiguous")
+    assert ambiguous.state == "indeterminate"
+    assert ambiguous.cancel_action.state == "indeterminate"
+    assert ambiguous_partial.exists()
+    assert json.loads(ambiguous_receipt.read_text())["state"] == "indeterminate"
 
     app = FastAPI()
     app.include_router(create_jobs_router(provider, "token"))
@@ -558,7 +605,6 @@ class _HeldInvoke:
     def __init__(self, transport: LocalWorkspaceRpcTransport) -> None:
         self.transport = transport
         self.winner_started = Event()
-        self.inspected = Event()
         self.release = Event()
         self.invocations = 0
 
@@ -572,8 +618,6 @@ class _HeldInvoke:
             self.invocations += 1
             self.winner_started.set()
             assert self.release.wait(2)
-        elif header["action"] == "inspectOperation":
-            self.inspected.set()
         return self.transport.rpc(binding, header, body)
 
 
@@ -644,10 +688,13 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     with pytest.raises(DependencyUnavailableError, match="not confirmed"):
         provider.invoke_workspace("job-1", request)
     assert provider.inspect_operation("job-1", "operation-1").state == "accepted"
+    retained_dispatch = store.read_runtime("operation", "job-1", "operation-1")
+    invoke_frame = decode_workspace_header(local.last_request_frame)
+    assert retained_dispatch.values["dispatchPhase"] == "relinquished"  # type: ignore[union-attr]
+    assert invoke_frame["dispatchToken"] == retained_dispatch.values["dispatchToken"]  # type: ignore[union-attr]
     assert sidecar.stats()["operationSideEffects"] == 1
 
-    restarted = _provider(kube, store, local)
-    replay = restarted.invoke_workspace("job-1", request)
+    replay = provider.invoke_workspace("job-1", request)
     result = replay.snapshot
     assert replay.created is False
     assert result.state == "succeeded" and result.exit_code == 0
@@ -656,7 +703,9 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     assert result.inline_result == {"value": 7}
     assert result.inline_result_size == len(b'{"value":7}')
     assert result.inline_result_digest == hashlib.sha256(b'{"value":7}').hexdigest()
+    assert decode_workspace_header(local.last_request_frame)["action"] == "fenceOperation"
     assert sidecar.stats()["operationSideEffects"] == 1
+    restarted = _provider(kube, store, local)
     assert restarted.invoke_workspace("job-1", request).snapshot == result
 
     changed = request.model_copy(update={"request_digest": "b" * 64})
@@ -666,7 +715,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     sidecar.forget_operations()
     kube2, store2, _, _ = _setup(tmp_path / "unknown")
     values = dict(store.read_runtime("operation", "job-1", "operation-1").values)  # type: ignore[union-attr]
-    values.update({"dispatchOwner": "retained-owner", "dispatchPhase": "dispatching"})
+    values.update({"dispatchRuntime": "retained-runtime", "dispatchPhase": "dispatching"})
     values["payload"] = (
         provider.inspect_operation("job-1", "operation-1")
         .model_copy(
@@ -689,7 +738,6 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
         winner = pool.submit(race_provider.invoke_workspace, "job-1", race_request)
         assert race_transport.winner_started.wait(1)
         loser = pool.submit(race_provider.invoke_workspace, "job-1", race_request)
-        assert race_transport.inspected.wait(1)
         replayed = loser.result(timeout=1)
         assert replayed.created is False and replayed.snapshot.state is OperationState.ACCEPTED
         race_transport.release.set()
@@ -698,18 +746,22 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     assert race_transport.invocations == 1
 
     delayed_kube, delayed_store, delayed_sidecar, _ = _setup(tmp_path / "delayed-owner")
-    delayed_kube.hold_dispatch_proof = True
     delayed_local = LocalWorkspaceRpcTransport(delayed_sidecar.dispatch)
-    delayed = _provider(delayed_kube, delayed_store, delayed_local)
+    delayed_transport = _HeldInvoke(delayed_local)
+    delayed = _provider(delayed_kube, delayed_store, delayed_transport)
     delayed_request = request.model_copy(update={"operation_ref": "operation-delayed"})
     with ThreadPoolExecutor(max_workers=1) as pool:
         old_winner = pool.submit(delayed.invoke_workspace, "job-1", delayed_request)
-        assert delayed_kube.dispatch_claimed.wait(1)
-        assert delayed_kube.dispatch_proof_waiting.wait(1)
+        assert delayed_transport.winner_started.wait(1)
+        retained = delayed_store.read_runtime("operation", "job-1", "operation-delayed")
+        assert retained.values["dispatchPhase"] == "dispatching"  # type: ignore[union-attr]
         superseder = _provider(delayed_kube, delayed_store, delayed_local)
         with pytest.raises(OperationIndeterminateError):
             superseder.invoke_workspace("job-1", delayed_request)
-        delayed_kube.release_dispatch_proof.set()
+        fence = decode_workspace_header(delayed_local.last_request_frame)
+        assert fence["action"] == "fenceOperation"
+        assert fence["dispatchToken"] == retained.values["dispatchToken"]  # type: ignore[union-attr]
+        delayed_transport.release.set()
         with pytest.raises(OperationIndeterminateError):
             old_winner.result(timeout=2)
     assert delayed_sidecar.stats()["operationSideEffects"] == 0
