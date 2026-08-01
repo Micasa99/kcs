@@ -926,6 +926,8 @@ class V2JobProvider:
                 workspace_managed = False
             if workspace_managed:
                 transfer = self._workspace_runtime.reconcile_transfer(job_ref, identity)
+                if transfer.state is TransferState.INDETERMINATE:
+                    return "indeterminate"
                 if (
                     transfer.cancel_action.state is ActionState.ACCEPTED
                     or transfer.discard_action.state is ActionState.ACCEPTED

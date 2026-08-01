@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .canonical import canonical_bytes, canonical_digest
 from .contracts import (
@@ -125,6 +125,7 @@ class WorkspaceRuntime:
         self._live_binding = live_binding
         self._assert_accepting = assert_accepting
         self._clock = clock
+        self._dispatch_owner = uuid4().hex
 
     def register_transfer(self, job_ref: str, request: TransferRegisterRequest) -> TransferResult:
         binding = self._live_binding(job_ref)
@@ -491,6 +492,8 @@ class WorkspaceRuntime:
             "frameDigest": frame_digest,
             "jobUid": str(binding.job_uid),
             "podUid": str(_pod_uid(binding)),
+            "dispatchOwner": self._dispatch_owner,
+            "dispatchPhase": "reserved",
             "payload": accepted.model_dump_json(by_alias=True),
         }
         try:
@@ -505,6 +508,8 @@ class WorkspaceRuntime:
             return WorkspaceOperationResult(
                 self._recover_operation(record, retained, binding), created=False
             )
+        record = self._claim_operation_dispatch(record, retained)
+        record, retained = self._prove_operation_dispatch_owner(record)
         try:
             reply = self._rpc_checked(
                 binding,
@@ -525,6 +530,51 @@ class WorkspaceRuntime:
         return WorkspaceOperationResult(
             self._record_operation_result(record, retained, reply), created=True
         )
+
+    def _claim_operation_dispatch(
+        self, record: object, retained: WorkspaceOperationSnapshot
+    ) -> object:
+        values = _values(record)
+        if (
+            values.get("dispatchOwner") != self._dispatch_owner
+            or values.get("dispatchPhase") != "reserved"
+        ):
+            raise OperationIndeterminateError()
+        written = self._store.compare_and_swap_runtime(
+            "operation",
+            retained.job_ref,
+            retained.operation_ref,
+            {**values, "dispatchPhase": "dispatching"},
+            expected_resource_version=_resource_version(record),
+        )
+        if written is not None:
+            return written
+        current = self._store.read_runtime("operation", retained.job_ref, retained.operation_ref)
+        if current is None:
+            raise JobNotFoundError()
+        current_snapshot = self._operation_snapshot(current)
+        if current_snapshot.state is OperationState.INDETERMINATE:
+            raise OperationIndeterminateError()
+        raise DependencyUnavailableError("workspace dispatch ownership changed")
+
+    def _prove_operation_dispatch_owner(
+        self, record: object
+    ) -> tuple[object, WorkspaceOperationSnapshot]:
+        retained = self._operation_snapshot(record)
+        current = self._store.read_runtime("operation", retained.job_ref, retained.operation_ref)
+        if current is None:
+            raise JobNotFoundError()
+        current_snapshot = self._operation_snapshot(current)
+        values = _values(current)
+        if (
+            values.get("dispatchOwner") == self._dispatch_owner
+            and values.get("dispatchPhase") == "dispatching"
+            and current_snapshot.state is OperationState.ACCEPTED
+        ):
+            return current, current_snapshot
+        if current_snapshot.state is OperationState.INDETERMINATE:
+            raise OperationIndeterminateError()
+        raise DependencyUnavailableError("workspace dispatch ownership was superseded")
 
     def inspect_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
         record = self._store.read_runtime("operation", job_ref, operation_ref)
@@ -605,6 +655,16 @@ class WorkspaceRuntime:
                     "completed_at": now,
                     "observed_at": now,
                     "failure_reason": "the surviving workspace sidecar has no transfer truth",
+                    "cancel_action": retained.cancel_action.model_copy(
+                        update={"state": ActionState.INDETERMINATE, "observed_at": now}
+                    )
+                    if retained.cancel_action.state is ActionState.ACCEPTED
+                    else retained.cancel_action,
+                    "discard_action": retained.discard_action.model_copy(
+                        update={"state": ActionState.INDETERMINATE, "observed_at": now}
+                    )
+                    if retained.discard_action.state is ActionState.ACCEPTED
+                    else retained.discard_action,
                 }
             )
             _, current, _ = self._cas_transfer(record, indeterminate)
@@ -664,58 +724,73 @@ class WorkspaceRuntime:
         retained: WorkspaceOperationSnapshot,
         binding: JobBindingSnapshot,
     ) -> WorkspaceOperationSnapshot:
-        for attempt in range(20):
-            current = self._operation_snapshot(record)
-            if current.state in {
-                OperationState.SUCCEEDED,
-                OperationState.FAILED,
-                OperationState.INDETERMINATE,
-            }:
-                if current.state is OperationState.INDETERMINATE:
-                    raise OperationIndeterminateError()
-                return current
-            reply = self._rpc_checked(
-                binding,
-                {"action": "inspectOperation", "operationRef": current.operation_ref},
-                identity_kind="operation",
+        current = self._operation_snapshot(record)
+        if current.state in {
+            OperationState.SUCCEEDED,
+            OperationState.FAILED,
+            OperationState.INDETERMINATE,
+        }:
+            if current.state is OperationState.INDETERMINATE:
+                raise OperationIndeterminateError()
+            return current
+        reply = self._rpc_checked(
+            binding,
+            {"action": "inspectOperation", "operationRef": current.operation_ref},
+            identity_kind="operation",
+        )
+        if reply.header.get("known") is True:
+            if reply.header.get("requestDigest") != current.request_digest:
+                raise OperationIdentityConflictError()
+            return self._record_operation_result(record, current, reply)
+        values = _values(record)
+        if values.get("dispatchOwner") == self._dispatch_owner and values.get("dispatchPhase") in {
+            "reserved",
+            "dispatching",
+        }:
+            return current
+        if values.get("dispatchPhase") not in {None, "reserved", "dispatching"}:
+            raise DependencyUnavailableError("retained workspace dispatch phase is invalid")
+        now = self._clock()
+        indeterminate = WorkspaceOperationSnapshot.model_validate(
+            {
+                **current.model_dump(by_alias=False),
+                "state": OperationState.INDETERMINATE,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "inline_result_size": None,
+                "inline_result_digest": None,
+                "inline_result": None,
+                "result_transfer_ref": None,
+                "finished_at": now,
+                "observed_at": now,
+                "failure_reason": "the surviving workspace sidecar has no operation truth",
+            }
+        )
+        written = self._store.compare_and_swap_runtime(
+            "operation",
+            current.job_ref,
+            current.operation_ref,
+            {
+                **values,
+                "dispatchOwner": self._dispatch_owner,
+                "dispatchPhase": "indeterminate",
+                "payload": indeterminate.model_dump_json(by_alias=True),
+            },
+            expected_resource_version=_resource_version(record),
+        )
+        if written is None:
+            refreshed = self._store.read_runtime(
+                "operation", current.job_ref, current.operation_ref
             )
-            if reply.header.get("known") is True:
-                if reply.header.get("requestDigest") != current.request_digest:
-                    raise OperationIdentityConflictError()
-                return self._record_operation_result(record, current, reply)
-            if attempt < 19:
-                time.sleep(0.005)
-                refreshed = self._store.read_runtime(
-                    "operation", current.job_ref, current.operation_ref
-                )
-                if refreshed is None:
-                    raise JobNotFoundError()
-                record = refreshed
-                continue
-            now = self._clock()
-            indeterminate = WorkspaceOperationSnapshot.model_validate(
-                {
-                    **current.model_dump(by_alias=False),
-                    "state": OperationState.INDETERMINATE,
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": "",
-                    "stdout_truncated": False,
-                    "stderr_truncated": False,
-                    "inline_result_size": None,
-                    "inline_result_digest": None,
-                    "inline_result": None,
-                    "result_transfer_ref": None,
-                    "finished_at": now,
-                    "observed_at": now,
-                    "failure_reason": "the surviving workspace sidecar has no operation truth",
-                }
-            )
-            retained_after_cas = self._cas_operation(record, indeterminate)
-            if retained_after_cas.state is not OperationState.INDETERMINATE:
-                return retained_after_cas
-            raise OperationIndeterminateError()
-        raise DependencyUnavailableError("workspace operation recovery did not converge")
+            if refreshed is None:
+                raise JobNotFoundError()
+            refreshed_snapshot = self._operation_snapshot(refreshed)
+            if refreshed_snapshot.state is not OperationState.INDETERMINATE:
+                return refreshed_snapshot
+        raise OperationIndeterminateError()
 
     def _record_operation_result(
         self,
@@ -789,13 +864,13 @@ class WorkspaceRuntime:
                     "failure_reason": "workspace returned an invalid terminal result",
                 }
             )
-            retained = self._cas_operation(record, indeterminate)
+            retained = self._cas_operation(record, indeterminate, dispatch_phase="indeterminate")
             if retained.state is not OperationState.INDETERMINATE:
                 return retained
             raise DependencyUnavailableError(
                 "workspace returned an invalid terminal result"
             ) from error
-        retained = self._cas_operation(record, result)
+        retained = self._cas_operation(record, result, dispatch_phase=result.state.value)
         if retained.state is OperationState.INDETERMINATE:
             raise OperationIndeterminateError()
         return retained
@@ -921,14 +996,22 @@ class WorkspaceRuntime:
         return current, self._transfer_snapshot(current), False
 
     def _cas_operation(
-        self, record: object, snapshot: WorkspaceOperationSnapshot
+        self,
+        record: object,
+        snapshot: WorkspaceOperationSnapshot,
+        *,
+        dispatch_phase: str,
     ) -> WorkspaceOperationSnapshot:
         resource_version = _resource_version(record)
         written = self._store.compare_and_swap_runtime(
             "operation",
             snapshot.job_ref,
             snapshot.operation_ref,
-            {**_values(record), "payload": snapshot.model_dump_json(by_alias=True)},
+            {
+                **_values(record),
+                "dispatchPhase": dispatch_phase,
+                "payload": snapshot.model_dump_json(by_alias=True),
+            },
             expected_resource_version=resource_version,
         )
         if written is not None:

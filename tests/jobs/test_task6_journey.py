@@ -12,13 +12,14 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 from typing import Any, Literal
 from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
 
+import kcs.conformance.workspace_sidecar as workspace_sidecar
 from kcs.conformance.workspace_sidecar import WorkspaceSidecar, _serve_connection
 from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.contracts import (
@@ -39,6 +40,7 @@ from kcs.jobs.errors import (
     OperationIndeterminateError,
     OverwriteForbiddenError,
     TransferBytesMismatchError,
+    TransferIndeterminateError,
     UnsafePathError,
 )
 from kcs.jobs.provider import V2JobProvider
@@ -66,6 +68,11 @@ class _Kube:
 
     def __init__(self) -> None:
         self.maps: dict[str, dict[str, Any]] = {}
+        self.hold_dispatch_proof = False
+        self.dispatch_claimed = Event()
+        self.dispatch_proof_waiting = Event()
+        self.release_dispatch_proof = Event()
+        self.dispatch_thread: int | None = None
 
     def create_config_map(self, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -77,7 +84,17 @@ class _Kube:
         return value
 
     def read_config_map(self, name: str) -> object | None:
-        return self.maps.get(name)
+        value = self.maps.get(name)
+        if (
+            self.hold_dispatch_proof
+            and self.dispatch_thread == get_ident()
+            and value is not None
+            and value["data"].get("dispatchPhase") == "dispatching"
+        ):
+            self.dispatch_proof_waiting.set()
+            assert self.release_dispatch_proof.wait(2)
+            value = self.maps.get(name)
+        return value
 
     def replace_config_map(self, name: str, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -89,6 +106,9 @@ class _Kube:
             int(self.maps[name]["metadata"]["resourceVersion"]) + 1
         )
         self.maps[name] = value
+        if self.hold_dispatch_proof and value["data"].get("dispatchPhase") == "dispatching":
+            self.dispatch_thread = get_ident()
+            self.dispatch_claimed.set()
         return value
 
     def list_config_maps(self, selector: str | None = None) -> list[object]:
@@ -269,6 +289,54 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     monkeypatch.undo()
     assert (tmp_path / "inputs/race.bin").read_bytes() == b"concurrent-winner"
 
+    crash_content = b"installed-before-receipt"
+    crash_request = _transfer(
+        "stage-installing", TransferDirection.STAGE_INPUT, "inputs/installing.bin", crash_content
+    )
+    provider.register_transfer("job-1", crash_request)
+    write_receipt = sidecar._write_receipt
+    lost_completed_receipt = False
+
+    def crash_before_completed_receipt(retained: Mapping[str, Any]) -> None:
+        nonlocal lost_completed_receipt
+        if (
+            retained.get("transferRef") == "stage-installing"
+            and retained.get("state") == "completed"
+            and not lost_completed_receipt
+        ):
+            lost_completed_receipt = True
+            raise RuntimeError("simulated crash before completed receipt")
+        write_receipt(retained)
+
+    monkeypatch.setattr(sidecar, "_write_receipt", crash_before_completed_receipt)
+    with pytest.raises(DependencyUnavailableError):
+        provider.stage_transfer_content(
+            "job-1",
+            "stage-installing",
+            io.BytesIO(crash_content),
+            content_length=len(crash_content),
+        )
+    monkeypatch.undo()
+    installed = tmp_path / "inputs/installing.bin"
+    installed_inode = installed.stat().st_ino
+    installing_receipts = [
+        item
+        for item in (tmp_path / ".kcs/receipts").glob("*.json")
+        if json.loads(item.read_text()).get("transferRef") == "stage-installing"
+    ]
+    assert len(installing_receipts) == 1
+    assert json.loads(installing_receipts[0].read_text())["state"] == "installing"
+    recovered_stage = _provider(
+        kube, store, LocalWorkspaceRpcTransport(WorkspaceSidecar(tmp_path).dispatch)
+    ).stage_transfer_content(
+        "job-1",
+        "stage-installing",
+        io.BytesIO(crash_content),
+        content_length=len(crash_content),
+    )
+    assert recovered_stage.state == "completed" and installed.stat().st_ino == installed_inode
+    assert json.loads(installing_receipts[0].read_text())["state"] == "completed"
+
     output = b"immutable-output\x00\xff"
     (tmp_path / "outputs").mkdir()
     (tmp_path / "outputs/result.bin").write_bytes(output)
@@ -291,7 +359,25 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     assert receipt.stat().st_mode & 0o777 == 0o600
     first.cleanup()
     second.cleanup()
+    discard_events: list[str] = []
+    fsync_directory = workspace_sidecar._fsync_directory
+    write_discard_receipt = restarted_sidecar._write_receipt
+
+    def trace_fsync(path: Path) -> None:
+        if path.name == "snapshots":
+            discard_events.append("snapshot-fsync")
+        fsync_directory(path)
+
+    def trace_discard_receipt(retained: Mapping[str, Any]) -> None:
+        if retained.get("state") == "discarded":
+            discard_events.append("discard-receipt")
+        write_discard_receipt(retained)
+
+    monkeypatch.setattr(workspace_sidecar, "_fsync_directory", trace_fsync)
+    monkeypatch.setattr(restarted_sidecar, "_write_receipt", trace_discard_receipt)
     restarted_provider.discard_transfer("job-1", "collect-1", "discard-1", canonical_digest({}))
+    monkeypatch.undo()
+    assert discard_events[:2] == ["snapshot-fsync", "discard-receipt"]
     assert (tmp_path / "outputs/result.bin").read_bytes() == b"changed-after-snapshot"
     assert not first.path.exists() and not second.path.exists()
     assert not list(tmp_path.rglob("*.partial"))
@@ -580,6 +666,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     sidecar.forget_operations()
     kube2, store2, _, _ = _setup(tmp_path / "unknown")
     values = dict(store.read_runtime("operation", "job-1", "operation-1").values)  # type: ignore[union-attr]
+    values.update({"dispatchOwner": "retained-owner", "dispatchPhase": "dispatching"})
     values["payload"] = (
         provider.inspect_operation("job-1", "operation-1")
         .model_copy(
@@ -603,11 +690,29 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
         assert race_transport.winner_started.wait(1)
         loser = pool.submit(race_provider.invoke_workspace, "job-1", race_request)
         assert race_transport.inspected.wait(1)
+        replayed = loser.result(timeout=1)
+        assert replayed.created is False and replayed.snapshot.state is OperationState.ACCEPTED
         race_transport.release.set()
-        outcomes = [winner.result(timeout=2), loser.result(timeout=2)]
-    assert sorted(item.created for item in outcomes) == [False, True]
-    assert all(item.snapshot.state is OperationState.SUCCEEDED for item in outcomes)
+        created = winner.result(timeout=2)
+    assert created.created is True and created.snapshot.state is OperationState.SUCCEEDED
     assert race_transport.invocations == 1
+
+    delayed_kube, delayed_store, delayed_sidecar, _ = _setup(tmp_path / "delayed-owner")
+    delayed_kube.hold_dispatch_proof = True
+    delayed_local = LocalWorkspaceRpcTransport(delayed_sidecar.dispatch)
+    delayed = _provider(delayed_kube, delayed_store, delayed_local)
+    delayed_request = request.model_copy(update={"operation_ref": "operation-delayed"})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        old_winner = pool.submit(delayed.invoke_workspace, "job-1", delayed_request)
+        assert delayed_kube.dispatch_claimed.wait(1)
+        assert delayed_kube.dispatch_proof_waiting.wait(1)
+        superseder = _provider(delayed_kube, delayed_store, delayed_local)
+        with pytest.raises(OperationIndeterminateError):
+            superseder.invoke_workspace("job-1", delayed_request)
+        delayed_kube.release_dispatch_proof.set()
+        with pytest.raises(OperationIndeterminateError):
+            old_winner.result(timeout=2)
+    assert delayed_sidecar.stats()["operationSideEffects"] == 0
 
     bad_request = request.model_copy(update={"operation_ref": "operation-invalid"})
     bad_provider = _provider(kube, store, _InvalidOperationResult())
@@ -667,6 +772,44 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     assert finalized.snapshot.terminal_operation_refs == ["operation-finalize"]
     discarded = finalizer.inspect_transfer("job-1", "discard-finalize")
     assert discarded.state == "discarded" and discarded.discard_action.state == "succeeded"
+
+    unknown_root = tmp_path / "unknown-transfer-action"
+    unknown_kube, unknown_store, unknown_sidecar, unknown_provider = _setup(unknown_root)
+    unknown_bytes = b"unknown-transfer"
+    unknown_request = _transfer(
+        "unknown-action", TransferDirection.STAGE_INPUT, "unknown.bin", unknown_bytes
+    )
+    unknown_provider.register_transfer("job-1", unknown_request)
+    unavailable = _provider(unknown_kube, unknown_store, None)
+    with pytest.raises(DependencyUnavailableError):
+        unavailable.stage_transfer_content(
+            "job-1", "unknown-action", io.BytesIO(unknown_bytes), content_length=len(unknown_bytes)
+        )
+    with pytest.raises(DependencyUnavailableError):
+        unavailable.discard_transfer(
+            "job-1", "unknown-action", "unknown-discard", canonical_digest({})
+        )
+    unknown_finalizer = _provider(
+        unknown_kube,
+        unknown_store,
+        LocalWorkspaceRpcTransport(unknown_sidecar.dispatch),
+        sleeper=lambda _: None,
+        transport=_StopTransport(),
+    )
+    unknown_spec = FinalizeSpec(
+        operation_refs=[], transfer_refs=["unknown-action"], drain_timeout_seconds=1
+    )
+    with pytest.raises(TransferIndeterminateError):
+        unknown_finalizer.finalize(
+            "job-1",
+            FinalizeJobRequest(
+                finalize_ref="unknown-finalize",
+                request_digest=canonical_digest(unknown_spec),
+                spec=unknown_spec,
+            ),
+        )
+    unknown = unknown_finalizer.inspect_transfer("job-1", "unknown-action")
+    assert unknown.state == "indeterminate" and unknown.discard_action.state == "indeterminate"
     print(
         "JOURNEY operation",
         json.dumps(

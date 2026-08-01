@@ -180,7 +180,7 @@ class WorkspaceSidecar:
                     raise _RpcRejectedError(
                         "TRANSFER_BYTES_MISMATCH", "transfer replay bytes differ"
                     )
-                return dict(retained)
+                return _public_transfer(retained)
             if retained.get("state") in {"canceled", "discarded"}:
                 raise _RpcRejectedError(
                     "STATE_CONFLICT", "the transfer already reached a terminal state"
@@ -189,16 +189,39 @@ class WorkspaceSidecar:
         self._validate_transfer_path(request, allow_stage_existing=True)
         parent_fd, target_name = self._open_parent(str(request["path"]), create=True)
         partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
-        partial.unlink(missing_ok=True)
         try:
-            descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as output, body.open("rb") as source:
-                shutil.copyfileobj(source, output, length=_COPY_CHUNK)
-                output.flush()
-                os.fsync(output.fileno())
-            verified_size, verified_digest = _hash_file(partial)
-            if verified_size != size or verified_digest != content_digest:
-                raise _RpcRejectedError("TRANSFER_BYTES_MISMATCH", "private staged bytes changed")
+            intent: dict[str, Any]
+            if retained is not None and retained.get("state") == "installing":
+                reconciled = self._reconcile_installing(
+                    request, retained, parent_fd, target_name, partial
+                )
+                if reconciled is not None:
+                    self._transfers[transfer_ref] = reconciled
+                    return _public_transfer(reconciled)
+                intent = dict(retained)
+            else:
+                partial.unlink(missing_ok=True)
+                descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output, body.open("rb") as source:
+                    shutil.copyfileobj(source, output, length=_COPY_CHUNK)
+                    output.flush()
+                    os.fsync(output.fileno())
+                verified_size, verified_digest = _hash_file(partial)
+                if verified_size != size or verified_digest != content_digest:
+                    raise _RpcRejectedError(
+                        "TRANSFER_BYTES_MISMATCH", "private staged bytes changed"
+                    )
+                installed_stat = partial.stat(follow_symlinks=False)
+                intent = {
+                    **_completed_transfer(transfer_ref, digest, size, content_digest),
+                    "state": "installing",
+                    "direction": "stage_input",
+                    "path": request["path"],
+                    "overwritePolicy": request["overwritePolicy"],
+                    "installDevice": installed_stat.st_dev,
+                    "installInode": installed_stat.st_ino,
+                }
+                self._write_receipt(intent)
             matches = _casefold_entries_at(parent_fd, target_name)
             if len(matches) > 1 or (matches and matches[0] != target_name):
                 raise _RpcRejectedError("UNSAFE_PATH", "workspace target is ambiguous")
@@ -227,14 +250,73 @@ class WorkspaceSidecar:
                         )
                 os.replace(partial, target_name, dst_dir_fd=parent_fd)
             os.fsync(parent_fd)
+            self._stage_installs += 1
+            result = {**intent, "ok": True, "state": "completed"}
+            self._write_receipt(result)
+            self._transfers[transfer_ref] = result
+            return _public_transfer(result)
         finally:
             partial.unlink(missing_ok=True)
             os.close(parent_fd)
-        result = _completed_transfer(transfer_ref, digest, size, content_digest)
-        self._write_receipt(result)
-        self._transfers[transfer_ref] = dict(result)
-        self._stage_installs += 1
-        return result
+
+    def _reconcile_installing(
+        self,
+        request: Mapping[str, Any],
+        retained: Mapping[str, Any],
+        parent_fd: int,
+        target_name: str,
+        partial: Path,
+    ) -> dict[str, Any] | None:
+        if (
+            retained.get("direction") != "stage_input"
+            or retained.get("path") != request.get("path")
+            or retained.get("overwritePolicy") != request.get("overwritePolicy")
+            or retained.get("actualSizeBytes") != request.get("declaredSizeBytes")
+            or retained.get("actualSha256") != request.get("contentSha256")
+            or type(retained.get("installDevice")) is not int
+            or type(retained.get("installInode")) is not int
+        ):
+            raise _RpcRejectedError(
+                "TRANSFER_INDETERMINATE", "installing receipt does not match the request"
+            )
+        matches = _casefold_entries_at(parent_fd, target_name)
+        if len(matches) > 1 or (matches and matches[0] != target_name):
+            raise _RpcRejectedError("UNSAFE_PATH", "workspace target is ambiguous")
+        if matches:
+            target_stat, target_size, target_digest = _inspect_at(parent_fd, target_name)
+            if (
+                target_stat.st_dev == retained["installDevice"]
+                and target_stat.st_ino == retained["installInode"]
+                and target_size == retained["actualSizeBytes"]
+                and target_digest == retained["actualSha256"]
+            ):
+                completed = {**retained, "ok": True, "state": "completed"}
+                os.fsync(parent_fd)
+                self._write_receipt(completed)
+                return completed
+            code = (
+                "OVERWRITE_FORBIDDEN"
+                if request.get("overwritePolicy") == "forbid"
+                else "TRANSFER_INDETERMINATE"
+            )
+            raise _RpcRejectedError(code, "workspace target differs from installing intent")
+        try:
+            partial_stat = partial.stat(follow_symlinks=False)
+            partial_size, partial_digest = _hash_nofollow(partial)
+        except FileNotFoundError as error:
+            raise _RpcRejectedError(
+                "TRANSFER_INDETERMINATE", "installing bytes cannot be reconciled"
+            ) from error
+        if (
+            partial_stat.st_dev != retained["installDevice"]
+            or partial_stat.st_ino != retained["installInode"]
+            or partial_size != retained["actualSizeBytes"]
+            or partial_digest != retained["actualSha256"]
+        ):
+            raise _RpcRejectedError(
+                "TRANSFER_INDETERMINATE", "installing bytes differ from retained intent"
+            )
+        return None
 
     def _collect(self, request: Mapping[str, Any]) -> tuple[dict[str, object], Path | None]:
         transfer_ref, digest = _identity(request, "transferRef", "requestDigest")
@@ -347,6 +429,7 @@ class WorkspaceSidecar:
             candidate = Path(snapshot_path)
             if candidate.parent == self._snapshots:
                 candidate.unlink(missing_ok=True)
+                _fsync_directory(self._snapshots)
         partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
         partial.unlink(missing_ok=True)
         result = {**retained, "ok": True, "transferRef": transfer_ref, "state": "discarded"}
@@ -386,7 +469,7 @@ class WorkspaceSidecar:
             or value.get("receiptVersion") != 1
             or value.get("transferRef") != transfer_ref
             or not isinstance(value.get("requestDigest"), str)
-            or value.get("state") not in {"completed", "canceled", "discarded"}
+            or value.get("state") not in {"installing", "completed", "canceled", "discarded"}
         ):
             raise _RpcRejectedError("TRANSFER_INDETERMINATE", "transfer receipt is invalid")
         snapshot_name = value.get("snapshotName")
@@ -670,6 +753,21 @@ def _hash_nofollow(path: Path) -> tuple[int, str]:
         return _hash_stream(source)
 
 
+def _inspect_at(parent_fd: int, name: str) -> tuple[os.stat_result, int, str]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    target_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(target_stat.st_mode):
+        os.close(descriptor)
+        raise _RpcRejectedError("UNSAFE_PATH", "workspace target is not a regular file")
+    with os.fdopen(descriptor, "rb") as source:
+        size, digest = _hash_stream(source)
+    return target_stat, size, digest
+
+
 def _casefold_entries_at(parent_fd: int, name: str) -> list[str]:
     folded = unicodedata.normalize("NFC", name).casefold()
     return [
@@ -697,7 +795,17 @@ def _public_transfer(value: Mapping[str, Any]) -> dict[str, object]:
     return {
         key: item
         for key, item in value.items()
-        if key not in {"receiptVersion", "snapshotName", "snapshotPath"}
+        if key
+        not in {
+            "direction",
+            "installDevice",
+            "installInode",
+            "overwritePolicy",
+            "path",
+            "receiptVersion",
+            "snapshotName",
+            "snapshotPath",
+        }
     }
 
 
