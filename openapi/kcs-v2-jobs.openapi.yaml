@@ -148,7 +148,11 @@ paths:
         RATE_LIMIT: {status: 429, recoveryAction: retry_same}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
-      x-kcs-ordering: [createdAt, jobRef]
+      x-kcs-ordering:
+        strategy: stable-key-merge
+        collections: [items, tombstones]
+        keys: [createdAt, jobRef]
+        uniqueIdentities: [jobRef, providerRequestId, jobUid]
       x-kcs-page-token-binding: [namespace, providerRequestId, subjectRef, state, createdAfter, includeDeleted]
       parameters:
         - {$ref: '#/components/parameters/PageToken'}
@@ -352,28 +356,31 @@ paths:
       responses:
         '201': &GrantCreated
           description: New bound credential grant accepted.
+          x-kcs-required-headers: [Cache-Control]
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
         '200': &GrantReplay
           description: Stable grant replay or cleanup retry without replacement Secret.
+          x-kcs-required-headers: [Cache-Control]
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
-        '400': &CredentialNoStoreError
-          description: Sanitized credential-route error; no credential bytes are returned.
+        '400': &NoStoreError
+          description: Sanitized no-store route error; sensitive bytes are not returned.
+          x-kcs-required-headers: [Cache-Control]
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
-        '401': *CredentialNoStoreError
-        '403': *CredentialNoStoreError
-        '404': *CredentialNoStoreError
-        '409': *CredentialNoStoreError
-        '413': *CredentialNoStoreError
-        '415': *CredentialNoStoreError
-        '422': *CredentialNoStoreError
-        '500': *CredentialNoStoreError
-        '503': *CredentialNoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -393,15 +400,16 @@ paths:
       responses:
         '200':
           description: Non-secret grant lifecycle and destruction observation.
+          x-kcs-required-headers: [Cache-Control]
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
-        '401': *CredentialNoStoreError
-        '403': *CredentialNoStoreError
-        '404': *CredentialNoStoreError
-        '409': *CredentialNoStoreError
-        '500': *CredentialNoStoreError
-        '503': *CredentialNoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/agent/start:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -654,20 +662,21 @@ paths:
       responses:
         '200':
           description: Bytes counted, verified, fsynced as applicable, and atomically installed or replayed.
+          x-kcs-required-headers: [Cache-Control]
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
-        '400': *Error400
-        '401': *Error401
-        '403': *Error403
-        '404': *Error404
-        '409': *Error409
-        '413': *Error413
-        '415': *Error415
-        '422': *Error422
-        '500': *Error500
-        '503': *Error503
-        '504': *Error504
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
     get:
       tags: [Transfers]
       operationId: getTransferContent
@@ -688,6 +697,7 @@ paths:
       responses:
         '200':
           description: Authorized immutable collect snapshot streamed and digest verified.
+          x-kcs-required-headers: [Content-Length, X-Content-SHA256, X-KCS-Snapshot-Ref, Cache-Control]
           headers:
             Content-Length: {schema: {type: integer, minimum: 0, maximum: 107374182400}}
             X-Content-SHA256: {schema: {$ref: '#/components/schemas/Sha256'}}
@@ -696,16 +706,14 @@ paths:
           content:
             application/octet-stream:
               schema: {type: string, format: binary, maxLength: 107374182400, x-kcs-maxBytes: 107374182400}
-        '401': *Error401
-        '403': *Error403
-        '404': *Error404
-        '409': *Error409
-        '410':
-          description: Transfer content is no longer retained.
-          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
-        '500': *Error500
-        '503': *Error503
-        '504': *Error504
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
   /api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -990,6 +998,7 @@ paths:
       responses:
         '200':
           description: Exact committed compact canonical OpenAPI JSON artifact.
+          x-kcs-required-headers: [ETag, X-KCS-API-Version, Cache-Control]
           x-kcs-etag-derivation:
             algorithm: sha256
             source: exact-response-bytes
@@ -1001,9 +1010,9 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OpenApiDocument'}
-        '401': *Error401
-        '403': *Error403
-        '500': *Error500
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '500': *NoStoreError
 components:
   securitySchemes:
     v2ServiceBearer:
@@ -1270,6 +1279,14 @@ components:
     GenerationSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [runnerState]
+            properties: {runnerState: {const: exited}}
+          then:
+            properties:
+              finishedAt: {$ref: '#/components/schemas/Timestamp'}
+              exitCode: {type: integer}
       required: [jobRef, generation, agentRunRef, executionEnvelopeRef, executionEnvelopeDigest, launchBundlePath, launchBundleDigest, launchBundleSizeBytes, materialPaths, credentialGrantRef, startMetadataDigest, runnerState, supervisorAlive, pid, exitCode, startedAt, finishedAt, observedAt, replayed, credentialAcknowledgedAt, credentialDestroyedAt]
       properties:
         jobRef: {$ref: '#/components/schemas/OpaqueRef'}
@@ -1310,6 +1327,20 @@ components:
     ActionSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [state]
+            properties: {state: {const: not_requested}}
+          then:
+            properties:
+              actionRef: {type: 'null'}
+              requestDigest: {type: 'null'}
+              observedAt: {type: 'null'}
+          else:
+            properties:
+              actionRef: {$ref: '#/components/schemas/OpaqueRef'}
+              requestDigest: {$ref: '#/components/schemas/Sha256'}
+              observedAt: {$ref: '#/components/schemas/Timestamp'}
       required: [actionRef, requestDigest, state, observedAt]
       properties:
         actionRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
@@ -1344,6 +1375,40 @@ components:
     JobBindingSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [bindingState]
+            properties: {bindingState: {const: running}}
+          then:
+            properties:
+              observedPodCount: {const: 1}
+              podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        - if:
+            required: [observedPodCount]
+            properties: {observedPodCount: {type: integer, minimum: 2}}
+          then:
+            properties: {bindingState: {const: indeterminate}}
+        - if:
+            required: [bindingState]
+            properties: {bindingState: {const: finalizing}}
+          then:
+            properties:
+              finalizeAction:
+                properties: {state: {not: {const: not_requested}}}
+        - if:
+            required: [bindingState]
+            properties: {bindingState: {const: canceling}}
+          then:
+            properties:
+              cancelAction:
+                properties: {state: {not: {const: not_requested}}}
+        - if:
+            required: [bindingState]
+            properties: {bindingState: {const: deleting}}
+          then:
+            properties:
+              deleteAction:
+                properties: {state: {not: {const: not_requested}}}
       required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, createdAt, updatedAt, startedAt, finishedAt, observedAt, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
       properties:
         jobRef: {$ref: '#/components/schemas/OpaqueRef'}
@@ -1414,6 +1479,65 @@ components:
     CredentialGrantSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [state]
+            properties: {state: {const: accepted}}
+          then:
+            properties:
+              availableAt: {type: 'null'}
+              acknowledgedAt: {type: 'null'}
+              ackAgentRunRef: {type: 'null'}
+              ackGeneration: {type: 'null'}
+              consumedAt: {type: 'null'}
+              destroyedAt: {type: 'null'}
+              destroyFailureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {const: available}}
+          then:
+            properties:
+              availableAt: {$ref: '#/components/schemas/Timestamp'}
+              acknowledgedAt: {type: 'null'}
+              ackAgentRunRef: {type: 'null'}
+              ackGeneration: {type: 'null'}
+              consumedAt: {type: 'null'}
+              destroyedAt: {type: 'null'}
+              secretPresent: {const: true}
+              destroyFailureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {const: acknowledged}}
+          then:
+            properties:
+              availableAt: {$ref: '#/components/schemas/Timestamp'}
+              acknowledgedAt: {$ref: '#/components/schemas/Timestamp'}
+              ackAgentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+              ackGeneration: {type: integer, minimum: 1}
+              consumedAt: {type: 'null'}
+              destroyedAt: {type: 'null'}
+              destroyFailureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {const: consumed}}
+          then:
+            properties:
+              consumedAt: {$ref: '#/components/schemas/Timestamp'}
+        - if:
+            required: [state]
+            properties: {state: {const: destroyed}}
+          then:
+            properties:
+              destroyedAt: {$ref: '#/components/schemas/Timestamp'}
+              secretPresent: {const: false}
+              destroyFailureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {const: destroy_failed}}
+          then:
+            properties:
+              destroyedAt: {type: 'null'}
+              destroyFailureReason: {type: string, minLength: 1}
       required: [credentialGrantRef, credentialSha256, grantMetadataDigest, agentRunRef, generation, launchBundleDigest, audience, ttlSeconds, jobRef, jobUid, podUid, state, acceptedAt, availableAt, acknowledgedAt, ackAgentRunRef, ackGeneration, consumedAt, destroyedAt, expiresAt, tombstoneExpiresAt, secretPresent, destroyFailureReason, observedAt]
       properties:
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
@@ -1446,6 +1570,9 @@ components:
       minLength: 1
       format: kcs-relative-posix-path
       x-kcs-case-policy: preserve-case-reject-casefold-collisions
+      x-kcs-unicode-policy:
+        normalization: NFC
+        rejectedGeneralCategories: [Cc, Cf, Cs, Co, Cn, Zl, Zp]
       description: Normalized relative POSIX path with no empty, dot, dot-dot, control, symlink, case, or normalization ambiguity.
     TransferSpec:
       type: object
@@ -1486,6 +1613,57 @@ components:
     TransferSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [state]
+            properties: {state: {const: registered}}
+          then:
+            properties:
+              actualSizeBytes: {type: 'null'}
+              actualSha256: {type: 'null'}
+              verified: {const: false}
+              contentAvailable: {const: false}
+              snapshotRef: {type: 'null'}
+              completedAt: {type: 'null'}
+              failureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {const: completed}}
+          then:
+            properties:
+              actualSizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
+              actualSha256: {$ref: '#/components/schemas/Sha256'}
+              verified: {const: true}
+              contentAvailable: {const: true}
+              completedAt: {$ref: '#/components/schemas/Timestamp'}
+              failureReason: {type: 'null'}
+        - if:
+            required: [state]
+            properties: {state: {enum: [canceled, discarded]}}
+          then:
+            properties:
+              completedAt: {$ref: '#/components/schemas/Timestamp'}
+        - if:
+            required: [state]
+            properties: {state: {const: canceled}}
+          then:
+            properties:
+              cancelAction:
+                properties: {state: {const: succeeded}}
+        - if:
+            required: [state]
+            properties: {state: {const: discarded}}
+          then:
+            properties:
+              discardAction:
+                properties: {state: {const: succeeded}}
+        - if:
+            required: [state]
+            properties: {state: {const: failed}}
+          then:
+            properties:
+              completedAt: {$ref: '#/components/schemas/Timestamp'}
+              failureReason: {type: string, minLength: 1}
       required: [transferRef, requestDigest, jobRef, jobUid, podUid, spec, state, actualSizeBytes, actualSha256, verified, contentAvailable, snapshotRef, createdAt, updatedAt, completedAt, observedAt, failureReason, cancelAction, discardAction]
       properties:
         transferRef: {$ref: '#/components/schemas/OpaqueRef'}
@@ -1519,6 +1697,14 @@ components:
     WorkspaceOperationSnapshot:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [state]
+            properties: {state: {const: succeeded}}
+          then:
+            properties:
+              finishedAt: {$ref: '#/components/schemas/Timestamp'}
+              exitCode: {const: 0}
       x-kcs-inline-result-relation:
         canonicalization: rfc8785-jcs
         value: inlineResult

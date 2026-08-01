@@ -10,7 +10,7 @@ Generated component schemas and the checksum file are deterministic review artif
 the YAML remains the source of truth. The committed
 [canonical compact JSON](../openapi/generated/kcs-v2-jobs.openapi.json) and
 [checksum](../openapi/generated/kcs-v2-jobs.openapi.sha256) currently have digest
-`6c7cc850a81b578a7380b4938030536335b114f68f0a4ccefc9923d1167663d9`.
+`efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e`.
 
 ## Runtime boundary and topology
 
@@ -50,7 +50,11 @@ forbidden request-body logging, sensitive-header redaction, and
 | Canonical OpenAPI | `GET /api/v2/openapi.json` |
 
 The OpenAPI endpoint returns the exact committed canonical JSON with `ETag` equal to
-its SHA-256, `X-KCS-API-Version: 2.0.0`, and `Cache-Control: no-store`.
+its SHA-256, `X-KCS-API-Version: 2.0.0`, and `Cache-Control: no-store`. Required wire
+headers are declared per response with `x-kcs-required-headers`; the generator checks
+that declaration for every status, including statuses without a route example. Every
+response from credential grant/inspect, transfer content PUT/GET, and canonical
+OpenAPI discovery carries the declared `Cache-Control: no-store` policy.
 
 ## Identity, digest, replay, and recovery
 
@@ -152,7 +156,10 @@ replay instead return `JobTombstone`. A binding snapshot includes:
 
 During provisioning, the schema explicitly permits unresolved Pod, resource version,
 node, role, generation, start, and finish observations to be `null`. Absence is not
-converted to an invented value.
+converted to an invented value. A `running` binding, however, requires exactly one
+observed Pod and a non-null immutable Pod UID; two or more observed Pods require an
+`indeterminate` binding. An action in `not_requested` has null identity, digest, and
+observation fields, while every requested action state carries all three.
 
 Job binding states are `provisioning | bound | running | finalizing | succeeded |
 failed | canceling | canceled | indeterminate | deleting | deleted`. Role states are
@@ -172,11 +179,13 @@ Here `succeeded` means the provider quiesce/workload action succeeded; it says n
 about the owning research outcome.
 
 `GET /api/v2/jobs` accepts `pageToken`, `pageSize`, `providerRequestId`, `subjectRef`,
-repeatable `state`, `createdAfter`, and `includeDeleted`. Results are ordered by
-`(createdAt, jobRef)`. Page tokens are opaque, canonically encoded unpadded base64url,
-bounded to 4096 bytes, and bound to the namespace and complete filter set. Malformed,
-non-canonical, and stale tokens return `INVALID_PAGE_TOKEN` and `STALE_PAGE_TOKEN`
-respectively.
+repeatable `state`, `createdAfter`, and `includeDeleted`. The separate `items` and
+`tombstones` collections are each ordered by `(createdAt, jobRef)` and form one
+deterministic `stable-key-merge` page. `jobRef`, `providerRequestId`, and `jobUid` are
+unique across both collections, and their combined cardinality obeys `pageSize`.
+Page tokens are opaque, canonically encoded unpadded base64url, bounded to 4096 bytes,
+and bound to the namespace and complete filter set. Malformed, non-canonical, and
+stale tokens return `INVALID_PAGE_TOKEN` and `STALE_PAGE_TOKEN` respectively.
 
 Role logs are the actual combined Kubernetes container log, returned as bounded
 `content`; they are not modeled as fictitious stdout/stderr streams. A response
@@ -351,10 +360,11 @@ Registration is exactly `{transferRef, requestDigest, spec}` with the digest ove
 - `mode: direct`; and
 - `overwritePolicy: forbid | replace_authorized`.
 
-KCS rejects an empty or absolute path, `.`, `..`, empty/repeated segments, NUL/control
-bytes, symlink traversal, Unicode normalization ambiguity, and unauthorized
-replacement. It preserves path case but rejects registration when the requested path
-case-folds to an existing workspace path.
+KCS rejects an empty or absolute path, `.`, `..`, empty/repeated segments, symlink
+traversal, Unicode normalization ambiguity, and unauthorized replacement. Paths must
+be NFC and may not contain Unicode general categories `Cc`, `Cf`, `Cs`, `Co`, `Cn`,
+`Zl`, or `Zp`. It preserves path case but rejects registration when the requested
+path case-folds to an existing workspace path.
 
 V2.0.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
 It exposes no signed URL or transfer token and implements no `Range` request mode.
@@ -558,10 +568,15 @@ Run:
 .venv/bin/python scripts/generate_v2_openapi_artifacts.py --check
 ```
 
-The check rejects duplicate YAML keys, dangling or invalid references, and an invalid
-full OpenAPI 3.1 document. It validates route-level examples against the actual
-request/response/header/query/media schemas, verifies semantic JCS and raw-byte
-digests plus UTF-8/byte extensions, emits every component schema, generates twice,
-and compares those generated outputs byte for byte. The test suite separately
-regenerates the artifact set and compares it with the committed canonical JSON,
-component schemas, and checksum.
+The check rejects duplicate YAML or JSON keys, dangling or invalid references, and an
+invalid full OpenAPI 3.1 document. It validates route-level examples against the
+actual request/response/header/query/media schemas, verifies semantic JCS and
+raw-byte digests, cross-links retained Job, grant, transfer, operation, error, and
+tombstone identities, and consumes the UTF-8/byte/state extensions. A distinct raw
+artifact-hygiene pass scans every bundle and fixture—including opaque workspace
+frames—for private hosts/networks, home/SSH paths, SSH or PEM material, tokens,
+kubeconfig material, and sensitive structured keys. Binary fixtures must carry the
+explicit `synthetic-` marker and still pass signature scanning. The generator emits
+every component schema, generates twice, and compares those outputs byte for byte.
+The test suite separately regenerates the artifact set and compares it with the
+committed canonical JSON, component schemas, and checksum.

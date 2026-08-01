@@ -291,7 +291,12 @@ def test_list_and_logs_freeze_filters_ordering_and_cursor_recovery() -> None:
         "createdAfter",
         "includeDeleted",
     }
-    assert list_operation["x-kcs-ordering"] == ["createdAt", "jobRef"]
+    assert list_operation["x-kcs-ordering"] == {
+        "strategy": "stable-key-merge",
+        "collections": ["items", "tombstones"],
+        "keys": ["createdAt", "jobRef"],
+        "uniqueIdentities": ["jobRef", "providerRequestId", "jobUid"],
+    }
     assert list_operation["x-kcs-page-token-binding"] == [
         "namespace",
         "providerRequestId",
@@ -631,15 +636,37 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
     )
     assert schemas["Environment"]["x-kcs-secret-value-policy"] == "reject-secret-shaped-values"
 
+    expected_authorization = {
+        "createJob": "v2-mutator",
+        "listJobs": "v2-reader",
+        "inspectJob": "v2-reader",
+        "deleteJob": "v2-mutator",
+        "getRoleLogs": "v2-reader",
+        "grantCredential": "v2-private-credential-writer",
+        "inspectCredentialGrant": "v2-reader",
+        "startAgent": "v2-mutator",
+        "registerTransfer": "v2-mutator",
+        "inspectTransfer": "v2-reader",
+        "discardTransfer": "v2-mutator",
+        "putTransferContent": "v2-mutator",
+        "getTransferContent": "v2-reader",
+        "cancelTransfer": "v2-mutator",
+        "invokeWorkspace": "v2-mutator",
+        "inspectWorkspaceOperation": "v2-reader",
+        "finalizeJob": "v2-mutator",
+        "cancelJob": "v2-mutator",
+        "getCanonicalOpenApi": "v2-reader",
+    }
     all_mapped_codes: set[str] = set()
+    observed_operations: set[str] = set()
     for path_item in document["paths"].values():
         for method, operation in path_item.items():
             if method in MUTATING_METHODS | {"get"}:
-                assert operation["x-kcs-service-authorization"] in {
-                    "v2-reader",
-                    "v2-mutator",
-                    "v2-private-credential-writer",
-                }
+                operation_id = operation["operationId"]
+                observed_operations.add(operation_id)
+                assert (
+                    operation["x-kcs-service-authorization"] == expected_authorization[operation_id]
+                )
                 mapping = operation["x-kcs-error-codes"]
                 assert mapping and isinstance(mapping, dict)
                 all_mapped_codes.update(mapping)
@@ -658,6 +685,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
                 assert mapping["FORBIDDEN"]["status"] == 403
                 if "requestBody" in operation:
                     assert mapping["UNSUPPORTED_MEDIA_TYPE"]["status"] == 415
+    assert observed_operations == set(expected_authorization)
 
     assert all_mapped_codes == codes
 

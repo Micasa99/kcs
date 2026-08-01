@@ -7,11 +7,13 @@ import argparse
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import re
 import tempfile
 import unicodedata
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -24,7 +26,136 @@ from openapi_spec_validator import validate
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "openapi" / "kcs-v2-jobs.openapi.yaml"
 DEFAULT_OUTPUT = ROOT / "openapi" / "generated"
-HTTP_METHODS = {"delete", "get", "patch", "post", "put"}
+HTTP_METHODS = {"delete", "get", "head", "options", "patch", "post", "put", "trace"}
+EXCHANGE_FIELDS = {
+    "scenario",
+    "operationId",
+    "request",
+    "response",
+    "replayOf",
+    "conflictsWith",
+}
+REQUEST_EXAMPLE_FIELDS = {
+    "path",
+    "query",
+    "headers",
+    "contentType",
+    "body",
+    "bodyFixture",
+    "bodyFile",
+    "bodyPatch",
+}
+RESPONSE_EXAMPLE_FIELDS = {
+    "status",
+    "headers",
+    "contentType",
+    "body",
+    "bodyFixture",
+    "bodyFile",
+    "bodyPatch",
+}
+NO_STORE_OPERATION_IDS = {
+    "grantCredential",
+    "inspectCredentialGrant",
+    "putTransferContent",
+    "getTransferContent",
+    "getCanonicalOpenApi",
+}
+MUTATION_OPERATION_IDS = {
+    "createJob",
+    "grantCredential",
+    "startAgent",
+    "registerTransfer",
+    "putTransferContent",
+    "cancelTransfer",
+    "discardTransfer",
+    "invokeWorkspace",
+    "finalizeJob",
+    "cancelJob",
+    "deleteJob",
+}
+OPERATION_AUTHORIZATION = {
+    "createJob": "v2-mutator",
+    "listJobs": "v2-reader",
+    "inspectJob": "v2-reader",
+    "deleteJob": "v2-mutator",
+    "getRoleLogs": "v2-reader",
+    "grantCredential": "v2-private-credential-writer",
+    "inspectCredentialGrant": "v2-reader",
+    "startAgent": "v2-mutator",
+    "registerTransfer": "v2-mutator",
+    "inspectTransfer": "v2-reader",
+    "discardTransfer": "v2-mutator",
+    "putTransferContent": "v2-mutator",
+    "getTransferContent": "v2-reader",
+    "cancelTransfer": "v2-mutator",
+    "invokeWorkspace": "v2-mutator",
+    "inspectWorkspaceOperation": "v2-reader",
+    "finalizeJob": "v2-mutator",
+    "cancelJob": "v2-mutator",
+    "getCanonicalOpenApi": "v2-reader",
+}
+EXPECTED_OPERATION_LOCATIONS = {
+    "createJob": ("post", "/api/v2/jobs"),
+    "listJobs": ("get", "/api/v2/jobs"),
+    "inspectJob": ("get", "/api/v2/jobs/{jobRef}"),
+    "deleteJob": ("delete", "/api/v2/jobs/{jobRef}"),
+    "getRoleLogs": ("get", "/api/v2/jobs/{jobRef}/logs"),
+    "grantCredential": ("post", "/api/v2/jobs/{jobRef}/agent/credential-grants"),
+    "inspectCredentialGrant": (
+        "get",
+        "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",
+    ),
+    "startAgent": ("post", "/api/v2/jobs/{jobRef}/agent/start"),
+    "registerTransfer": ("post", "/api/v2/jobs/{jobRef}/transfers"),
+    "inspectTransfer": ("get", "/api/v2/jobs/{jobRef}/transfers/{transferRef}"),
+    "discardTransfer": ("delete", "/api/v2/jobs/{jobRef}/transfers/{transferRef}"),
+    "putTransferContent": (
+        "put",
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+    ),
+    "getTransferContent": (
+        "get",
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+    ),
+    "cancelTransfer": (
+        "post",
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel",
+    ),
+    "invokeWorkspace": ("post", "/api/v2/jobs/{jobRef}/workspace/invoke"),
+    "inspectWorkspaceOperation": (
+        "get",
+        "/api/v2/jobs/{jobRef}/operations/{operationRef}",
+    ),
+    "finalizeJob": ("post", "/api/v2/jobs/{jobRef}/finalize"),
+    "cancelJob": ("post", "/api/v2/jobs/{jobRef}/cancel"),
+    "getCanonicalOpenApi": ("get", "/api/v2/openapi.json"),
+}
+EXPECTED_ROOT_FEATURES = {
+    "transferModes": ["direct"],
+    "rangeRequests": False,
+    "signedTransfers": False,
+}
+EXPECTED_ROOT_LIMITS = {
+    "refUtf8Bytes": 256,
+    "environmentEntries": 32,
+    "environmentKeyUtf8Bytes": 64,
+    "environmentValueUtf8Bytes": 2048,
+    "launchBundleBytes": 1048576,
+    "credentialBytes": 65536,
+    "operationStdoutBytes": 65536,
+    "operationStderrBytes": 65536,
+    "logsDefaultBytes": 65536,
+    "logsMaximumBytes": 1048576,
+    "directTransferBytes": 107374182400,
+    "paginationDefault": 50,
+    "paginationMaximum": 200,
+    "tombstoneRetentionSeconds": 604800,
+    "credentialTtlDefaultSeconds": 300,
+    "credentialTtlMaximumSeconds": 900,
+}
+CANONICAL_X_KCS_POLICY_SHA256 = "7fee71dd3250e77b57f29361615cc20941ca3c32cd54282f027322de8bab0749"
+CANONICAL_OPENAPI_SHA256 = "efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -65,8 +196,95 @@ SECRET_VALUE = re.compile(
     r"(?:authorization|bearer|cookie|api[_-]?key|token|secret|credential)(?:\s+|\s*[:=])"
     r"|-----BEGIN\x20(?:[A-Z0-9]+\x20)*(?:PRIVATE\x20KEY|CERTIFICATE)-----"
     r"|(?:ssh-(?:rsa|ed25519)|kubeconfig|serviceaccount)"
+    r"|[\"']?(?:client-(?:key|certificate)(?:-data)?|certificate-authority(?:-data)?|current-context)[\"']?\s*:"
+    r"|[\"']?apiVersion[\"']?\s*:\s*[\"']?v1[\"']?[\s\S]{0,512}"
+    r"[\"']?kind[\"']?\s*:\s*[\"']?Config[\"']?"
+    r"|[\"']?kind[\"']?\s*:\s*[\"']?Config[\"']?[\s\S]{0,512}"
+    r"[\"']?apiVersion[\"']?\s*:\s*[\"']?v1[\"']?"
     r"|[a-z][a-z0-9+.-]*://[^/@\s]+@"
     r")"
+)
+UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
+SENSITIVE_ARTIFACT_KEYS = {
+    "auth",
+    "authorization",
+    "token",
+    "serviceaccounttoken",
+    "secret",
+    "credential",
+    "bearertoken",
+    "accesstoken",
+    "refreshtoken",
+    "apikey",
+    "cookie",
+    "password",
+    "clientsecret",
+    "privatekey",
+    "providerkey",
+    "sshkey",
+    "sshprivatekey",
+    "sshuser",
+    "identityfile",
+    "sshpath",
+    "privatehost",
+    "clientkey",
+    "clientkeydata",
+    "clientcertificate",
+    "clientcertificatedata",
+    "certificateauthority",
+    "certificateauthoritydata",
+    "currentcontext",
+}
+ARTIFACT_PRIVATE_PATH = re.compile(
+    r"(?ix)(?:"
+    r"(?<![A-Za-z0-9])~[/\\]"
+    r"|(?<![A-Za-z0-9])/(?:Users|home)/[^/\\\s]+(?:[/\\]|$)"
+    r"|(?<![A-Za-z0-9])/(?:root|var/root)(?:[/\\]|$)"
+    r"|(?<![A-Za-z0-9])[A-Z]:[/\\]Users[/\\][^/\\\s]+(?:[/\\]|$)"
+    r"|(?:^|[/\\])\.kube[/\\]config(?:\b|$)"
+    r"|\bIdentityFile\s+\S+"
+    r")"
+)
+ARTIFACT_PRIVATE_HOST = re.compile(
+    r"(?i)(?<![A-Za-z0-9-])(?:"
+    r"(?:[A-Za-z0-9-]+\.)+(?:internal|local|lan)|"
+    r"(?:[A-Za-z0-9-]+\.)*localhost"
+    r")(?:\.(?=$|[:/\s]))?(?![A-Za-z0-9.-])|\bHostName\s+\S+"
+)
+ARTIFACT_AUTH_VALUE = re.compile(
+    r"(?ix)(?:"
+    r"\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:bearer|basic)\s+\S+"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{4,}"
+    r"|\b(?:cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)"
+    r"\s*[:=]\s*[^\s,;}]+"
+    r"|-----BEGIN\x20(?:[A-Z0-9]+\x20)*PRIVATE\x20KEY-----"
+    r"|[a-z][a-z0-9+.-]*://[^/@\s]+@"
+    r")"
+)
+ARTIFACT_IP_CANDIDATE = re.compile(
+    r"(?<![0-9A-Fa-f:.])(?:\d{1,3}(?:\.\d{1,3}){3}|"
+    r"(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})(?![0-9A-Fa-f:.])"
+)
+ARTIFACT_IPV4_CANDIDATE = re.compile(r"(?<![0-9A-Fa-f:.])\d{1,3}(?:\.\d{1,3}){3}(?![0-9A-Za-z.])")
+ARTIFACT_MIXED_IPV6_CANDIDATE = re.compile(
+    r"(?<![0-9A-Fa-f:.])(?:[0-9A-Fa-f]{0,4}:){2,7}"
+    r"\d{1,3}(?:\.\d{1,3}){3}(?![0-9A-Fa-f:.])"
+)
+PRIVATE_ARTIFACT_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "0.0.0.0/32",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "::/128",
+        "fc00::/7",
+        "fe80::/10",
+        "::1/128",
+    )
 )
 
 
@@ -80,6 +298,80 @@ class OpenAPIArtifactSet(NamedTuple):
 
 class _UniqueKeyLoader(yaml.SafeLoader):
     """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
+
+
+def _load_json_text(value: str, label: str) -> Any:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"{label}: duplicate JSON key {key!r}")
+            result[key] = item
+        return result
+
+    try:
+        return json.loads(value, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label}: invalid JSON") from exc
+
+
+def _contains_private_network(value: str) -> bool:
+    matches = (
+        match.group()
+        for pattern in (
+            ARTIFACT_IP_CANDIDATE,
+            ARTIFACT_IPV4_CANDIDATE,
+            ARTIFACT_MIXED_IPV6_CANDIDATE,
+        )
+        for match in pattern.finditer(value)
+    )
+    for candidate in matches:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if any(address in network for network in PRIVATE_ARTIFACT_NETWORKS):
+            return True
+    return False
+
+
+def _validate_artifact_hygiene(value: Any, label: str, path: str = "$") -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if normalized in SENSITIVE_ARTIFACT_KEYS:
+                raise ValueError(f"{label}: artifact hygiene forbids sensitive key at {path}.{key}")
+            _validate_artifact_hygiene(child, label, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_artifact_hygiene(child, label, f"{path}[{index}]")
+        return
+    if not isinstance(value, str):
+        return
+    if (
+        ARTIFACT_PRIVATE_PATH.search(value)
+        or ARTIFACT_PRIVATE_HOST.search(value)
+        or ARTIFACT_AUTH_VALUE.search(value)
+        or SECRET_VALUE.search(value)
+        or _contains_private_network(value)
+    ):
+        raise ValueError(f"{label}: artifact hygiene forbids private material at {path}")
+
+
+def _validate_binary_artifact_hygiene(value: bytes, label: str) -> None:
+    decoded = value.decode("utf-8", errors="ignore")
+    if not value.startswith(b"synthetic-") or (
+        ARTIFACT_PRIVATE_PATH.search(decoded)
+        or ARTIFACT_PRIVATE_HOST.search(decoded)
+        or ARTIFACT_AUTH_VALUE.search(decoded)
+        or SECRET_VALUE.search(decoded)
+        or "-----BEGIN OPENSSH PRIVATE KEY-----" in decoded
+        or _contains_private_network(decoded)
+    ):
+        raise ValueError(f"{label}: artifact hygiene forbids private binary material")
 
 
 def _construct_unique_mapping(
@@ -203,7 +495,7 @@ def _is_safe_relative_posix_path(value: object) -> bool:
         return False
     if (
         "\\" in value
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(unicodedata.category(char) in UNSAFE_PATH_CATEGORIES for char in value)
         or unicodedata.normalize("NFC", value) != value
     ):
         return False
@@ -269,6 +561,20 @@ def _check_extended_limits(instance: Any, schema: Any, document: dict[str, Any])
         if max_canonical is not None and len(rfc8785.dumps(instance)) > max_canonical:
             raise ValueError(f"canonical JSON exceeds {max_canonical} bytes")
     if isinstance(instance, dict):
+        time_ordering = schema.get("x-kcs-time-ordering")
+        if time_ordering is not None:
+            if (
+                not isinstance(time_ordering, list)
+                or len(time_ordering) < 2
+                or any(not isinstance(field, str) for field in time_ordering)
+            ):
+                raise ValueError("time ordering extension is invalid")
+            try:
+                timestamps = [_timestamp_sort_value(instance[field]) for field in time_ordering]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("time ordering fields must be RFC 3339 timestamps") from exc
+            if timestamps != sorted(timestamps):
+                raise ValueError(f"time ordering {' <= '.join(time_ordering)} is violated")
         combined = schema.get("x-kcs-combinedMaxItems")
         if isinstance(combined, dict):
             properties = combined.get("properties", [])
@@ -353,10 +659,7 @@ def _json_body(section: dict[str, Any], examples_dir: Path, label: str) -> Any:
         body = section["body"]
     else:
         path = _fixture_path(examples_dir, section["bodyFixture"], label)
-        try:
-            body = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{label}: invalid JSON fixture {path.name}") from exc
+        body = _load_json_text(path.read_text(), f"{label} fixture {path.name}")
     if "bodyPatch" in section:
         if not has_fixture or not isinstance(section["bodyPatch"], dict):
             raise ValueError(f"{label}: bodyPatch requires a JSON bodyFixture")
@@ -394,16 +697,698 @@ def _operation_index(document: dict[str, Any]) -> dict[str, tuple[str, str, dict
     return result
 
 
+def _required_response_headers(response: Mapping[str, Any], label: str) -> list[str]:
+    declared = response.get("headers", {})
+    required = response.get("x-kcs-required-headers", [])
+    if not isinstance(declared, Mapping):
+        raise ValueError(f"{label}: response headers declaration must be an object")
+    if not isinstance(required, list) or any(not isinstance(name, str) for name in required):
+        raise ValueError(f"{label}: invalid required response header declaration")
+    declared_names = list(declared)
+    if any(not isinstance(name, str) for name in declared_names):
+        raise ValueError(f"{label}: response header names must be strings")
+    declared_folded = [name.casefold() for name in declared_names]
+    required_folded = [name.casefold() for name in required]
+    if (
+        len(declared_folded) != len(set(declared_folded))
+        or len(required_folded) != len(set(required_folded))
+        or any(name not in declared for name in required)
+    ):
+        raise ValueError(f"{label}: invalid required response header declaration")
+    return required
+
+
+def _validate_response_header_policy(
+    document: dict[str, Any],
+    operation_id: str,
+    operation: Mapping[str, Any],
+    status: str,
+    response: Mapping[str, Any],
+) -> None:
+    label = f"{operation_id} response {status}"
+    required = set(_required_response_headers(response, label))
+    declared = response.get("headers", {})
+    expected: dict[str, Any | None] = {}
+    cache_control = operation.get("x-kcs-cache-control")
+    if operation_id in NO_STORE_OPERATION_IDS and cache_control != "no-store":
+        raise ValueError(f"{operation_id}: response header policy must declare no-store")
+    if cache_control == "no-store":
+        expected["Cache-Control"] = "no-store"
+    if operation_id == "getTransferContent" and status == "200":
+        expected.update(
+            {
+                "Content-Length": None,
+                "X-Content-SHA256": None,
+                "X-KCS-Snapshot-Ref": None,
+            }
+        )
+    if operation_id == "getCanonicalOpenApi" and status == "200":
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.0.0"})
+    for name, expected_const in expected.items():
+        if name not in required or name not in declared:
+            raise ValueError(f"{label}: required response header {name} is not declared")
+        header = _dereference(document, declared[name])
+        if not isinstance(header, Mapping) or not isinstance(header.get("schema"), Mapping):
+            raise ValueError(f"{label}: required response header {name} has no schema")
+        schema = _dereference(document, header["schema"])
+        if expected_const is not None and schema.get("const") != expected_const:
+            raise ValueError(f"{label}: required response header {name} has the wrong constant")
+    if operation_id == "getTransferContent" and status == "200":
+        expected_schemas = {
+            "Content-Length": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": EXPECTED_ROOT_LIMITS["directTransferBytes"],
+            },
+            "X-Content-SHA256": {"$ref": "#/components/schemas/Sha256"},
+            "X-KCS-Snapshot-Ref": {"$ref": "#/components/schemas/OpaqueRef"},
+        }
+        if any(
+            _dereference(document, declared[name]).get("schema") != expected_schema
+            for name, expected_schema in expected_schemas.items()
+        ):
+            raise ValueError(f"{label}: transfer integrity header policy is invalid")
+    if operation_id == "getCanonicalOpenApi" and status == "200":
+        etag = _dereference(document, declared["ETag"])
+        if etag.get("schema") != {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+        } or response.get("content") != {
+            "application/json": {"schema": {"$ref": "#/components/schemas/OpenApiDocument"}}
+        }:
+            raise ValueError(f"{label}: canonical discovery integrity policy is invalid")
+
+
+def _x_kcs_policy_sha256(document: Mapping[str, Any]) -> str:
+    projection: dict[str, Any] = {}
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                child_path = f"{path}/{escaped}"
+                if key.startswith("x-kcs-"):
+                    projection[child_path] = child
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}/{index}")
+
+    visit(document, "")
+    return jcs_sha256(projection)
+
+
+def _contract_value(document: Any, path: tuple[str | int, ...]) -> Any:
+    value = document
+    for segment in path:
+        try:
+            value = value[segment]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return value
+
+
+def _validate_limit_carriers(document: Mapping[str, Any]) -> None:
+    limits = EXPECTED_ROOT_LIMITS
+    carriers: tuple[tuple[tuple[str | int, ...], int], ...] = (
+        (("components", "schemas", "OpaqueRef", "maxLength"), limits["refUtf8Bytes"]),
+        (
+            ("components", "schemas", "Environment", "maxProperties"),
+            limits["environmentEntries"],
+        ),
+        (
+            ("components", "schemas", "Environment", "propertyNames", "maxLength"),
+            limits["environmentKeyUtf8Bytes"],
+        ),
+        (
+            ("components", "schemas", "Environment", "additionalProperties", "maxLength"),
+            limits["environmentValueUtf8Bytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "AgentStartRequest",
+                "properties",
+                "launchBundleSizeBytes",
+                "maximum",
+            ),
+            limits["launchBundleBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "GenerationSnapshot",
+                "properties",
+                "launchBundleSizeBytes",
+                "maximum",
+            ),
+            limits["launchBundleBytes"],
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/agent/credential-grants",
+                "post",
+                "requestBody",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "maxLength",
+            ),
+            limits["credentialBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "WorkspaceOperationSnapshot",
+                "properties",
+                "stdout",
+                "maxLength",
+            ),
+            limits["operationStdoutBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "WorkspaceOperationSnapshot",
+                "properties",
+                "stderr",
+                "maxLength",
+            ),
+            limits["operationStderrBytes"],
+        ),
+        (
+            ("components", "parameters", "LogLimit", "schema", "default"),
+            limits["logsDefaultBytes"],
+        ),
+        (
+            ("components", "parameters", "LogLimit", "schema", "maximum"),
+            limits["logsMaximumBytes"],
+        ),
+        (
+            ("components", "schemas", "RoleLogs", "properties", "content", "maxLength"),
+            limits["logsMaximumBytes"],
+        ),
+        (
+            ("components", "parameters", "PageSize", "schema", "default"),
+            limits["paginationDefault"],
+        ),
+        (
+            ("components", "parameters", "PageSize", "schema", "maximum"),
+            limits["paginationMaximum"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "JobBindingSnapshotList",
+                "properties",
+                "items",
+                "maxItems",
+            ),
+            limits["paginationMaximum"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "JobBindingSnapshotList",
+                "properties",
+                "tombstones",
+                "maxItems",
+            ),
+            limits["paginationMaximum"],
+        ),
+        (
+            ("components", "parameters", "CredentialTtlHeader", "schema", "maximum"),
+            limits["credentialTtlMaximumSeconds"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "CredentialGrantSnapshot",
+                "properties",
+                "ttlSeconds",
+                "maximum",
+            ),
+            limits["credentialTtlMaximumSeconds"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "TransferSpec",
+                "properties",
+                "declaredSizeBytes",
+                "maximum",
+            ),
+            limits["directTransferBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "TransferSpec",
+                "properties",
+                "authorizedMaxSizeBytes",
+                "maximum",
+            ),
+            limits["directTransferBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "TransferSnapshot",
+                "properties",
+                "actualSizeBytes",
+                "oneOf",
+                0,
+                "maximum",
+            ),
+            limits["directTransferBytes"],
+        ),
+        (
+            ("components", "parameters", "ContentLengthHeader", "schema", "maximum"),
+            limits["directTransferBytes"],
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+                "put",
+                "requestBody",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "maxLength",
+            ),
+            limits["directTransferBytes"],
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+                "get",
+                "responses",
+                "200",
+                "headers",
+                "Content-Length",
+                "schema",
+                "maximum",
+            ),
+            limits["directTransferBytes"],
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+                "get",
+                "responses",
+                "200",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "maxLength",
+            ),
+            limits["directTransferBytes"],
+        ),
+    )
+    for path, expected in carriers:
+        if _contract_value(document, path) != expected:
+            raise ValueError(f"limit carrier {'/'.join(map(str, path))} is invalid")
+
+    def verify_extension_pairs(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for extension in ("x-kcs-maxUtf8Bytes", "x-kcs-maxBytes"):
+                if extension in value and value.get("maxLength") != value[extension]:
+                    raise ValueError(f"limit carrier {path}/{extension} disagrees with maxLength")
+            for key, child in value.items():
+                verify_extension_pairs(child, f"{path}/{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                verify_extension_pairs(child, f"{path}/{index}")
+
+    verify_extension_pairs(document, "")
+
+
+def _validate_format_carriers(document: Mapping[str, Any]) -> None:
+    carriers: tuple[tuple[tuple[str | int, ...], str], ...] = (
+        (
+            ("components", "schemas", "Environment", "additionalProperties", "format"),
+            "kcs-non-secret-runtime-value",
+        ),
+        (("components", "schemas", "SafeRelativePath", "format"), "kcs-relative-posix-path"),
+        (("components", "schemas", "OpaqueCursor", "format"), "kcs-base64url"),
+        (("components", "schemas", "OpaquePageToken", "format"), "kcs-base64url"),
+        (("components", "schemas", "Timestamp", "format"), "date-time"),
+        (("components", "schemas", "KubernetesUid", "format"), "uuid"),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/agent/credential-grants",
+                "post",
+                "requestBody",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "format",
+            ),
+            "binary",
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+                "put",
+                "requestBody",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "format",
+            ),
+            "binary",
+        ),
+        (
+            (
+                "paths",
+                "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+                "get",
+                "responses",
+                "200",
+                "content",
+                "application/octet-stream",
+                "schema",
+                "format",
+            ),
+            "binary",
+        ),
+    )
+    for path, expected in carriers:
+        if _contract_value(document, path) != expected:
+            raise ValueError(f"format carrier {'/'.join(map(str, path))} is invalid")
+
+
+def _validate_frozen_contract_fingerprints(
+    document: Mapping[str, Any], openapi_bytes: bytes | None = None
+) -> None:
+    if _x_kcs_policy_sha256(document) != CANONICAL_X_KCS_POLICY_SHA256:
+        raise ValueError("machine policy extension fingerprint is invalid")
+    serialized = _json_bytes(document) if openapi_bytes is None else openapi_bytes
+    if hashlib.sha256(serialized).hexdigest() != CANONICAL_OPENAPI_SHA256:
+        raise ValueError(
+            "standard contract enforcement fingerprint is invalid; bump the API version "
+            "and explicitly update the frozen fingerprint"
+        )
+
+
 def _validate_contract_extensions(document: dict[str, Any]) -> None:
-    for operation_id, (_method, _path, operation) in _operation_index(document).items():
+    info = document.get("info", {})
+    expected_legacy_authorization = {
+        "v2NamespaceAccess": "denied",
+        "podsExec": "denied",
+        "secrets": "denied",
+        "mutations": "denied",
+    }
+    expected_network_boundary = {
+        "tlsRequired": True,
+        "privateIngressRequired": True,
+    }
+    if (
+        info.get("x-kcs-features") != EXPECTED_ROOT_FEATURES
+        or info.get("x-kcs-limits") != EXPECTED_ROOT_LIMITS
+        or document.get("x-kcs-legacy-authorization") != expected_legacy_authorization
+        or document.get("x-kcs-network-boundary") != expected_network_boundary
+    ):
+        raise ValueError("root contract policy declaration is invalid")
+
+    security_schemes = document.get("components", {}).get("securitySchemes", {})
+    bearer = security_schemes.get("v2ServiceBearer", {})
+    if (
+        document.get("security") != [{"v2ServiceBearer": []}]
+        or set(security_schemes) != {"v2ServiceBearer"}
+        or {key: bearer.get(key) for key in ("type", "scheme", "bearerFormat")}
+        != {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "opaque service token",
+        }
+    ):
+        raise ValueError("global bearer security policy is invalid")
+    if document.get("servers") != [{"url": "/"}]:
+        raise ValueError("server security boundary is invalid")
+
+    paths = document.get("paths", {})
+    if not isinstance(paths, Mapping):
+        raise ValueError("OpenAPI document paths must be an object")
+    if "webhooks" in document:
+        raise ValueError("webhook route surface is forbidden")
+    for path, path_item in paths.items():
+        if "servers" in path_item:
+            raise ValueError(f"{path}: path server overrides are forbidden")
+        unexpected_fields = set(path_item) - HTTP_METHODS - {"parameters"}
+        if unexpected_fields:
+            raise ValueError(f"{path}: frozen route surface has unexpected path item fields")
+        for method in HTTP_METHODS:
+            operation = path_item.get(method)
+            if not isinstance(operation, Mapping):
+                continue
+            if "servers" in operation:
+                raise ValueError(f"{method.upper()} {path}: operation server override is forbidden")
+            if "callbacks" in operation:
+                raise ValueError(f"{method.upper()} {path}: callback route surface is forbidden")
+
+    operations = _operation_index(document)
+    actual_locations = {
+        operation_id: (method, path)
+        for operation_id, (method, path, _operation) in operations.items()
+    }
+    expected_paths = {path for _method, path in EXPECTED_OPERATION_LOCATIONS.values()}
+    if actual_locations != EXPECTED_OPERATION_LOCATIONS or set(paths) != expected_paths:
+        raise ValueError("frozen route surface operation locations are invalid")
+    if any("security" in operation for _method, _path, operation in operations.values()):
+        raise ValueError("operation security overrides are forbidden")
+
+    expected_credential_privacy = {
+        "x-kcs-private-ingress": True,
+        "x-kcs-request-body-logging": "forbidden",
+        "x-kcs-no-request-body-log": True,
+        "x-kcs-redact-headers": [
+            "Authorization",
+            "KCS-Credential-SHA256",
+            "KCS-Grant-Metadata-Digest",
+        ],
+        "x-kcs-rbac-boundary": "v2-namespace-only",
+        "x-kcs-legacy-proxy-access": "denied",
+    }
+    credential_operation = operations.get("grantCredential", (None, None, {}))[2]
+    if any(
+        credential_operation.get(key) != value for key, value in expected_credential_privacy.items()
+    ):
+        raise ValueError("credential privacy policy declaration is invalid")
+
+    expected_operation_policies = {
+        "createJob": {
+            "x-kcs-unknown-outcome-recovery": {
+                "operationId": "listJobs",
+                "method": "GET",
+                "path": "/api/v2/jobs",
+                "query": {
+                    "providerRequestId": "$request.body#/providerRequestId",
+                    "includeDeleted": True,
+                },
+                "combinedCollections": ["items", "tombstones"],
+                "maximumMatches": 1,
+                "compareDigest": {
+                    "responseField": "specDigest",
+                    "requestField": "specDigest",
+                },
+            }
+        },
+        "listJobs": {
+            "x-kcs-ordering": {
+                "strategy": "stable-key-merge",
+                "collections": ["items", "tombstones"],
+                "keys": ["createdAt", "jobRef"],
+                "uniqueIdentities": ["jobRef", "providerRequestId", "jobUid"],
+            },
+            "x-kcs-page-token-binding": [
+                "namespace",
+                "providerRequestId",
+                "subjectRef",
+                "state",
+                "createdAfter",
+                "includeDeleted",
+            ],
+        },
+        "getRoleLogs": {"x-kcs-cursor-binding": ["namespace", "jobRef", "podUid", "container"]},
+        "putTransferContent": {"x-kcs-no-request-body-log": True},
+        "invokeWorkspace": {"x-kcs-forward-body-unchanged": True},
+        "finalizeJob": {"x-kcs-provider-only-quiesce": True},
+    }
+    for operation_id, expected_policy in expected_operation_policies.items():
+        operation = operations.get(operation_id, (None, None, {}))[2]
+        if any(operation.get(key) != value for key, value in expected_policy.items()):
+            raise ValueError(f"{operation_id}: operation contract policy is invalid")
+    canonical_operation = operations.get("getCanonicalOpenApi", (None, None, {}))[2]
+    canonical_response = canonical_operation.get("responses", {}).get("200", {})
+    if canonical_response.get("x-kcs-etag-derivation") != {
+        "algorithm": "sha256",
+        "source": "exact-response-bytes",
+        "encoding": "lowercase-hex",
+    }:
+        raise ValueError("getCanonicalOpenApi: operation contract policy is invalid")
+
+    schemas = document.get("components", {}).get("schemas", {})
+    expected_schema_policies = (
+        (
+            schemas.get("Environment", {}),
+            "x-kcs-secret-value-policy",
+            "reject-secret-shaped-values",
+        ),
+        (schemas.get("JobSpec", {}), "x-kcs-default-semantics", "omission-is-distinct"),
+        (
+            schemas.get("SafeRelativePath", {}),
+            "x-kcs-case-policy",
+            "preserve-case-reject-casefold-collisions",
+        ),
+        (
+            schemas.get("TransferSpec", {}),
+            "x-kcs-path-collision-policy",
+            "reject-existing-workspace-casefold-collision",
+        ),
+        (schemas.get("WorkspaceFrame", {}), "x-kcs-forward-unchanged", True),
+        (schemas.get("OpaqueRef", {}), "x-kcs-maxUtf8Bytes", 256),
+        (schemas.get("WorkspaceFrame", {}), "x-kcs-maxCanonicalBytes", 1048576),
+        (
+            schemas.get("WorkspaceOperationSnapshot", {}).get("properties", {}).get("stdout", {}),
+            "x-kcs-maxUtf8Bytes",
+            65536,
+        ),
+    )
+    if any(schema.get(key) != expected for schema, key, expected in expected_schema_policies):
+        raise ValueError("schema contract policy declaration is invalid")
+    _validate_limit_carriers(document)
+    _validate_format_carriers(document)
+    safe_path = schemas.get("SafeRelativePath", {})
+    expected_unicode_policy = {
+        "normalization": "NFC",
+        "rejectedGeneralCategories": ["Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"],
+    }
+    if safe_path.get("x-kcs-unicode-policy") != expected_unicode_policy:
+        raise ValueError("SafeRelativePath Unicode policy declaration is invalid")
+    tombstone = schemas.get("JobTombstone", {})
+    if tombstone.get("x-kcs-time-ordering") != ["createdAt", "deletedAt", "expiresAt"]:
+        raise ValueError("JobTombstone time ordering declaration is invalid")
+    if schemas.get("JobBindingSnapshotList", {}).get("x-kcs-combinedMaxItems") != {
+        "limit": 200,
+        "properties": ["items", "tombstones"],
+    }:
+        raise ValueError("JobBindingSnapshotList combined limit declaration is invalid")
+    if schemas.get("TransferSpec", {}).get("x-kcs-relations") != [
+        {
+            "left": "declaredSizeBytes",
+            "operator": "<=",
+            "right": "authorizedMaxSizeBytes",
+        }
+    ]:
+        raise ValueError("TransferSpec size relation declaration is invalid")
+    for schema_name in ("AgentStartRequest", "GenerationSnapshot"):
+        material_paths = schemas.get(schema_name, {}).get("properties", {}).get("materialPaths", {})
+        if material_paths.get("x-kcs-casefoldUnique") is not True:
+            raise ValueError(f"{schema_name} material path uniqueness declaration is invalid")
+    expected_inline_relation = {
+        "canonicalization": "rfc8785-jcs",
+        "value": "inlineResult",
+        "size": "inlineResultSize",
+        "digest": "inlineResultDigest",
+        "exclusiveWith": "resultTransferRef",
+    }
+    if (
+        schemas.get("WorkspaceOperationSnapshot", {}).get("x-kcs-inline-result-relation")
+        != expected_inline_relation
+    ):
+        raise ValueError("inline result relation extension is invalid")
+    error_codes = set(schemas.get("ErrorCode", {}).get("enum", []))
+    recovery_actions = set(schemas.get("RecoveryAction", {}).get("enum", []))
+    if set(operations) != set(OPERATION_AUTHORIZATION):
+        raise ValueError("service authorization declaration has an unknown operation set")
+    for operation_id, (_method, _path, operation) in operations.items():
+        if operation.get("x-kcs-service-authorization") != OPERATION_AUTHORIZATION[operation_id]:
+            raise ValueError(f"{operation_id}: service authorization declaration is invalid")
+        responses = operation.get("responses")
+        if not isinstance(responses, Mapping):
+            raise ValueError(f"{operation_id}: responses must be an object")
         replay = operation.get("x-kcs-replay")
-        if replay is None:
-            continue
-        mapping = operation.get("x-kcs-error-codes", {})
-        conflict_code = replay.get("conflictCode")
-        rule = mapping.get(conflict_code)
-        if not isinstance(rule, dict) or rule.get("status") != replay.get("conflictStatus"):
-            raise ValueError(f"{operation_id}: replay conflict mapping disagrees with error map")
+        digest_projection = operation.get("x-kcs-digest-projection")
+        if operation_id in MUTATION_OPERATION_IDS and (
+            not isinstance(digest_projection, Mapping) or not isinstance(replay, Mapping)
+        ):
+            raise ValueError(f"{operation_id}: mutation safety declaration is missing")
+        if replay is not None:
+            if not isinstance(replay, Mapping) or set(replay) != {
+                "newStatus",
+                "replayStatus",
+                "conflictStatus",
+                "conflictCode",
+                "recoveryAction",
+            }:
+                raise ValueError(f"{operation_id}: mutation safety declaration is invalid")
+            mapping = operation.get("x-kcs-error-codes", {})
+            conflict_code = replay.get("conflictCode")
+            rule = mapping.get(conflict_code)
+            statuses_are_declared = all(
+                not isinstance(replay.get(field), bool)
+                and isinstance(replay.get(field), int)
+                and str(replay[field]) in responses
+                for field in ("newStatus", "replayStatus", "conflictStatus")
+            )
+            if (
+                not statuses_are_declared
+                or not isinstance(rule, dict)
+                or rule.get("status") != replay.get("conflictStatus")
+                or rule.get("recoveryAction") != replay.get("recoveryAction")
+            ):
+                raise ValueError(
+                    f"{operation_id}: replay conflict mapping disagrees with error map"
+                )
+        error_map = operation.get("x-kcs-error-codes")
+        if not isinstance(error_map, Mapping):
+            raise ValueError(f"{operation_id}: error map declaration must be an object")
+        if error_map.get("UNAUTHENTICATED") != {"status": 401, "recoveryAction": "none"} or (
+            error_map.get("FORBIDDEN") != {"status": 403, "recoveryAction": "none"}
+        ):
+            raise ValueError(f"{operation_id}: authentication error policy is invalid")
+        for code, rule in error_map.items():
+            if (
+                code not in error_codes
+                or not isinstance(rule, Mapping)
+                or set(rule) != {"status", "recoveryAction"}
+                or isinstance(rule.get("status"), bool)
+                or not isinstance(rule.get("status"), int)
+                or str(rule.get("status")) not in responses
+                or rule.get("recoveryAction") not in recovery_actions
+            ):
+                raise ValueError(f"{operation_id}: error map declaration is invalid")
+        declared_error_statuses = {
+            str(status) for status in responses if str(status).isdigit() and int(str(status)) >= 400
+        }
+        mapped_error_statuses = {str(rule["status"]) for rule in error_map.values()}
+        if not declared_error_statuses <= mapped_error_statuses:
+            raise ValueError(f"{operation_id}: error map declaration omits a response status")
+        for status, raw_response in responses.items():
+            response = _dereference(document, raw_response)
+            if not isinstance(response, Mapping):
+                raise ValueError(f"{operation_id} response {status}: response must be an object")
+            _validate_response_header_policy(
+                document, operation_id, operation, str(status), response
+            )
 
 
 def _parameters(
@@ -441,9 +1426,17 @@ def _validate_parameter_examples(
             if parameter.get("required") and name not in supplied:
                 raise ValueError(f"{label}: missing required {where} parameter {name}")
         for name, value in supplied.items():
-            _validate_instance(
-                value, declared[where][name]["schema"], document, f"{label} {where} {name}"
-            )
+            schema = declared[where][name]["schema"]
+            instance = value
+            if (
+                where == "query"
+                and schema.get("type") == "array"
+                and declared[where][name].get("style") == "form"
+                and declared[where][name].get("explode") is True
+                and not isinstance(value, list)
+            ):
+                instance = [value]
+            _validate_instance(instance, schema, document, f"{label} {where} {name}")
 
 
 def _validate_media(
@@ -466,6 +1459,60 @@ def _validate_media(
     body = _json_body(section, examples_dir, label)
     _validate_instance(body, schema, document, label)
     return body, None
+
+
+def _validate_section_metadata(
+    section: Mapping[str, Any],
+    content: Mapping[str, Any] | None,
+    label: str,
+) -> None:
+    body_fields = {"body", "bodyFixture", "bodyFile", "bodyPatch"}
+    supplied_body_fields = set(section) & body_fields
+    if content is None:
+        if "contentType" in section or supplied_body_fields:
+            raise ValueError(f"{label}: route exchange metadata supplies an undeclared body")
+        return
+
+    content_type = section.get("contentType")
+    if not isinstance(content_type, str) or content_type not in content:
+        raise ValueError(f"{label}: route exchange metadata has an invalid contentType")
+    if content_type == "application/octet-stream":
+        if supplied_body_fields != {"bodyFile"}:
+            raise ValueError(
+                f"{label}: route exchange metadata for binary content requires only bodyFile"
+            )
+        return
+
+    sources = set(section) & {"body", "bodyFixture"}
+    if len(sources) != 1 or "bodyFile" in section:
+        raise ValueError(f"{label}: route exchange metadata for JSON must select one body source")
+    if "bodyPatch" in section and "bodyFixture" not in section:
+        raise ValueError(f"{label}: route exchange metadata bodyPatch requires bodyFixture")
+
+
+def _validate_exchange_metadata(
+    exchange: Mapping[str, Any],
+    request: Mapping[str, Any],
+    response: Mapping[str, Any],
+    request_content: Mapping[str, Any] | None,
+    response_content: Mapping[str, Any] | None,
+    label: str,
+) -> None:
+    replay_of = exchange.get("replayOf")
+    conflicts_with = exchange.get("conflictsWith")
+    if replay_of is not None and not isinstance(replay_of, str):
+        raise ValueError(f"{label}: route exchange metadata replayOf must be a string")
+    if conflicts_with is not None and not isinstance(conflicts_with, str):
+        raise ValueError(f"{label}: route exchange metadata conflictsWith must be a string")
+    if replay_of is not None and conflicts_with is not None:
+        raise ValueError(
+            f"{label}: route exchange metadata cannot set replayOf and conflictsWith together"
+        )
+    status = response.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise ValueError(f"{label}: route exchange metadata status must be an integer")
+    _validate_section_metadata(request, request_content, f"{label} request")
+    _validate_section_metadata(response, response_content, f"{label} response")
 
 
 def _header_value(headers: Mapping[str, Any], name: str, label: str) -> Any:
@@ -679,6 +1726,106 @@ def _requested_resource_echo(
     return values
 
 
+def _query_parameter_default(
+    document: Mapping[str, Any], operation: Mapping[str, Any], name: str
+) -> Any:
+    for parameter in operation.get("parameters", []):
+        resolved = _dereference(document, parameter)
+        if resolved.get("in") == "query" and resolved.get("name") == name:
+            return resolved.get("schema", {}).get("default")
+    return None
+
+
+def _timestamp_sort_value(value: str) -> datetime:
+    normalized = f"{value[:-1]}+00:00" if value.endswith(("Z", "z")) else value
+    return datetime.fromisoformat(normalized)
+
+
+def _validate_list_response(
+    document: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    request: Mapping[str, Any],
+    response_body: Mapping[str, Any],
+    label: str,
+) -> None:
+    query = request.get("query", {})
+    items = response_body.get("items", [])
+    tombstones = response_body.get("tombstones", [])
+    records = [*items, *tombstones]
+
+    include_deleted = query.get(
+        "includeDeleted", _query_parameter_default(document, operation, "includeDeleted")
+    )
+    if tombstones and include_deleted is not True:
+        raise ValueError(f"{label}: list response includes tombstones without includeDeleted")
+
+    provider_request_id = query.get("providerRequestId")
+    if provider_request_id is not None:
+        if any(record.get("providerRequestId") != provider_request_id for record in records):
+            raise ValueError(f"{label}: list response does not match providerRequestId filter")
+        if len(records) > 1:
+            raise ValueError(f"{label}: list response has multiple providerRequestId matches")
+
+    subject_ref = query.get("subjectRef")
+    if subject_ref is not None and (
+        tombstones or any(item.get("subjectRef") != subject_ref for item in items)
+    ):
+        raise ValueError(f"{label}: list response does not match subjectRef filter")
+
+    states = query.get("state")
+    if states is not None:
+        accepted_states = set(states if isinstance(states, list) else [states])
+        if any(item.get("bindingState") not in accepted_states for item in items) or any(
+            tombstone.get("state") not in accepted_states for tombstone in tombstones
+        ):
+            raise ValueError(f"{label}: list response does not match state filter")
+
+    created_after = query.get("createdAfter")
+    if created_after is not None:
+        threshold = _timestamp_sort_value(created_after)
+        if any(_timestamp_sort_value(record["createdAt"]) <= threshold for record in records):
+            raise ValueError(f"{label}: list response does not match createdAfter filter")
+
+    page_size = query.get("pageSize", _query_parameter_default(document, operation, "pageSize"))
+    if not isinstance(page_size, int) or len(records) > page_size:
+        raise ValueError(f"{label}: list response exceeds requested pageSize")
+
+    ordering = operation.get("x-kcs-ordering")
+    expected_ordering = {
+        "strategy": "stable-key-merge",
+        "collections": ["items", "tombstones"],
+        "keys": ["createdAt", "jobRef"],
+        "uniqueIdentities": ["jobRef", "providerRequestId", "jobUid"],
+    }
+    if ordering != expected_ordering:
+        raise ValueError(f"{label}: list response ordering declaration is invalid")
+    for field in ordering["uniqueIdentities"]:
+        values = [record.get(field) for record in records]
+        if len(values) != len(set(values)):
+            raise ValueError(f"{label}: duplicate list identity {field}")
+    for collection in (items, tombstones):
+        keys = [(_timestamp_sort_value(item["createdAt"]), item["jobRef"]) for item in collection]
+        if keys != sorted(keys):
+            raise ValueError(f"{label}: list response is not deterministically ordered")
+
+
+def _validate_logs_response(
+    document: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    request: Mapping[str, Any],
+    response_body: Mapping[str, Any],
+    label: str,
+) -> None:
+    query = request.get("query", {})
+    if response_body.get("container") != query.get("container"):
+        raise ValueError(f"{label}: logs response container does not match request")
+    if response_body.get("inputCursor") != query.get("cursor"):
+        raise ValueError(f"{label}: logs response inputCursor does not match request cursor")
+    limit = query.get("limitBytes", _query_parameter_default(document, operation, "limitBytes"))
+    if not isinstance(limit, int) or len(response_body.get("content", "").encode()) > limit:
+        raise ValueError(f"{label}: logs response exceeds requested limitBytes")
+
+
 def _validate_workspace_result(
     response_body: Mapping[str, Any], relation: Mapping[str, Any], label: str
 ) -> None:
@@ -851,6 +1998,10 @@ def _validate_digest_semantics(
         )
         if _header_value(response_headers, "Content-Length", label) != len(response_bytes or b""):
             raise ValueError(f"{label}: response Content-Length does not match body bytes")
+    elif operation_id == "listJobs" and isinstance(response_body, dict):
+        _validate_list_response(document, operation, request, response_body, label)
+    elif operation_id == "getRoleLogs" and isinstance(response_body, dict):
+        _validate_logs_response(document, operation, request, response_body, label)
     elif (
         operation_id == "invokeWorkspace"
         and isinstance(response_body, dict)
@@ -883,6 +2034,35 @@ def _error_code(response_body: Any) -> Any:
         if isinstance(error, dict):
             return error.get("code")
     return None
+
+
+def _validate_error_semantics(
+    operation: Mapping[str, Any],
+    status: str,
+    request: Mapping[str, Any],
+    response_body: Any,
+    label: str,
+) -> None:
+    if not isinstance(response_body, Mapping) or not isinstance(
+        response_body.get("error"), Mapping
+    ):
+        return
+    error = response_body["error"]
+    code = error.get("code")
+    rule = operation.get("x-kcs-error-codes", {}).get(code)
+    if (
+        not isinstance(rule, Mapping)
+        or str(rule.get("status")) != status
+        or error.get("recoveryAction") != rule.get("recoveryAction")
+    ):
+        raise ValueError(f"{label}: response does not match operation error map")
+    context = error.get("context", {})
+    if not isinstance(context, Mapping):
+        return
+    for field in ("jobRef", "credentialGrantRef", "transferRef", "operationRef"):
+        expected = request.get("path", {}).get(field)
+        if expected is not None and context.get(field) is not None and context[field] != expected:
+            raise ValueError(f"{label}: error context does not match request path {field}")
 
 
 def _validate_response_identity(request: Mapping[str, Any], response_body: Any, label: str) -> None:
@@ -957,10 +2137,6 @@ def _validate_scenario_semantics(
             raise ValueError(f"{label}: tombstone does not match create identity or digest")
     if scenario == "typed-error" and _error_code(response_body) != "NOT_FOUND":
         raise ValueError(f"{label}: typed 404 example must use NOT_FOUND")
-    if scenario == "logs-continuation" and response_body.get("container") != request.get(
-        "query", {}
-    ).get("container"):
-        raise ValueError(f"{label}: logs response container does not match request")
     if scenario == "grant-acknowledged" and response_body.get("state") != "acknowledged":
         raise ValueError(f"{label}: grant must be acknowledged")
     if scenario == "grant-destroyed":
@@ -1057,6 +2233,10 @@ def _validate_response_headers(
     unknown = set(supplied) - set(declared)
     if unknown:
         raise ValueError(f"{label}: undeclared response headers: {sorted(unknown)}")
+    required = _required_response_headers(response, label)
+    missing = set(required) - set(supplied)
+    if missing:
+        raise ValueError(f"{label}: missing required response headers: {sorted(missing)}")
     for name, value in supplied.items():
         header = _dereference(document, declared[name])
         _validate_instance(value, header["schema"], document, f"{label} header {name}")
@@ -1093,6 +2273,21 @@ def _request_digest(record: Mapping[str, Any]) -> Any:
     )
 
 
+def _require_cross_fields(
+    actual: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    fields: Iterable[str],
+    label: str,
+) -> None:
+    for field in fields:
+        if actual.get(field) != anchor.get(field):
+            raise ValueError(f"{label}: cross-exchange binding drift in {field}")
+
+
+def _transfer_key(value: Mapping[str, Any]) -> tuple[Any, Any]:
+    return value.get("jobRef"), value.get("transferRef")
+
+
 def _validate_example_links(exchanges: Mapping[str, Mapping[str, Any]]) -> None:
     for scenario, record in exchanges.items():
         replay_of = record.get("replayOf")
@@ -1122,6 +2317,307 @@ def _validate_example_links(exchanges: Mapping[str, Mapping[str, Any]]) -> None:
             if _request_digest(target) == _request_digest(record):
                 raise ValueError(f"{scenario}: conflictsWith does not change the request digest")
 
+    create_record = exchanges.get("create-new")
+    if create_record is None or not isinstance(create_record.get("responseBody"), Mapping):
+        raise ValueError("create-new: cross-exchange binding anchor is missing")
+    create_anchor = create_record["responseBody"]
+    create_request = create_record.get("requestBody")
+    if not isinstance(create_request, Mapping):
+        raise ValueError("create-new: cross-exchange request anchor is missing")
+    job_ref = create_anchor.get("jobRef")
+    job_uid = create_anchor.get("jobUid")
+    pod_uid = create_anchor.get("podUid")
+
+    job_snapshot_fields = (
+        "jobRef",
+        "providerHandle",
+        "providerRequestId",
+        "subjectRef",
+        "runtimePlanDigest",
+        "specDigest",
+        "jobUid",
+        "podUid",
+        "createdAt",
+    )
+    for scenario, record in exchanges.items():
+        body = record.get("responseBody")
+        error_code = _error_code(body)
+        request = record["request"]
+        path = request.get("path", {})
+        headers = request.get("headers", {})
+        if path.get("jobRef") is not None and error_code != "NOT_FOUND":
+            if path["jobRef"] != job_ref:
+                raise ValueError(f"{scenario}: cross-exchange binding drift in request jobRef")
+        for header_name, expected in (
+            ("KCS-Job-UID", job_uid),
+            ("KCS-Pod-UID", pod_uid),
+        ):
+            if header_name in headers and headers[header_name] != expected:
+                raise ValueError(f"{scenario}: cross-exchange binding drift in {header_name}")
+
+        if isinstance(body, Mapping):
+            if error_code is None:
+                for field, expected in (
+                    ("jobRef", job_ref),
+                    ("jobUid", job_uid),
+                    ("podUid", pod_uid),
+                ):
+                    if field in body and body[field] != expected:
+                        raise ValueError(
+                            f"{scenario}: cross-exchange binding drift in response {field}"
+                        )
+                binding = body.get("binding")
+                if isinstance(binding, Mapping):
+                    _require_cross_fields(
+                        binding,
+                        {"jobUid": job_uid, "podUid": pod_uid},
+                        ("jobUid", "podUid"),
+                        scenario,
+                    )
+            if "providerHandle" in body and "bindingState" in body:
+                _require_cross_fields(body, create_anchor, job_snapshot_fields, scenario)
+                for role in ("agent", "workspace"):
+                    actual_role = body.get(role)
+                    anchor_role = create_anchor.get(role)
+                    if (
+                        isinstance(actual_role, Mapping)
+                        and isinstance(anchor_role, Mapping)
+                        and actual_role.get("requested") != anchor_role.get("requested")
+                    ):
+                        raise ValueError(
+                            f"{scenario}: cross-exchange binding drift in "
+                            f"{role} requested resources"
+                        )
+            error = body.get("error")
+            if isinstance(error, Mapping) and error_code != "NOT_FOUND":
+                context = error.get("context", {})
+                if isinstance(context, Mapping) and context.get("jobRef") not in {
+                    None,
+                    job_ref,
+                }:
+                    raise ValueError(
+                        f"{scenario}: cross-exchange binding drift in error context jobRef"
+                    )
+
+    create_tombstone_record = exchanges.get("create-tombstone")
+    delete_tombstone_record = exchanges.get("delete-tombstone")
+    if create_tombstone_record is not None:
+        if create_tombstone_record.get("requestBody") != create_request:
+            raise ValueError(
+                "create-tombstone: cross-exchange binding drift in retained create request"
+            )
+        tombstone_body = create_tombstone_record.get("responseBody", {})
+        tombstone = tombstone_body.get("error", {}).get("context", {}).get("tombstone")
+        if not isinstance(tombstone, Mapping):
+            raise ValueError("create-tombstone: cross-exchange binding tombstone is missing")
+        _require_cross_fields(
+            tombstone,
+            create_anchor,
+            ("providerRequestId", "specDigest", "jobRef", "jobUid", "podUid", "createdAt"),
+            "create-tombstone",
+        )
+        if delete_tombstone_record is not None:
+            delete_tombstone = delete_tombstone_record.get("responseBody")
+            if delete_tombstone != tombstone:
+                raise ValueError(
+                    "delete-tombstone: cross-exchange binding drift from retained tombstone"
+                )
+
+    credential_record = exchanges.get("grant-new")
+    credential_anchor = (
+        credential_record.get("responseBody") if credential_record is not None else None
+    )
+    if not isinstance(credential_anchor, Mapping):
+        raise ValueError("grant-new: cross-exchange binding credential anchor is missing")
+    credential_fields = (
+        "credentialGrantRef",
+        "credentialSha256",
+        "grantMetadataDigest",
+        "agentRunRef",
+        "generation",
+        "launchBundleDigest",
+        "audience",
+        "ttlSeconds",
+        "jobRef",
+        "jobUid",
+        "podUid",
+        "acceptedAt",
+        "availableAt",
+        "expiresAt",
+        "tombstoneExpiresAt",
+    )
+    credential_snapshots: dict[str, Mapping[str, Any]] = {}
+    for scenario, record in exchanges.items():
+        body = record.get("responseBody")
+        if (
+            not isinstance(body, Mapping)
+            or "credentialGrantRef" not in body
+            or "credentialSha256" not in body
+        ):
+            continue
+        _require_cross_fields(body, credential_anchor, credential_fields, scenario)
+        credential_snapshots[scenario] = body
+        if body.get("ackAgentRunRef") is not None and body.get("ackAgentRunRef") != body.get(
+            "agentRunRef"
+        ):
+            raise ValueError(f"{scenario}: cross-exchange binding drift in ackAgentRunRef")
+        if body.get("ackGeneration") is not None and body.get("ackGeneration") != body.get(
+            "generation"
+        ):
+            raise ValueError(f"{scenario}: cross-exchange binding drift in ackGeneration")
+    acknowledged = credential_snapshots.get("grant-acknowledged")
+    destroyed = credential_snapshots.get("grant-destroyed")
+    if acknowledged is not None and destroyed is not None:
+        _require_cross_fields(
+            destroyed,
+            acknowledged,
+            ("availableAt", "acknowledgedAt", "ackAgentRunRef", "ackGeneration"),
+            "grant-destroyed",
+        )
+
+    for scenario, record in exchanges.items():
+        if record.get("operationId") != "startAgent" or not isinstance(
+            record.get("requestBody"), Mapping
+        ):
+            continue
+        start_request = record["requestBody"]
+        if scenario in {"start-new", "start-replay", "start-pod-loss"}:
+            _require_cross_fields(
+                start_request,
+                credential_anchor,
+                ("credentialGrantRef", "agentRunRef", "generation", "launchBundleDigest"),
+                scenario,
+            )
+            if credential_anchor.get("state") != "available":
+                raise ValueError(
+                    f"{scenario}: cross-exchange binding references an unusable credential grant"
+                )
+
+    transfer_anchors: dict[tuple[Any, Any], Mapping[str, Any]] = {}
+    for scenario, record in exchanges.items():
+        if record.get("operationId") != "registerTransfer":
+            continue
+        body = record.get("responseBody")
+        if not isinstance(body, Mapping):
+            continue
+        key = _transfer_key(body)
+        existing = transfer_anchors.get(key)
+        if existing is not None:
+            _require_cross_fields(
+                body,
+                existing,
+                ("requestDigest", "spec", "jobUid", "podUid", "createdAt"),
+                scenario,
+            )
+        else:
+            transfer_anchors[key] = body
+
+    transfer_fields = (
+        "jobRef",
+        "transferRef",
+        "requestDigest",
+        "jobUid",
+        "podUid",
+        "spec",
+        "createdAt",
+    )
+    transfer_path_operations = {
+        "inspectTransfer",
+        "discardTransfer",
+        "putTransferContent",
+        "getTransferContent",
+        "cancelTransfer",
+    }
+    for scenario, record in exchanges.items():
+        body = record.get("responseBody")
+        if isinstance(body, Mapping) and "transferRef" in body and "spec" in body:
+            anchor = transfer_anchors.get(_transfer_key(body))
+            if anchor is None:
+                raise ValueError(f"{scenario}: cross-exchange binding has no transfer registration")
+            _require_cross_fields(body, anchor, transfer_fields, scenario)
+        if record.get("operationId") in transfer_path_operations:
+            path = record["request"].get("path", {})
+            key = (path.get("jobRef"), path.get("transferRef"))
+            anchor = transfer_anchors.get(key)
+            if anchor is None:
+                raise ValueError(f"{scenario}: cross-exchange binding has no transfer registration")
+            expected_direction = {
+                "putTransferContent": "stage_input",
+                "getTransferContent": "collect_output",
+            }.get(record.get("operationId"))
+            if (
+                expected_direction is not None
+                and anchor.get("spec", {}).get("direction") != expected_direction
+            ):
+                raise ValueError(
+                    f"{scenario}: cross-exchange binding uses the wrong transfer direction"
+                )
+
+    cancel_job = exchanges.get("cancel-output-loss")
+    if cancel_job is not None and isinstance(cancel_job.get("requestBody"), Mapping):
+        cancel_path = cancel_job["request"].get("path", {})
+        for transfer_ref in (
+            cancel_job["requestBody"].get("spec", {}).get("finishCollectTransferRefs", [])
+        ):
+            anchor = transfer_anchors.get((cancel_path.get("jobRef"), transfer_ref))
+            if anchor is None or anchor.get("spec", {}).get("direction") != "collect_output":
+                raise ValueError(
+                    "cancel-output-loss: finishCollectTransferRefs must name a "
+                    "registered collect transfer"
+                )
+
+    workspace_anchors: dict[tuple[Any, Any], Mapping[str, Any]] = {}
+    for _scenario, record in exchanges.items():
+        if record.get("operationId") != "invokeWorkspace":
+            continue
+        body = record.get("responseBody")
+        if isinstance(body, Mapping):
+            workspace_anchors[(body.get("jobRef"), body.get("operationRef"))] = body
+    workspace_fields = (
+        "jobRef",
+        "operationRef",
+        "requestDigest",
+        "storedFrameDigest",
+        "binding",
+        "acceptedAt",
+    )
+    for scenario, record in exchanges.items():
+        body = record.get("responseBody")
+        if (
+            not isinstance(body, Mapping)
+            or "operationRef" not in body
+            or "storedFrameDigest" not in body
+        ):
+            continue
+        key = (body.get("jobRef"), body.get("operationRef"))
+        anchor = workspace_anchors.get(key)
+        if anchor is not None:
+            _require_cross_fields(body, anchor, workspace_fields, scenario)
+        elif scenario in {"invoke-result-transfer", "invoke-indeterminate"}:
+            raise ValueError(f"{scenario}: cross-exchange binding has no workspace invoke anchor")
+        result_transfer_ref = body.get("resultTransferRef")
+        if result_transfer_ref is not None:
+            transfer = transfer_anchors.get((body.get("jobRef"), result_transfer_ref))
+            if transfer is None or transfer.get("spec", {}).get("direction") != "collect_output":
+                raise ValueError(
+                    f"{scenario}: resultTransferRef must name a registered collect transfer"
+                )
+
+    finalize = exchanges.get("finalize-provider-quiesce")
+    if finalize is not None and isinstance(finalize.get("requestBody"), Mapping):
+        finalize_job_ref = finalize["request"].get("path", {}).get("jobRef")
+        finalize_spec = finalize["requestBody"].get("spec", {})
+        for operation_ref in finalize_spec.get("operationRefs", []):
+            if (finalize_job_ref, operation_ref) not in workspace_anchors:
+                raise ValueError(
+                    "finalize-provider-quiesce: operationRefs must name registered work"
+                )
+        for transfer_ref in finalize_spec.get("transferRefs", []):
+            if (finalize_job_ref, transfer_ref) not in transfer_anchors:
+                raise ValueError(
+                    "finalize-provider-quiesce: transferRefs must name registered work"
+                )
+
     collect_content = exchanges.get("transfer-collect-content")
     collect_snapshot = exchanges.get("transfer-collect-completed")
     if collect_content is not None and collect_snapshot is not None:
@@ -1149,6 +2645,13 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
     if not example_paths:
         raise ValueError(f"no sanitized route examples found in {examples_dir}")
     fixture_files = {path.resolve() for path in fixtures_dir.rglob("*") if path.is_file()}
+    for artifact_path in sorted([*example_paths, *fixture_files]):
+        label = str(artifact_path.relative_to(examples_dir))
+        if artifact_path.suffix == ".json":
+            value = _load_json_text(artifact_path.read_text(), label)
+            _validate_artifact_hygiene(value, label)
+        else:
+            _validate_binary_artifact_hygiene(artifact_path.read_bytes(), label)
     expected_layout_files = {
         *(path.resolve() for path in example_paths),
         *fixture_files,
@@ -1169,16 +2672,23 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
     referenced_fixtures: set[Path] = set()
     validated = 0
     for example_path in example_paths:
-        try:
-            bundle = json.loads(example_path.read_text())
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{example_path.name}: invalid JSON") from exc
+        bundle = _load_json_text(example_path.read_text(), example_path.name)
         if not isinstance(bundle, dict) or not isinstance(bundle.get("exchanges"), list):
             raise ValueError(f"{example_path.name}: expected a route exchange bundle")
+        unknown_bundle_fields = set(bundle) - {"exchanges"}
+        if unknown_bundle_fields:
+            raise ValueError(
+                f"{example_path.name}: undeclared bundle fields: {sorted(unknown_bundle_fields)}"
+            )
         for index, exchange in enumerate(bundle["exchanges"]):
             label = f"{example_path.name} exchange {index}"
             if not isinstance(exchange, dict):
                 raise ValueError(f"{label}: exchange must be an object")
+            unknown_exchange_fields = set(exchange) - EXCHANGE_FIELDS
+            if unknown_exchange_fields:
+                raise ValueError(
+                    f"{label}: undeclared exchange fields: {sorted(unknown_exchange_fields)}"
+                )
             scenario = exchange.get("scenario")
             if not isinstance(scenario, str) or scenario in scenarios:
                 raise ValueError(f"{label}: scenario must be a unique string")
@@ -1191,6 +2701,34 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
             response_example = exchange.get("response")
             if not isinstance(request, dict) or not isinstance(response_example, dict):
                 raise ValueError(f"{label}: request and response must be objects")
+            for section_name, section, allowed_fields in (
+                ("request", request, REQUEST_EXAMPLE_FIELDS),
+                ("response", response_example, RESPONSE_EXAMPLE_FIELDS),
+            ):
+                unknown_section_fields = set(section) - allowed_fields
+                if unknown_section_fields:
+                    raise ValueError(
+                        f"{label}: undeclared {section_name} fields: "
+                        f"{sorted(unknown_section_fields)}"
+                    )
+            request_body_spec = operation.get("requestBody")
+            if request_body_spec is not None:
+                request_body_spec = _dereference(document, request_body_spec)
+            raw_status = response_example.get("status")
+            if isinstance(raw_status, bool) or not isinstance(raw_status, int):
+                raise ValueError(f"{label}: route exchange metadata status must be an integer")
+            status = str(raw_status)
+            if status not in operation["responses"]:
+                raise ValueError(f"{label}: undeclared response status {status}")
+            response = _dereference(document, operation["responses"][status])
+            _validate_exchange_metadata(
+                exchange,
+                request,
+                response_example,
+                request_body_spec.get("content") if request_body_spec is not None else None,
+                response.get("content"),
+                label,
+            )
             for section in (request, response_example):
                 for fixture_key in ("bodyFixture", "bodyFile"):
                     fixture_name = section.get(fixture_key)
@@ -1202,9 +2740,7 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 
             request_body: Any | None = None
             request_bytes: bytes | None = None
-            request_body_spec = operation.get("requestBody")
             if request_body_spec is not None:
-                request_body_spec = _dereference(document, request_body_spec)
                 request_body, request_bytes = _validate_media(
                     document,
                     request_body_spec["content"],
@@ -1215,10 +2751,6 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
             elif set(request) & {"contentType", "body", "bodyFixture", "bodyFile"}:
                 raise ValueError(f"{label}: operation has no request body")
 
-            status = str(response_example.get("status"))
-            if status not in operation["responses"]:
-                raise ValueError(f"{label}: undeclared response status {status}")
-            response = _dereference(document, operation["responses"][status])
             _validate_response_headers(document, response, response_example, label)
             response_body: Any | None = None
             response_bytes: bytes | None = None
@@ -1232,7 +2764,7 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
                         f"{label} response",
                     )
                 except ValueError as exc:
-                    if scenario == "create-tombstone":
+                    if scenario == "create-tombstone" and "duplicate JSON key" not in str(exc):
                         raise ValueError(
                             f"{label}: tombstone scenario must carry sanitized tombstone context"
                         ) from exc
@@ -1251,6 +2783,7 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
                 response_example.get("headers", {}),
                 label,
             )
+            _validate_error_semantics(operation, status, request, response_body, label)
             _validate_response_identity(request, response_body, label)
             _validate_scenario_semantics(
                 scenario, status, request, request_body, response_body, label
@@ -1309,6 +2842,9 @@ def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
         component_bundles[name] = bundle
 
     validated_examples = _validate_examples(source, document)
+    openapi_bytes = _json_bytes(document)
+    _validate_frozen_contract_fingerprints(document, openapi_bytes)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     schema_dir = output_dir / "schemas"
     schema_dir.mkdir(exist_ok=True)
@@ -1316,7 +2852,6 @@ def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
         stale_schema.unlink()
 
     openapi_json = output_dir / "kcs-v2-jobs.openapi.json"
-    openapi_bytes = _json_bytes(document)
     openapi_json.write_bytes(openapi_bytes)
     sha256 = hashlib.sha256(openapi_bytes).hexdigest()
     checksum = output_dir / "kcs-v2-jobs.openapi.sha256"
