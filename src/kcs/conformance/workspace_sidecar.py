@@ -276,7 +276,7 @@ class WorkspaceSidecar:
         self,
         request: Mapping[str, Any],
         retained: Mapping[str, Any],
-        parent_fd: int,
+        parent_fd: int | None,
         target_name: str,
         partial: Path,
         *,
@@ -294,7 +294,17 @@ class WorkspaceSidecar:
             raise _RpcRejectedError(
                 "TRANSFER_INDETERMINATE", "installing receipt does not match the request"
             )
-        matches = _casefold_entries_at(parent_fd, target_name)
+        if parent_fd is None:
+            matches: list[str] = []
+        else:
+            try:
+                matches = _casefold_entries_at(parent_fd, target_name)
+            except OSError:
+                if canceling:
+                    self._reject_installing_indeterminate(
+                        retained, "installing target publication cannot be inspected"
+                    )
+                raise
         if len(matches) > 1 or (matches and matches[0] != target_name):
             if canceling:
                 self._reject_installing_indeterminate(
@@ -302,6 +312,7 @@ class WorkspaceSidecar:
                 )
             raise _RpcRejectedError("UNSAFE_PATH", "workspace target is ambiguous")
         if matches:
+            assert parent_fd is not None
             try:
                 target_stat, target_size, target_digest = _inspect_at(parent_fd, target_name)
             except (OSError, _RpcRejectedError):
@@ -341,6 +352,12 @@ class WorkspaceSidecar:
             raise _RpcRejectedError(
                 "TRANSFER_INDETERMINATE", "installing bytes cannot be reconciled"
             ) from error
+        except (OSError, _RpcRejectedError):
+            if canceling:
+                self._reject_installing_indeterminate(
+                    retained, "installing private bytes cannot be reconciled"
+                )
+            raise
         if (
             partial_stat.st_dev != retained["installDevice"]
             or partial_stat.st_ino != retained["installInode"]
@@ -457,11 +474,19 @@ class WorkspaceSidecar:
                 raise _RpcRejectedError(
                     "TRANSFER_INDETERMINATE", "installing receipt has no workspace path"
                 )
+            parent_fd: int | None
             try:
                 parent_fd, target_name = self._open_parent(raw_path, create=False)
-            except _RpcRejectedError:
+            except _RpcRejectedError as error:
+                if error.code != "NOT_FOUND":
+                    self._reject_installing_indeterminate(
+                        retained, "installing target publication is ambiguous"
+                    )
+                parent_fd = None
+                target_name = PurePosixPath(raw_path).name
+            except OSError:
                 self._reject_installing_indeterminate(
-                    retained, "installing target publication is ambiguous"
+                    retained, "installing target publication cannot be inspected"
                 )
             try:
                 reconciled = self._reconcile_installing(
@@ -478,7 +503,8 @@ class WorkspaceSidecar:
                     canceling=True,
                 )
             finally:
-                os.close(parent_fd)
+                if parent_fd is not None:
+                    os.close(parent_fd)
             if reconciled is not None:
                 self._transfers[transfer_ref] = reconciled
                 raise _RpcRejectedError("STATE_CONFLICT", "completed transfer cannot be canceled")

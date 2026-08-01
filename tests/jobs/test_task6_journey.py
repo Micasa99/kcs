@@ -385,7 +385,9 @@ def test_transfer_bytes_are_atomic_replayable_and_discard_only_private_content(
     )
 
 
-def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -> None:
+def test_transfer_policy_mismatch_cancel_and_octet_stream_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         from starlette.testclient import TestClient
@@ -470,6 +472,22 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
         receipt = tmp_path / ".kcs/receipts" / f"{hashlib.sha256(ref.encode()).hexdigest()}.json"
         return partial, target, receipt
 
+    def assert_cancel_indeterminate(ref: str, receipt: Path) -> None:
+        with pytest.raises(TransferIndeterminateError) as error:
+            provider.cancel_transfer("job-1", ref, cancel.model_copy(update={"cancel_ref": ref}))
+        retained = provider.inspect_transfer("job-1", ref)
+        assert (
+            str(error.value),
+            json.loads(receipt.read_text())["state"],
+            retained.state,
+            retained.cancel_action.state,
+        ) == (
+            TransferIndeterminateError.default_message,
+            "indeterminate",
+            "indeterminate",
+            "indeterminate",
+        )
+
     installed_partial, installed_target, installed_receipt = retain_installing(
         "cancel-installed", "cancel/installed.bin", b"published-before-cancel"
     )
@@ -508,6 +526,32 @@ def test_transfer_policy_mismatch_cancel_and_octet_stream_http(tmp_path: Path) -
     assert ambiguous.cancel_action.state == "indeterminate"
     assert ambiguous_partial.exists()
     assert json.loads(ambiguous_receipt.read_text())["state"] == "indeterminate"
+
+    _, _, unreadable_parent_receipt = retain_installing(
+        "cancel-unreadable-parent",
+        "cancel/unreadable-parent.bin",
+        b"parent-failure-bytes",
+    )
+
+    def deny_parent_open(raw_path: str, *, create: bool) -> tuple[int, str]:
+        raise PermissionError(f"private-parent-must-not-escape:{raw_path}:{create}")
+
+    with monkeypatch.context() as parent_failure:
+        parent_failure.setattr(sidecar, "_open_parent", deny_parent_open)
+        assert_cancel_indeterminate("cancel-unreadable-parent", unreadable_parent_receipt)
+
+    _, _, unreadable_receipt = retain_installing(
+        "cancel-unreadable-partial",
+        "cancel/unreadable-partial.bin",
+        b"unreadable-private-bytes",
+    )
+
+    def deny_partial_read(path: Path) -> tuple[int, str]:
+        raise PermissionError(f"private-partial-must-not-escape:{path}")
+
+    with monkeypatch.context() as partial_failure:
+        partial_failure.setattr(workspace_sidecar, "_hash_nofollow", deny_partial_read)
+        assert_cancel_indeterminate("cancel-unreadable-partial", unreadable_receipt)
 
     app = FastAPI()
     app.include_router(create_jobs_router(provider, "token"))
