@@ -107,6 +107,14 @@ class GrantIdentityConflictError(IdentityDigestConflictError):
     recovery_action = "inspect_grant"
 
 
+class TransferIdentityConflictError(IdentityDigestConflictError):
+    recovery_action = "inspect_transfer"
+
+
+class OperationIdentityConflictError(IdentityDigestConflictError):
+    recovery_action = "inspect_operation"
+
+
 class StateConflictError(KcsV2Error):
     code = "STATE_CONFLICT"
     status_code = 409
@@ -124,6 +132,24 @@ class TransferIndeterminateError(StateConflictError):
     code = "TRANSFER_INDETERMINATE"
     recovery_action = "inspect_transfer"
     default_message = "A requested transfer has indeterminate retained state"
+
+
+class TransferBytesMismatchError(StateConflictError):
+    code = "TRANSFER_BYTES_MISMATCH"
+    recovery_action = "inspect_transfer"
+    default_message = "The streamed bytes do not match the registered transfer"
+
+
+class OverwriteForbiddenError(StateConflictError):
+    code = "OVERWRITE_FORBIDDEN"
+    recovery_action = "inspect_transfer"
+    default_message = "The transfer would overwrite workspace content without authority"
+
+
+class UnsafePathError(KcsV2Error):
+    code = "UNSAFE_PATH"
+    status_code = 422
+    default_message = "The transfer path is unsafe in the bound workspace"
 
 
 class IllegalGenerationError(KcsV2Error):

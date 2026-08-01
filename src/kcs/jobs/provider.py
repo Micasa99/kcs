@@ -47,9 +47,14 @@ from .contracts import (
     RoleLogs,
     RoleState,
     RunnerState,
+    TransferCancelRequest,
     TransferObservation,
+    TransferRegisterRequest,
+    TransferSnapshot,
     TransferState,
+    WorkspaceInvokeRequest,
     WorkspaceObservedResources,
+    WorkspaceOperationSnapshot,
     WorkspaceRequestedResources,
     WorkspaceRoleSnapshot,
 )
@@ -78,7 +83,12 @@ from .errors import (
     TransferIndeterminateError,
 )
 from .renderer import credential_secret_name
-from .transport import AgentRpcResponse, AgentRpcTransportProtocol
+from .transport import (
+    AgentRpcResponse,
+    AgentRpcTransportProtocol,
+    WorkspaceRpcTransportProtocol,
+)
+from .workspace_runtime import TransferResult, VerifiedContent, WorkspaceRuntime
 
 EMPTY_OBJECT_DIGEST = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 DEFAULT_PAGE_SIZE = 50
@@ -222,6 +232,7 @@ class V2JobProvider:
         delete_poll_interval_seconds: float = DEFAULT_DELETE_POLL_INTERVAL_SECONDS,
         sleeper: Callable[[float], None] | None = None,
         transport: AgentRpcTransportProtocol | None = None,
+        workspace_transport: WorkspaceRpcTransportProtocol | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -240,6 +251,13 @@ class V2JobProvider:
         self._delete_poll_interval_seconds = delete_poll_interval_seconds
         self._sleeper = sleeper or time.sleep
         self._transport = transport
+        self._workspace_runtime = WorkspaceRuntime(
+            store,
+            workspace_transport,
+            self._live_binding,
+            self._assert_accepting_workspace_work,
+            self._now,
+        )
         self.reconcile_credentials()
 
     def reconcile_credentials(self) -> None:
@@ -526,6 +544,54 @@ class V2JobProvider:
             ) from error
         return self._update_grant(record, state=CredentialState.AVAILABLE, secret_present=True)
 
+    def register_transfer(self, job_ref: str, request: TransferRegisterRequest) -> TransferResult:
+        return self._workspace_runtime.register_transfer(job_ref, request)
+
+    def stage_transfer_content(
+        self,
+        job_ref: str,
+        transfer_ref: str,
+        stream: Any,
+        *,
+        content_length: int | None = None,
+    ) -> TransferSnapshot:
+        return self._workspace_runtime.stage_transfer_content(
+            job_ref,
+            transfer_ref,
+            stream,
+            content_length=content_length,
+        )
+
+    def open_collected_content(self, job_ref: str, transfer_ref: str) -> VerifiedContent:
+        return self._workspace_runtime.open_collected_content(job_ref, transfer_ref)
+
+    def inspect_transfer(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
+        return self._workspace_runtime.inspect_transfer(job_ref, transfer_ref)
+
+    def cancel_transfer(
+        self, job_ref: str, transfer_ref: str, request: TransferCancelRequest
+    ) -> TransferResult:
+        return self._workspace_runtime.cancel_transfer(job_ref, transfer_ref, request)
+
+    def discard_transfer(
+        self,
+        job_ref: str,
+        transfer_ref: str,
+        discard_ref: str,
+        request_digest: str,
+    ) -> TransferSnapshot:
+        return self._workspace_runtime.discard_transfer(
+            job_ref, transfer_ref, discard_ref, request_digest
+        )
+
+    def invoke_workspace(
+        self, job_ref: str, request: WorkspaceInvokeRequest
+    ) -> WorkspaceOperationSnapshot:
+        return self._workspace_runtime.invoke_workspace(job_ref, request)
+
+    def inspect_operation(self, job_ref: str, operation_ref: str) -> WorkspaceOperationSnapshot:
+        return self._workspace_runtime.inspect_operation(job_ref, operation_ref)
+
     def inspect_credential_grant(
         self, job_ref: str, credential_grant_ref: str
     ) -> CredentialGrantSnapshot:
@@ -750,6 +816,11 @@ class V2JobProvider:
     def _assert_not_finalizing(self, job_ref: str) -> None:
         if self._runtime_records("finalize", job_ref):
             raise StateConflictError("The provider is already quiescing this Job")
+
+    def _assert_accepting_workspace_work(self, job_ref: str) -> None:
+        self._assert_not_finalizing(job_ref)
+        if self._runtime_records("cancel", job_ref):
+            raise StateConflictError("The provider is already canceling this Job")
 
     def _reserve_finalize(
         self,

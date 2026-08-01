@@ -10,11 +10,13 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from .errors import (
@@ -345,6 +347,70 @@ class V2KubeAdapter:
             raise
         except Exception as error:
             raise DependencyUnavailableError("supervisor exec dependency failed") from error
+        finally:
+            websocket.close()
+
+    def exec_workspace_rpc(
+        self,
+        binding: Mapping[str, str],
+        header_frame: bytes,
+        body_path: Path | None,
+        response_path: Path,
+        max_response_bytes: int,
+    ) -> None:
+        """Stream raw binary channels through the single fixed workspace RPC argv."""
+        from kubernetes.stream import stream
+
+        pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        pod_name = str(_value(_value(pod, "metadata"), "name"))
+        websocket: Any = stream(
+            self._core.connect_get_namespaced_pod_exec,
+            pod_name,
+            self.namespace,
+            container="workspace",
+            command=["/opt/kcs/workspace-sidecar", "rpc"],
+            stderr=True,
+            stdin=True,
+            stdout=True,
+            tty=False,
+            binary=True,
+            _preload_content=False,
+        )
+        written = 0
+        try:
+            websocket.write_channel(0, header_frame)
+            if body_path is not None:
+                with body_path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        websocket.write_channel(0, chunk)
+            deadline = time.monotonic() + 300
+            with response_path.open("wb") as output:
+                while websocket.is_open() and time.monotonic() < deadline:
+                    websocket.update(timeout=1)
+                    while websocket.peek_stdout():
+                        chunk = websocket.read_stdout()
+                        if not isinstance(chunk, bytes):
+                            raise DependencyUnavailableError(
+                                "workspace exec returned a non-binary stdout channel"
+                            )
+                        written += len(chunk)
+                        if written > max_response_bytes:
+                            raise DependencyUnavailableError(
+                                "workspace exec response exceeded its bound"
+                            )
+                        output.write(chunk)
+                    if websocket.peek_stderr():
+                        raise DependencyUnavailableError("workspace exec returned an error stream")
+                output.flush()
+                os.fsync(output.fileno())
+            if websocket.is_open():
+                raise DependencyTimeoutError("workspace exec did not complete")
+            if _exec_status(websocket.read_channel(3)) != 0:
+                raise DependencyUnavailableError("workspace exec did not succeed")
+        except (DependencyTimeoutError, DependencyUnavailableError):
+            raise
+        except Exception as error:
+            raise DependencyUnavailableError("workspace exec dependency failed") from error
         finally:
             websocket.close()
 

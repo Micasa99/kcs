@@ -56,7 +56,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         from kcs.jobs.renderer import V2JobRenderer
         from kcs.jobs.settings import V2RuntimeSettings
         from kcs.jobs.store import V2JobStore
-        from kcs.jobs.transport import ExecRpcTransport
+        from kcs.jobs.transport import ExecRpcTransport, ExecWorkspaceRpcTransport
 
         settings = settings or V2RuntimeSettings.from_env(os.environ)
         config.load_incluster_config()
@@ -69,6 +69,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             V2JobRenderer(settings),
             namespace=settings.namespace,
             transport=ExecRpcTransport(kube.exec_supervisor_rpc),
+            workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
         )
     return _v2_provider
 

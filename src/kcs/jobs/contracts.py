@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -13,13 +13,14 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
     StrictBool,
     StrictInt,
     StrictStr,
     model_validator,
 )
 
-from .canonical import validate_request_digest
+from .canonical import canonical_bytes, canonical_digest, validate_request_digest
 from .policy import (
     validate_casefold_unique_paths,
     validate_immutable_image,
@@ -215,6 +216,19 @@ class TransferState(StrEnum):
     INDETERMINATE = "indeterminate"
 
 
+class TransferDirection(StrEnum):
+    STAGE_INPUT = "stage_input"
+    COLLECT_OUTPUT = "collect_output"
+
+
+class OperationState(StrEnum):
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INDETERMINATE = "indeterminate"
+
+
 class ActionState(StrEnum):
     NOT_REQUESTED = "not_requested"
     ACCEPTED = "accepted"
@@ -382,6 +396,170 @@ class TransferObservation(ContractModel):
     transfer_ref: OpaqueRef
     state: TransferState
     observed_at: Timestamp
+
+
+class TransferSpec(ContractModel):
+    direction: TransferDirection
+    path: SafeRelativePath
+    declared_size_bytes: Annotated[StrictInt, Field(ge=0, le=107374182400)]
+    authorized_max_size_bytes: Annotated[StrictInt, Field(ge=0, le=107374182400)]
+    content_sha256: Sha256
+    mode: Literal["direct"]
+    overwrite_policy: Literal["forbid", "replace_authorized"]
+
+    @model_validator(mode="after")
+    def validate_size_authority(self) -> TransferSpec:
+        if self.declared_size_bytes > self.authorized_max_size_bytes:
+            raise ValueError("declaredSizeBytes cannot exceed authorizedMaxSizeBytes")
+        return self
+
+
+class TransferRegisterRequest(ContractModel):
+    transfer_ref: OpaqueRef
+    request_digest: Sha256
+    spec: TransferSpec
+
+    @model_validator(mode="after")
+    def validate_spec_digest(self) -> TransferRegisterRequest:
+        validate_request_digest(self.transfer_ref, self.request_digest, self.spec)
+        return self
+
+
+class TransferCancelSpec(ContractModel):
+    reason: OpaqueRef | None = None
+
+
+class TransferCancelRequest(ContractModel):
+    cancel_ref: OpaqueRef
+    request_digest: Sha256
+    spec: TransferCancelSpec
+
+    @model_validator(mode="after")
+    def validate_spec_digest(self) -> TransferCancelRequest:
+        validate_request_digest(self.cancel_ref, self.request_digest, self.spec)
+        return self
+
+
+class TransferSnapshot(ContractModel):
+    transfer_ref: OpaqueRef
+    request_digest: Sha256
+    job_ref: OpaqueRef
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    spec: TransferSpec
+    state: TransferState
+    actual_size_bytes: Annotated[StrictInt, Field(ge=0, le=107374182400)] | None
+    actual_sha256: Sha256 | None
+    verified: StrictBool
+    content_available: StrictBool
+    snapshot_ref: OpaqueRef | None
+    created_at: Timestamp
+    updated_at: Timestamp
+    completed_at: Timestamp | None
+    observed_at: Timestamp
+    failure_reason: StrictStr | None
+    cancel_action: ActionSnapshot
+    discard_action: ActionSnapshot
+
+    @model_validator(mode="after")
+    def validate_transfer_state(self) -> TransferSnapshot:
+        if self.state is TransferState.REGISTERED and any(
+            value is not None
+            for value in (self.actual_size_bytes, self.actual_sha256, self.completed_at)
+        ):
+            raise ValueError("registered transfer cannot carry verified byte state")
+        if self.state is TransferState.COMPLETED and (
+            self.actual_size_bytes is None
+            or self.actual_sha256 is None
+            or not self.verified
+            or not self.content_available
+            or self.completed_at is None
+        ):
+            raise ValueError("completed transfer requires verified available bytes")
+        if (
+            self.state is TransferState.CANCELED
+            and self.cancel_action.state is not ActionState.SUCCEEDED
+        ):
+            raise ValueError("canceled transfer requires a succeeded cancel action")
+        if (
+            self.state is TransferState.DISCARDED
+            and self.discard_action.state is not ActionState.SUCCEEDED
+        ):
+            raise ValueError("discarded transfer requires a succeeded discard action")
+        return self
+
+
+class WorkspaceFrame(RootModel[dict[str, Any]]):
+    """Opaque ``cosmos.workspace/1`` object; KCS validates only its wire envelope."""
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def validate_protocol_and_bound(self) -> WorkspaceFrame:
+        if self.root.get("protocol") != "cosmos.workspace/1":
+            raise ValueError("workspace frame protocol must be cosmos.workspace/1")
+        if len(canonical_bytes(self.root)) > 1048576:
+            raise ValueError("workspace frame exceeds its canonical 1 MiB bound")
+        return self
+
+
+class WorkspaceInvokeRequest(ContractModel):
+    """Internal route envelope for header identity plus the unchanged frame."""
+
+    operation_ref: OpaqueRef
+    request_digest: Sha256
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    frame: WorkspaceFrame
+
+
+class BindingIdentity(ContractModel):
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+
+
+class WorkspaceOperationSnapshot(ContractModel):
+    job_ref: OpaqueRef
+    operation_ref: OpaqueRef
+    request_digest: Sha256
+    stored_frame_digest: Sha256
+    binding: BindingIdentity
+    state: OperationState
+    exit_code: StrictInt | None
+    stdout: StrictStr
+    stderr: StrictStr
+    stdout_truncated: StrictBool
+    stderr_truncated: StrictBool
+    inline_result_size: Annotated[StrictInt, Field(ge=0, le=65536)] | None
+    inline_result_digest: Sha256 | None
+    inline_result: dict[str, Any] | None
+    result_transfer_ref: OpaqueRef | None
+    accepted_at: Timestamp
+    started_at: Timestamp | None
+    finished_at: Timestamp | None
+    observed_at: Timestamp
+    failure_reason: StrictStr | None
+
+    @model_validator(mode="after")
+    def validate_operation_result(self) -> WorkspaceOperationSnapshot:
+        if len(self.stdout.encode("utf-8")) > 65536 or len(self.stderr.encode("utf-8")) > 65536:
+            raise ValueError("workspace output exceeds the 64 KiB UTF-8 bound")
+        if self.inline_result is not None:
+            encoded = canonical_bytes(self.inline_result)
+            if (
+                len(encoded) > 65536
+                or self.inline_result_size != len(encoded)
+                or self.inline_result_digest != canonical_digest(self.inline_result)
+                or self.result_transfer_ref is not None
+            ):
+                raise ValueError("inline workspace result metadata is inconsistent")
+        elif self.inline_result_size is not None or self.inline_result_digest is not None:
+            raise ValueError("absent inline result cannot carry digest metadata")
+        if self.state is OperationState.SUCCEEDED and (
+            self.exit_code != 0 or self.finished_at is None
+        ):
+            raise ValueError("succeeded operation requires exitCode 0 and finishedAt")
+        return self
 
 
 class GenerationSnapshot(ContractModel):

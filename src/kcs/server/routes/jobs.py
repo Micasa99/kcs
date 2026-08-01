@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
-from collections.abc import Callable, Coroutine
+import tempfile
+from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +18,10 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi import Path as ApiPath
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from kcs.jobs.canonical import DigestMismatchError as CanonicalDigestMismatchError
 from kcs.jobs.contracts import (
@@ -34,12 +37,19 @@ from kcs.jobs.contracts import (
     JobTombstone,
     LogContainer,
     RoleLogs,
+    TransferCancelRequest,
+    TransferRegisterRequest,
+    TransferSnapshot,
+    WorkspaceFrame,
+    WorkspaceInvokeRequest,
+    WorkspaceOperationSnapshot,
 )
 from kcs.jobs.errors import (
     DigestMismatchError,
     InvalidRequestError,
     KcsV2Error,
     PayloadTooLargeError,
+    TransferBytesMismatchError,
 )
 from kcs.jobs.provider import (
     DEFAULT_LOG_LIMIT_BYTES,
@@ -87,6 +97,10 @@ class _UnsupportedMediaTypeError(KcsV2Error):
 
 
 class _CredentialMediaTypeError(_UnsupportedMediaTypeError):
+    default_message = "Content-Type must be application/octet-stream"
+
+
+class _TransferMediaTypeError(_UnsupportedMediaTypeError):
     default_message = "Content-Type must be application/octet-stream"
 
 
@@ -168,6 +182,10 @@ def _require_json_media_type(request: Request) -> None:
         if media_type.lower() != "application/octet-stream":
             raise _CredentialMediaTypeError
         return
+    if request.method == "PUT" and request.url.path.endswith("/content"):
+        if media_type.lower() != "application/octet-stream":
+            raise _TransferMediaTypeError
+        return
     if media_type.lower() != "application/json":
         raise _UnsupportedMediaTypeError
 
@@ -186,6 +204,41 @@ async def _credential_body(request: Request) -> bytes:
             raise PayloadTooLargeError()
         body.extend(chunk)
     return bytes(body)
+
+
+async def _transfer_body_file(request: Request, content_length: int) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix="kcs-http-transfer-")
+    path = Path(raw_path)
+    received = 0
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > content_length:
+                    raise TransferBytesMismatchError()
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if received != content_length:
+            raise TransferBytesMismatchError()
+        return path
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _content_chunks(path: Path) -> Iterator[bytes]:
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                yield chunk
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
@@ -446,6 +499,223 @@ def create_jobs_router(
     ) -> Response:
         result = provider.start_agent(job_ref, payload)
         return _json_model(result, status_code=200 if result.replayed else 202)
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/transfers",
+        operation_id="registerTransfer",
+        tags=["Transfers"],
+        status_code=201,
+        response_model=TransferSnapshot,
+        responses={
+            200: {"model": TransferSnapshot, "description": "Stable transfer replay."},
+            **_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 503),
+        },
+    )
+    def register_transfer(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: TransferRegisterRequest,
+    ) -> Response:
+        result = provider.register_transfer(job_ref, payload)
+        return _json_model(result.snapshot, status_code=201 if result.created else 200)
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}",
+        operation_id="inspectTransfer",
+        tags=["Transfers"],
+        response_model=TransferSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_transfer(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        transfer_ref: Annotated[
+            str,
+            ApiPath(alias="transferRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+    ) -> Response:
+        return _json_model(provider.inspect_transfer(job_ref, transfer_ref))
+
+    @router.delete(
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}",
+        operation_id="discardTransfer",
+        tags=["Transfers"],
+        response_model=TransferSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500, 503),
+    )
+    def discard_transfer(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        transfer_ref: Annotated[
+            str,
+            ApiPath(alias="transferRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        discard_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Discard-Ref", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN
+            ),
+        ],
+        request_digest: Annotated[str, Header(alias="KCS-Request-Digest", pattern=_SHA256_PATTERN)],
+    ) -> Response:
+        return _json_model(
+            provider.discard_transfer(job_ref, transfer_ref, discard_ref, request_digest)
+        )
+
+    @router.put(
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+        operation_id="putTransferContent",
+        tags=["Transfers"],
+        response_model=TransferSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503, 504),
+    )
+    async def put_transfer_content(
+        request: Request,
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        transfer_ref: Annotated[
+            str,
+            ApiPath(alias="transferRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        content_sha256: Annotated[str, Header(alias="KCS-Content-SHA256", pattern=_SHA256_PATTERN)],
+        content_length: Annotated[int, Header(alias="Content-Length", ge=0, le=107374182400)],
+    ) -> Response:
+        transfer = provider.inspect_transfer(job_ref, transfer_ref)
+        if (
+            transfer.spec.content_sha256 != content_sha256
+            or content_length != transfer.spec.declared_size_bytes
+            or content_length > transfer.spec.authorized_max_size_bytes
+        ):
+            raise TransferBytesMismatchError()
+        path = await _transfer_body_file(request, content_length)
+        try:
+            with path.open("rb") as stream:
+                snapshot = provider.stage_transfer_content(
+                    job_ref, transfer_ref, stream, content_length=content_length
+                )
+            return _json_model(snapshot)
+        finally:
+            path.unlink(missing_ok=True)
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
+        operation_id="getTransferContent",
+        tags=["Transfers"],
+        response_class=StreamingResponse,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503, 504),
+    )
+    def get_transfer_content(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        transfer_ref: Annotated[
+            str,
+            ApiPath(alias="transferRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+    ) -> StreamingResponse:
+        content = provider.open_collected_content(job_ref, transfer_ref)
+        return StreamingResponse(
+            _content_chunks(content.path),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Length": str(content.size),
+                "X-Content-SHA256": content.sha256,
+                "X-KCS-Snapshot-Ref": content.snapshot_ref,
+                "Cache-Control": "no-store",
+            },
+            background=BackgroundTask(content.cleanup),
+        )
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel",
+        operation_id="cancelTransfer",
+        tags=["Transfers"],
+        status_code=202,
+        response_model=TransferSnapshot,
+        responses={
+            200: {"model": TransferSnapshot, "description": "Stable cancellation replay."},
+            **_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503),
+        },
+    )
+    def cancel_transfer(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        transfer_ref: Annotated[
+            str,
+            ApiPath(alias="transferRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        payload: TransferCancelRequest,
+    ) -> Response:
+        result = provider.cancel_transfer(job_ref, transfer_ref, payload)
+        return _json_model(result.snapshot, status_code=202 if result.created else 200)
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/workspace/invoke",
+        operation_id="invokeWorkspace",
+        tags=["Workspace"],
+        status_code=202,
+        response_model=WorkspaceOperationSnapshot,
+        responses={
+            200: {"model": WorkspaceOperationSnapshot, "description": "Stable operation replay."},
+            **_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503, 504),
+        },
+    )
+    def invoke_workspace(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: WorkspaceFrame,
+        operation_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Operation-Ref", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN
+            ),
+        ],
+        request_digest: Annotated[str, Header(alias="KCS-Request-Digest", pattern=_SHA256_PATTERN)],
+        job_uid: Annotated[UUID, Header(alias="KCS-Job-UID")],
+        pod_uid: Annotated[UUID, Header(alias="KCS-Pod-UID")],
+    ) -> Response:
+        existed = True
+        try:
+            provider.inspect_operation(job_ref, operation_ref)
+        except KcsV2Error:
+            existed = False
+        result = provider.invoke_workspace(
+            job_ref,
+            WorkspaceInvokeRequest(
+                operation_ref=operation_ref,
+                request_digest=request_digest,
+                job_uid=job_uid,
+                pod_uid=pod_uid,
+                frame=payload,
+            ),
+        )
+        return _json_model(result, status_code=200 if existed else 202)
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/operations/{operationRef}",
+        operation_id="inspectWorkspaceOperation",
+        tags=["Workspace"],
+        response_model=WorkspaceOperationSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_workspace_operation(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        operation_ref: Annotated[
+            str,
+            ApiPath(
+                alias="operationRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN
+            ),
+        ],
+    ) -> Response:
+        return _json_model(provider.inspect_operation(job_ref, operation_ref))
 
     @router.post(
         "/api/v2/jobs/{jobRef}/finalize",
