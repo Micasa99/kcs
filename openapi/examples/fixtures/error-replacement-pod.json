@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "REPLACEMENT_POD",
+    "message": "immutable Pod binding was lost or replaced",
+    "retryable": false,
+    "recoveryAction": "new_attempt",
+    "requestId": "request-synthetic-replacement-pod",
+    "context": {"jobRef": "job-synthetic-001"}
+  }
+}

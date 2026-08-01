@@ -1,7 +1,0 @@
-{
-  "method": "attempt.run",
-  "spec": {
-    "providerRequestId": "attempt-sanitized-001"
-  },
-  "specDigest": "68ec081a086f7a5a594b7743e1509bff11715a774f2d522754652ca576c570e2"
-}

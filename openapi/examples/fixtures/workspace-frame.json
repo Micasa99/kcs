@@ -1,0 +1,8 @@
+{
+  "protocol": "cosmos.workspace/1",
+  "action": "submit",
+  "operation_id": "owner-operation-synthetic-001",
+  "request_digest": "8888888888888888888888888888888888888888888888888888888888888888",
+  "frame_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+  "payload": {"synthetic": true}
+}

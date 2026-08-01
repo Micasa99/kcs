@@ -1,0 +1,32 @@
+{
+  "exchanges": [
+    {
+      "scenario": "invoke-new",
+      "operationId": "invokeWorkspace",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001"},
+        "headers": {
+          "KCS-Operation-Ref": "operation-synthetic-001",
+          "KCS-Request-Digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "KCS-Job-UID": "11111111-1111-4111-8111-111111111111",
+          "KCS-Pod-UID": "22222222-2222-4222-8222-222222222222"
+        },
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/workspace-frame.json"
+      },
+      "response": {"status": 202, "contentType": "application/json", "bodyFixture": "fixtures/workspace-operation.json"}
+    },
+    {
+      "scenario": "invoke-result-transfer",
+      "operationId": "inspectWorkspaceOperation",
+      "request": {"path": {"jobRef": "job-synthetic-001", "operationRef": "operation-synthetic-001"}},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/workspace-operation-result-transfer.json"}
+    },
+    {
+      "scenario": "invoke-indeterminate",
+      "operationId": "inspectWorkspaceOperation",
+      "request": {"path": {"jobRef": "job-synthetic-001", "operationRef": "operation-synthetic-001"}},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/workspace-operation-indeterminate.json"}
+    }
+  ]
+}

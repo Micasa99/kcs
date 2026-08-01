@@ -1,0 +1,23 @@
+{
+  "jobRef": "job-synthetic-001",
+  "generation": 2,
+  "agentRunRef": "agent-run-synthetic-002",
+  "executionEnvelopeRef": "envelope-synthetic-002",
+  "executionEnvelopeDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "launchBundlePath": "runtime/launch-2.json",
+  "launchBundleDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "launchBundleSizeBytes": 768,
+  "materialPaths": ["runtime/prompt-2.txt", "runtime/tools-2.json"],
+  "credentialGrantRef": "grant-synthetic-002",
+  "startMetadataDigest": "5c73fdcc214230cdde4d28722cf0c6834b054d802077ba82c9d88e60b1bd4225",
+  "runnerState": "accepted",
+  "supervisorAlive": true,
+  "pid": null,
+  "exitCode": null,
+  "startedAt": null,
+  "finishedAt": null,
+  "observedAt": "2026-08-01T00:12:00Z",
+  "replayed": false,
+  "credentialAcknowledgedAt": null,
+  "credentialDestroyedAt": null
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate deterministic KCS V2 OpenAPI and component-schema artifacts."""
+"""Validate and generate deterministic KCS V2 OpenAPI review artifacts."""
 
 from __future__ import annotations
 
@@ -8,18 +8,62 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 import tempfile
+import unicodedata
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import rfc8785
 import yaml
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from openapi_spec_validator import validate
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "openapi" / "kcs-v2-jobs.openapi.yaml"
 DEFAULT_OUTPUT = ROOT / "openapi" / "generated"
+HTTP_METHODS = {"delete", "get", "patch", "post", "put"}
+LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
+REQUIRED_SCENARIOS = {
+    "create-new",
+    "create-replay",
+    "create-conflict",
+    "create-tombstone",
+    "binding-inspect",
+    "list-page",
+    "logs-continuation",
+    "grant-new",
+    "grant-replay",
+    "grant-acknowledged",
+    "grant-destroyed",
+    "start-new",
+    "start-replay",
+    "start-next-generation",
+    "start-pod-loss",
+    "transfer-stage",
+    "transfer-collect",
+    "transfer-cancel",
+    "transfer-discard",
+    "transfer-restart",
+    "invoke-new",
+    "invoke-result-transfer",
+    "invoke-indeterminate",
+    "finalize-provider-quiesce",
+    "cancel-output-loss",
+    "delete-tombstone",
+    "typed-error",
+}
+SECRET_VALUE = re.compile(
+    r"(?ix)("
+    r"(?:authorization|bearer|cookie|api[_-]?key|token|secret|credential)(?:\s+|\s*[:=])"
+    r"|-----BEGIN[ -][A-Z0-9 ]+(?:PRIVATE KEY|CERTIFICATE)-----"
+    r"|(?:ssh-(?:rsa|ed25519)|kubeconfig|serviceaccount)"
+    r"|[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@"
+    r")"
+)
 
 
 class OpenAPIArtifactSet(NamedTuple):
@@ -30,8 +74,101 @@ class OpenAPIArtifactSet(NamedTuple):
     validated_examples: int
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key {key!r} at line {key_node.start_mark.line + 1}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
+def _load_yaml(source: Path) -> dict[str, Any]:
+    try:
+        document = yaml.load(source.read_text(), Loader=_UniqueKeyLoader)
+    except ValueError:
+        raise
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML document: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{source} must contain an OpenAPI object")
+    return document
+
+
 def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def jcs_sha256(value: Any) -> str:
+    """Return lowercase SHA-256 of RFC 8785 canonical JSON bytes."""
+    return hashlib.sha256(rfc8785.dumps(value)).hexdigest()
+
+
+def jcs_projection_sha256(value: Mapping[str, Any], projection: str) -> str:
+    """Hash one explicitly named payload projection, excluding sibling identity."""
+    if projection not in value:
+        raise ValueError(f"missing digest projection {projection!r}")
+    return jcs_sha256(value[projection])
+
+
+def _resolve_pointer(document: Any, ref: str) -> Any:
+    if not ref.startswith("#/"):
+        raise ValueError(f"only internal OpenAPI references are allowed: {ref}")
+    current = document
+    for raw_part in ref[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"dangling OpenAPI reference {ref}") from exc
+        elif isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            raise ValueError(f"dangling OpenAPI reference {ref}")
+    return current
+
+
+def _iter_values(value: Any) -> Iterable[Any]:
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_values(child)
+
+
+def _validate_references(document: dict[str, Any]) -> None:
+    for value in _iter_values(document):
+        if isinstance(value, dict) and "$ref" in value:
+            ref = value["$ref"]
+            if not isinstance(ref, str):
+                raise ValueError(f"invalid OpenAPI reference {ref!r}")
+            _resolve_pointer(document, ref)
+
+
+def _dereference(document: dict[str, Any], value: Any) -> Any:
+    seen: set[str] = set()
+    while isinstance(value, dict) and "$ref" in value:
+        ref = value["$ref"]
+        if ref in seen:
+            raise ValueError(f"cyclic OpenAPI reference {ref}")
+        seen.add(ref)
+        value = _resolve_pointer(document, ref)
+    return value
 
 
 def _component_bundle(name: str, schemas: dict[str, Any]) -> dict[str, Any]:
@@ -57,24 +194,48 @@ def _component_bundle(name: str, schemas: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _check_extended_limits(instance: Any, schema: Any, root: dict[str, Any]) -> None:
+def _is_safe_relative_posix_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        return False
+    if (
+        "\\" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or unicodedata.normalize("NFC", value) != value
+    ):
+        return False
+    parts = value.split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
+
+
+def _is_non_secret_runtime_value(value: object) -> bool:
+    return isinstance(value, str) and SECRET_VALUE.search(value) is None
+
+
+FORMAT_CHECKER = FormatChecker()
+FORMAT_CHECKER.checks("kcs-relative-posix-path")(_is_safe_relative_posix_path)
+FORMAT_CHECKER.checks("kcs-non-secret-runtime-value")(_is_non_secret_runtime_value)
+
+
+def _check_extended_limits(instance: Any, schema: Any, document: dict[str, Any]) -> None:
     if not isinstance(schema, dict):
         return
-    if "$ref" in schema:
-        prefix = "#/components/schemas/"
-        ref = schema["$ref"]
-        if isinstance(ref, str) and ref.startswith(prefix):
-            _check_extended_limits(instance, root[ref.removeprefix(prefix)], root)
-        return
-    for choice in schema.get("oneOf", []):
-        if choice.get("type") == "null" and instance is None:
-            return
-        if choice.get("type") == type(instance).__name__:
-            _check_extended_limits(instance, choice, root)
-            return
-        if "$ref" in choice and instance is not None:
-            _check_extended_limits(instance, choice, root)
-            return
+    schema = _dereference(document, schema)
+    choices = schema.get("oneOf", [])
+    if choices:
+        for choice in choices:
+            choice = _dereference(document, choice)
+            if instance is None and choice.get("type") == "null":
+                return
+            candidate_type = choice.get("type")
+            if (
+                (candidate_type == "object" and isinstance(instance, dict))
+                or (candidate_type == "array" and isinstance(instance, list))
+                or (candidate_type == "string" and isinstance(instance, str))
+                or (candidate_type == "integer" and isinstance(instance, int))
+                or "$ref" in choice
+            ):
+                _check_extended_limits(instance, choice, document)
+                return
     if isinstance(instance, str):
         max_utf8 = schema.get("x-kcs-maxUtf8Bytes")
         if max_utf8 is not None and len(instance.encode()) > max_utf8:
@@ -87,81 +248,855 @@ def _check_extended_limits(instance: Any, schema: Any, root: dict[str, Any]) -> 
                 raise ValueError("value is not canonical base64") from exc
             if len(decoded) > max_decoded:
                 raise ValueError(f"decoded content exceeds {max_decoded} bytes")
+    if isinstance(instance, (dict, list)):
+        max_canonical = schema.get("x-kcs-maxCanonicalBytes")
+        if max_canonical is not None and len(rfc8785.dumps(instance)) > max_canonical:
+            raise ValueError(f"canonical JSON exceeds {max_canonical} bytes")
     if isinstance(instance, dict):
-        combined_limit = schema.get("x-kcs-combinedUtf8Bytes")
-        combined_properties = schema.get("x-kcs-combinedUtf8Properties", [])
-        if combined_limit is not None:
-            combined_size = sum(
-                len(instance.get(name, "").encode()) for name in combined_properties
-            )
-            if combined_size > combined_limit:
-                raise ValueError(f"combined strings exceed {combined_limit} UTF-8 bytes")
+        combined = schema.get("x-kcs-combinedMaxItems")
+        if isinstance(combined, dict):
+            properties = combined.get("properties", [])
+            limit = combined.get("limit")
+            if isinstance(limit, int) and isinstance(properties, list):
+                count = sum(
+                    len(instance.get(name, []))
+                    for name in properties
+                    if isinstance(name, str) and isinstance(instance.get(name, []), list)
+                )
+                if count > limit:
+                    names = " and ".join(str(name) for name in properties)
+                    raise ValueError(f"combined {names} exceed {limit} items")
+        relations = schema.get("x-kcs-relations", [])
+        if isinstance(relations, list):
+            for relation in relations:
+                if not isinstance(relation, dict) or relation.get("operator") != "<=":
+                    continue
+                left = relation.get("left")
+                right = relation.get("right")
+                if left in instance and right in instance and instance[left] > instance[right]:
+                    raise ValueError(f"{left} must be <= {right}")
         properties = schema.get("properties", {})
         additional = schema.get("additionalProperties")
         for key, value in instance.items():
             child_schema = properties.get(key, additional if isinstance(additional, dict) else {})
-            _check_extended_limits(value, child_schema, root)
+            _check_extended_limits(value, child_schema, document)
     if isinstance(instance, list) and isinstance(schema.get("items"), dict):
         for value in instance:
-            _check_extended_limits(value, schema["items"], root)
+            _check_extended_limits(value, schema["items"], document)
 
 
-def _validate_digest_semantics(schema_name: str, instance: dict[str, Any]) -> None:
-    if schema_name == "CredentialGrantRequest":
-        payload = base64.b64decode(instance["credential"], validate=True)
-        digest_field = "credentialSha256"
-    elif schema_name == "AgentStartRequest":
-        payload = instance["launch"].encode()
-        digest_field = "launchSha256"
-    elif schema_name == "WorkspaceInvokeRequest":
-        payload = rfc8785.dumps(instance["spec"])
-        digest_field = "specDigest"
+def _check_secret_runtime_env(instance: Any) -> None:
+    if isinstance(instance, dict):
+        runtime_env = instance.get("runtimeEnv")
+        if isinstance(runtime_env, dict):
+            for value in runtime_env.values():
+                if not _is_non_secret_runtime_value(value):
+                    raise ValueError("secret-shaped runtimeEnv value is forbidden")
+        for child in instance.values():
+            _check_secret_runtime_env(child)
+    elif isinstance(instance, list):
+        for child in instance:
+            _check_secret_runtime_env(child)
+
+
+def _validate_instance(
+    instance: Any, schema: dict[str, Any], document: dict[str, Any], label: str
+) -> None:
+    root_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        **schema,
+        "components": document["components"],
+    }
+    try:
+        _check_secret_runtime_env(instance)
+        Draft202012Validator(root_schema, format_checker=FORMAT_CHECKER).validate(instance)
+        _check_extended_limits(instance, schema, document)
+    except (ValidationError, ValueError) as exc:
+        raise ValueError(f"{label}: {exc}") from exc
+
+
+def _fixture_path(examples_dir: Path, value: str, label: str) -> Path:
+    candidate = (examples_dir / value).resolve()
+    try:
+        candidate.relative_to(examples_dir.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label}: fixture escapes examples directory") from exc
+    if not candidate.is_file():
+        raise ValueError(f"{label}: fixture does not exist: {value}")
+    return candidate
+
+
+def _merge_patch(value: Any, patch: Any) -> Any:
+    if not isinstance(patch, dict):
+        return patch
+    result = dict(value) if isinstance(value, dict) else {}
+    for key, child in patch.items():
+        result[key] = _merge_patch(result.get(key), child)
+    return result
+
+
+def _json_body(section: dict[str, Any], examples_dir: Path, label: str) -> Any:
+    has_body = "body" in section
+    has_fixture = "bodyFixture" in section
+    if has_body == has_fixture:
+        raise ValueError(f"{label}: specify exactly one of body or bodyFixture")
+    if has_body:
+        body = section["body"]
     else:
+        path = _fixture_path(examples_dir, section["bodyFixture"], label)
+        try:
+            body = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label}: invalid JSON fixture {path.name}") from exc
+    if "bodyPatch" in section:
+        if not has_fixture or not isinstance(section["bodyPatch"], dict):
+            raise ValueError(f"{label}: bodyPatch requires a JSON bodyFixture")
+        body = _merge_patch(body, section["bodyPatch"])
+    return body
+
+
+def _binary_body(section: dict[str, Any], examples_dir: Path, label: str) -> bytes:
+    if set(section) & {"body", "bodyFixture", "bodyPatch"}:
+        raise ValueError(f"{label}: binary bodies must use bodyFile")
+    if "bodyFile" not in section:
+        raise ValueError(f"{label}: missing bodyFile")
+    return _fixture_path(examples_dir, section["bodyFile"], label).read_bytes()
+
+
+def _operation_index(document: dict[str, Any]) -> dict[str, tuple[str, str, dict[str, Any]]]:
+    result: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    for path, path_item in document["paths"].items():
+        for method, operation in path_item.items():
+            if method not in HTTP_METHODS:
+                continue
+            operation_id = operation.get("operationId")
+            if not operation_id or operation_id in result:
+                raise ValueError(f"OpenAPI document has invalid operationId {operation_id!r}")
+            result[operation_id] = (method, path, operation)
+    return result
+
+
+def _parameters(
+    document: dict[str, Any], path: str, operation: dict[str, Any]
+) -> list[dict[str, Any]]:
+    path_parameters = document["paths"][path].get("parameters", [])
+    values = [*path_parameters, *operation.get("parameters", [])]
+    return [_dereference(document, parameter) for parameter in values]
+
+
+def _validate_parameter_examples(
+    document: dict[str, Any],
+    path: str,
+    operation: dict[str, Any],
+    request: dict[str, Any],
+    label: str,
+) -> None:
+    groups = {
+        "path": request.get("path", {}),
+        "query": request.get("query", {}),
+        "header": request.get("headers", {}),
+    }
+    declared: dict[str, dict[str, dict[str, Any]]] = {key: {} for key in groups}
+    for parameter in _parameters(document, path, operation):
+        where = parameter["in"]
+        key = "header" if where == "header" else where
+        declared[key][parameter["name"]] = parameter
+    for where, supplied in groups.items():
+        if not isinstance(supplied, dict):
+            raise ValueError(f"{label}: request {where} values must be an object")
+        unknown = set(supplied) - set(declared[where])
+        if unknown:
+            raise ValueError(f"{label}: undeclared {where} parameters: {sorted(unknown)}")
+        for name, parameter in declared[where].items():
+            if parameter.get("required") and name not in supplied:
+                raise ValueError(f"{label}: missing required {where} parameter {name}")
+        for name, value in supplied.items():
+            _validate_instance(
+                value, declared[where][name]["schema"], document, f"{label} {where} {name}"
+            )
+
+
+def _validate_media(
+    document: dict[str, Any],
+    content: dict[str, Any],
+    section: dict[str, Any],
+    examples_dir: Path,
+    label: str,
+) -> tuple[Any | None, bytes | None]:
+    content_type = section.get("contentType")
+    if content_type not in content:
+        raise ValueError(f"{label}: undeclared content type {content_type!r}")
+    schema = content[content_type].get("schema", {})
+    if content_type == "application/octet-stream":
+        body_bytes = _binary_body(section, examples_dir, label)
+        maximum = schema.get("x-kcs-maxBytes", schema.get("maxLength"))
+        if maximum is not None and len(body_bytes) > maximum:
+            raise ValueError(f"{label}: body exceeds {maximum} bytes")
+        return None, body_bytes
+    body = _json_body(section, examples_dir, label)
+    _validate_instance(body, schema, document, label)
+    return body, None
+
+
+def _header_value(headers: Mapping[str, Any], name: str, label: str) -> Any:
+    if name not in headers:
+        raise ValueError(f"{label}: missing header {name}")
+    return headers[name]
+
+
+def _assert_digest(actual: str, supplied: object, label: str) -> None:
+    if not isinstance(supplied, str) or not LOWER_HEX_SHA256.fullmatch(supplied):
+        raise ValueError(f"{label}: digest must be 64 lowercase hex")
+    if supplied != actual:
+        raise ValueError(f"{label}: digest mismatch; expected {actual}")
+
+
+def _normalized_wire_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _find_semantic_header(headers: Mapping[str, Any], field: str, label: str) -> Any:
+    expected = _normalized_wire_name(field)
+    matches = [
+        value
+        for name, value in headers.items()
+        if _normalized_wire_name(name).endswith(expected)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"{label}: missing header carrying {field}")
+    return matches[0]
+
+
+def _projection_value(
+    projection: Mapping[str, Any],
+    request_body: Any | None,
+    request_bytes: bytes | None,
+    label: str,
+) -> Any:
+    source = projection.get("source")
+    if source == "constant":
+        if "value" not in projection:
+            raise ValueError(f"{label}: constant digest projection has no value")
+        return projection["value"]
+    if source != "requestBody":
+        raise ValueError(f"{label}: unsupported digest projection source {source!r}")
+    if projection.get("encoding") == "raw-bytes":
+        if request_bytes is None:
+            raise ValueError(f"{label}: raw-byte digest projection has no request bytes")
+        return request_bytes
+    if request_body is None:
+        raise ValueError(f"{label}: request-body digest projection has no request body")
+    if "field" in projection:
+        field = projection["field"]
+        if not isinstance(request_body, dict) or field not in request_body:
+            raise ValueError(f"{label}: digest projection field {field!r} is missing")
+        return request_body[field]
+    excluded = projection.get("exclude", [])
+    if excluded:
+        if not isinstance(request_body, dict) or not isinstance(excluded, list):
+            raise ValueError(f"{label}: invalid digest projection exclusion")
+        return {key: value for key, value in request_body.items() if key not in excluded}
+    return request_body
+
+
+def _projected_digest(
+    projection: Mapping[str, Any],
+    request_body: Any | None,
+    request_bytes: bytes | None,
+    label: str,
+) -> str:
+    value = _projection_value(projection, request_body, request_bytes, label)
+    if projection.get("encoding") == "raw-bytes":
+        return hashlib.sha256(value).hexdigest()
+    return jcs_sha256(value)
+
+
+def _digest_wire_value(
+    field: str,
+    location: str,
+    request: Mapping[str, Any],
+    request_body: Any | None,
+    response_body: Any | None,
+    response_headers: Mapping[str, Any],
+    label: str,
+) -> Any | None:
+    if location == "body":
+        if not isinstance(request_body, dict) or field not in request_body:
+            raise ValueError(f"{label}: request body does not carry {field}")
+        return request_body[field]
+    if location == "header":
+        return _find_semantic_header(request.get("headers", {}), field, label)
+    if location == "response":
+        if isinstance(response_body, dict) and field in response_body:
+            return response_body[field]
+        return None
+    if location == "response-header":
+        return _find_semantic_header(response_headers, field, label)
+    raise ValueError(f"{label}: unsupported digest location {location!r}")
+
+
+def _metadata_projection(
+    definition: Mapping[str, Any], headers: Mapping[str, Any], label: str
+) -> tuple[dict[str, Any], str]:
+    projection = definition.get("projection")
+    if not isinstance(projection, list) or not projection:
+        raise ValueError(f"{label}: metadata digest projection must be a non-empty list")
+    metadata: dict[str, Any] = {}
+    for item in projection:
+        if not isinstance(item, dict) or set(item) != {"field", "header"}:
+            raise ValueError(f"{label}: invalid metadata digest projection entry")
+        metadata[item["field"]] = _header_value(headers, item["header"], label)
+    return metadata, jcs_sha256(metadata)
+
+
+def _validate_declared_digest_projection(
+    operation: Mapping[str, Any],
+    request: Mapping[str, Any],
+    request_body: Any | None,
+    request_bytes: bytes | None,
+    response_body: Any | None,
+    response_headers: Mapping[str, Any],
+    label: str,
+) -> None:
+    definition = operation.get("x-kcs-digest-projection")
+    if definition is None:
         return
-    actual = hashlib.sha256(payload).hexdigest()
-    if instance[digest_field] != actual:
-        raise ValueError(f"{digest_field} does not match payload bytes")
+    if not isinstance(definition, dict):
+        raise ValueError(f"{label}: digest projection extension must be an object")
+    projection = definition.get("projection")
+    if definition.get("digestOwnership") == "platform":
+        if projection is not None:
+            raise ValueError(f"{label}: platform-owned digest must not declare a projection")
+        supplied = _digest_wire_value(
+            definition["digest"],
+            definition["digestLocation"],
+            request,
+            request_body,
+            response_body,
+            response_headers,
+            label,
+        )
+        if not isinstance(supplied, str) or not LOWER_HEX_SHA256.fullmatch(supplied):
+            raise ValueError(f"{label}: platform-owned digest must be 64 lowercase hex")
+    else:
+        if not isinstance(projection, dict):
+            raise ValueError(f"{label}: digest projection is missing")
+        actual = _projected_digest(projection, request_body, request_bytes, label)
+        supplied = _digest_wire_value(
+            definition["digest"],
+            definition["digestLocation"],
+            request,
+            request_body,
+            response_body,
+            response_headers,
+            label,
+        )
+        if supplied is not None:
+            _assert_digest(actual, supplied, label)
+
+    metadata_definition = definition.get("metadataDigest")
+    if metadata_definition is not None:
+        if not isinstance(metadata_definition, dict):
+            raise ValueError(f"{label}: metadata digest definition must be an object")
+        _metadata, actual = _metadata_projection(
+            metadata_definition, request.get("headers", {}), label
+        )
+        supplied = _digest_wire_value(
+            metadata_definition["field"],
+            metadata_definition["digestLocation"],
+            request,
+            request_body,
+            response_body,
+            response_headers,
+            label,
+        )
+        if supplied is not None:
+            _assert_digest(actual, supplied, label)
+
+    stored_definition = definition.get("storedIntegrityDigest")
+    if stored_definition is not None:
+        if not isinstance(stored_definition, dict) or not isinstance(
+            stored_definition.get("projection"), dict
+        ):
+            raise ValueError(f"{label}: stored integrity digest projection is invalid")
+        actual = _projected_digest(
+            stored_definition["projection"], request_body, request_bytes, label
+        )
+        supplied = _digest_wire_value(
+            stored_definition["field"],
+            stored_definition["digestLocation"],
+            request,
+            request_body,
+            response_body,
+            response_headers,
+            label,
+        )
+        if supplied is not None:
+            _assert_digest(actual, supplied, label)
+
+
+def _validate_digest_semantics(
+    operation: Mapping[str, Any],
+    operation_id: str,
+    request: dict[str, Any],
+    request_body: Any | None,
+    request_bytes: bytes | None,
+    response_body: Any | None,
+    response_bytes: bytes | None,
+    response_headers: Mapping[str, Any],
+    label: str,
+) -> None:
+    headers = request.get("headers", {})
+    _validate_declared_digest_projection(
+        operation,
+        request,
+        request_body,
+        request_bytes,
+        response_body,
+        response_headers,
+        label,
+    )
+    if operation_id == "createJob":
+        if isinstance(response_body, dict) and "specDigest" in response_body:
+            _assert_digest(request_body["specDigest"], response_body["specDigest"], label)
+            if response_body.get("providerRequestId") != request_body["providerRequestId"]:
+                raise ValueError(f"{label}: response does not echo providerRequestId")
+    elif operation_id == "grantCredential":
+        raw_digest = hashlib.sha256(request_bytes or b"").hexdigest()
+        metadata, metadata_digest = _metadata_projection(
+            operation["x-kcs-digest-projection"]["metadataDigest"], headers, label
+        )
+        if isinstance(response_body, dict):
+            expected = {
+                "credentialGrantRef": headers["KCS-Credential-Grant-Ref"],
+                "credentialSha256": raw_digest,
+                "grantMetadataDigest": metadata_digest,
+                "jobRef": request.get("path", {}).get("jobRef"),
+                **metadata,
+            }
+            for field, value in expected.items():
+                if response_body.get(field) != value:
+                    raise ValueError(f"{label}: response does not echo {field}")
+    elif operation_id == "startAgent":
+        if isinstance(response_body, dict) and "startMetadataDigest" in response_body:
+            expected = {
+                "jobRef": request.get("path", {}).get("jobRef"),
+                **request_body,
+            }
+            for field, value in expected.items():
+                if response_body.get(field) != value:
+                    raise ValueError(f"{label}: response does not echo {field}")
+    elif operation_id in {
+        "registerTransfer",
+        "cancelTransfer",
+        "finalizeJob",
+        "cancelJob",
+    }:
+        if operation_id == "registerTransfer" and isinstance(response_body, dict):
+            expected = {
+                "jobRef": request.get("path", {}).get("jobRef"),
+                "transferRef": request_body["transferRef"],
+                "requestDigest": request_body["requestDigest"],
+                "spec": request_body["spec"],
+            }
+            for field, value in expected.items():
+                if response_body.get(field) != value:
+                    raise ValueError(f"{label}: response does not echo {field}")
+        action_field = {
+            "cancelTransfer": "cancelAction",
+            "finalizeJob": "finalizeAction",
+            "cancelJob": "cancelAction",
+        }.get(operation_id)
+        if action_field and isinstance(response_body, dict) and action_field in response_body:
+            action = response_body[action_field]
+            identity_field = "cancelRef" if operation_id != "finalizeJob" else "finalizeRef"
+            if action.get("actionRef") != request_body[identity_field]:
+                raise ValueError(f"{label}: response does not echo {identity_field}")
+            if action.get("requestDigest") != request_body["requestDigest"]:
+                raise ValueError(f"{label}: response does not echo requestDigest")
+    elif operation_id == "putTransferContent":
+        digest = hashlib.sha256(request_bytes or b"").hexdigest()
+        if _header_value(headers, "Content-Length", label) != len(request_bytes or b""):
+            raise ValueError(f"{label}: Content-Length does not match body bytes")
+        if isinstance(response_body, dict):
+            if response_body.get("spec", {}).get("contentSha256") != digest:
+                raise ValueError(f"{label}: transfer spec does not bind the uploaded bytes")
+            if response_body.get("actualSha256") != digest:
+                raise ValueError(f"{label}: response does not echo the actual byte digest")
+    elif operation_id in {"discardTransfer", "deleteJob"}:
+        digest = _header_value(headers, "KCS-Request-Digest", label)
+        if isinstance(response_body, dict):
+            if operation_id == "discardTransfer":
+                action = response_body.get("discardAction", {})
+                if action.get("actionRef") != headers.get("KCS-Discard-Ref"):
+                    raise ValueError(f"{label}: response does not echo discardRef")
+                if action.get("requestDigest") != digest:
+                    raise ValueError(f"{label}: response does not echo requestDigest")
+            elif response_body.get("deleteRef") != headers.get("KCS-Delete-Ref"):
+                raise ValueError(f"{label}: response does not echo deleteRef")
+            elif response_body.get("deleteRequestDigest") != digest:
+                raise ValueError(f"{label}: response does not echo requestDigest")
+    elif operation_id == "getTransferContent":
+        digest = hashlib.sha256(response_bytes or b"").hexdigest()
+        _assert_digest(
+            digest,
+            _header_value(response_headers, "X-Content-SHA256", label),
+            label,
+        )
+        if _header_value(response_headers, "Content-Length", label) != len(response_bytes or b""):
+            raise ValueError(f"{label}: response Content-Length does not match body bytes")
+    elif (
+        operation_id == "invokeWorkspace"
+        and isinstance(response_body, dict)
+        and "storedFrameDigest" in response_body
+    ):
+        if response_body.get("operationRef") != headers.get("KCS-Operation-Ref"):
+            raise ValueError(f"{label}: response does not echo operationRef")
+        if response_body.get("requestDigest") != headers.get("KCS-Request-Digest"):
+            raise ValueError(f"{label}: response does not echo requestDigest")
+        expected_binding = {
+            "jobUid": headers.get("KCS-Job-UID"),
+            "podUid": headers.get("KCS-Pod-UID"),
+        }
+        if response_body.get("binding") != expected_binding:
+            raise ValueError(f"{label}: response does not echo immutable binding")
+
+
+def _error_code(response_body: Any) -> Any:
+    if isinstance(response_body, dict):
+        error = response_body.get("error")
+        if isinstance(error, dict):
+            return error.get("code")
+    return None
+
+
+def _validate_response_identity(
+    request: Mapping[str, Any], response_body: Any, label: str
+) -> None:
+    if not isinstance(response_body, dict) or _error_code(response_body) is not None:
+        return
+    for name, expected in request.get("path", {}).items():
+        if name in response_body and response_body[name] != expected:
+            raise ValueError(f"{label}: response does not match path {name}")
+
+
+def _validate_scenario_semantics(
+    scenario: str,
+    status: str,
+    request_body: Any,
+    response_body: Any,
+    label: str,
+) -> None:
+    expected_status = {
+        "create-new": "201",
+        "create-replay": "200",
+        "create-conflict": "409",
+        "create-tombstone": "410",
+        "grant-new": "201",
+        "grant-replay": "200",
+        "start-new": "202",
+        "start-replay": "200",
+        "start-next-generation": "202",
+        "start-pod-loss": "409",
+        "transfer-stage": "201",
+        "transfer-collect": "201",
+        "transfer-cancel": "202",
+        "invoke-new": "202",
+        "finalize-provider-quiesce": "202",
+        "cancel-output-loss": "202",
+        "typed-error": "404",
+    }.get(scenario)
+    if expected_status is not None and status != expected_status:
+        raise ValueError(f"{label}: scenario requires status {expected_status}")
+
+    if scenario == "create-conflict" and _error_code(response_body) != "IDENTITY_CONFLICT":
+        raise ValueError(f"{label}: create conflict must use IDENTITY_CONFLICT")
+    if scenario == "create-tombstone":
+        error = response_body.get("error", {}) if isinstance(response_body, dict) else {}
+        context = error.get("context", {}) if isinstance(error, dict) else {}
+        if error.get("code") != "TOMBSTONED" or not isinstance(context.get("tombstone"), dict):
+            raise ValueError(f"{label}: tombstone scenario must carry sanitized tombstone context")
+    if scenario == "typed-error" and _error_code(response_body) != "NOT_FOUND":
+        raise ValueError(f"{label}: typed 404 example must use NOT_FOUND")
+    if scenario == "grant-acknowledged" and response_body.get("state") != "acknowledged":
+        raise ValueError(f"{label}: grant must be acknowledged")
+    if scenario == "grant-destroyed":
+        if (
+            response_body.get("state") != "destroyed"
+            or response_body.get("secretPresent") is not False
+        ):
+            raise ValueError(f"{label}: grant must be destroyed with no Secret observed")
+    if scenario in {"start-new", "start-replay", "start-next-generation"}:
+        expected_generation = 2 if scenario == "start-next-generation" else 1
+        expected_replayed = scenario == "start-replay"
+        if request_body.get("generation") != expected_generation:
+            raise ValueError(f"{label}: request generation is not scenario-accurate")
+        if response_body.get("generation") != expected_generation:
+            raise ValueError(f"{label}: response generation is not scenario-accurate")
+        if response_body.get("replayed") is not expected_replayed:
+            raise ValueError(f"{label}: replayed flag is not scenario-accurate")
+    if scenario == "start-pod-loss" and _error_code(response_body) not in {
+        "STALE_BINDING",
+        "REPLACEMENT_POD",
+    }:
+        raise ValueError(f"{label}: pod loss must be a binding identity error")
+    if (
+        scenario == "transfer-stage"
+        and response_body.get("spec", {}).get("direction") != "stage_input"
+    ):
+        raise ValueError(f"{label}: stage scenario has the wrong direction")
+    if (
+        scenario == "transfer-collect"
+        and response_body.get("spec", {}).get("direction") != "collect_output"
+    ):
+        raise ValueError(f"{label}: collect scenario has the wrong direction")
+    if scenario == "transfer-cancel":
+        if (
+            response_body.get("state") != "canceled"
+            or response_body.get("cancelAction", {}).get("state") != "succeeded"
+        ):
+            raise ValueError(f"{label}: cancel scenario must show its terminal action")
+    if scenario == "transfer-discard":
+        if (
+            response_body.get("state") != "discarded"
+            or response_body.get("discardAction", {}).get("state") != "succeeded"
+        ):
+            raise ValueError(f"{label}: discard scenario must show its terminal action")
+    if scenario == "transfer-restart" and response_body.get("state") != "indeterminate":
+        raise ValueError(f"{label}: restart example must expose indeterminate reality")
+    if scenario == "invoke-new" and response_body.get("state") != "accepted":
+        raise ValueError(f"{label}: new invocation must be accepted")
+    if scenario == "invoke-result-transfer":
+        if response_body.get("state") != "succeeded" or not response_body.get("resultTransferRef"):
+            raise ValueError(f"{label}: large result must name its collect transfer")
+    if scenario == "invoke-indeterminate" and response_body.get("state") != "indeterminate":
+        raise ValueError(f"{label}: unknown invocation outcome must remain indeterminate")
+    if scenario == "finalize-provider-quiesce":
+        action = response_body.get("finalizeAction", {})
+        if response_body.get("bindingState") != "finalizing" or action.get(
+            "actionRef"
+        ) != request_body.get("finalizeRef"):
+            raise ValueError(f"{label}: finalize must expose provider quiesce state")
+    if scenario == "cancel-output-loss":
+        action = response_body.get("cancelAction", {})
+        if (
+            response_body.get("bindingState") != "canceling"
+            or response_body.get("outputLossPossible") is not True
+            or action.get("actionRef") != request_body.get("cancelRef")
+        ):
+            raise ValueError(f"{label}: cancel must expose possible output loss")
+    if scenario == "delete-tombstone" and response_body.get("state") != "deleted":
+        raise ValueError(f"{label}: delete must return its retained tombstone")
+
+
+def _validate_response_headers(
+    document: dict[str, Any], response: dict[str, Any], example: dict[str, Any], label: str
+) -> None:
+    declared = response.get("headers", {})
+    supplied = example.get("headers", {})
+    if not isinstance(supplied, dict):
+        raise ValueError(f"{label}: response headers must be an object")
+    unknown = set(supplied) - set(declared)
+    if unknown:
+        raise ValueError(f"{label}: undeclared response headers: {sorted(unknown)}")
+    for name, value in supplied.items():
+        header = _dereference(document, declared[name])
+        _validate_instance(value, header["schema"], document, f"{label} header {name}")
+
+
+def _request_identity(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    extension = record["operation"].get("x-kcs-digest-projection", {})
+    request = record["request"]
+    body = record["requestBody"]
+    values: list[Any] = []
+    for item in extension.get("identity", []):
+        where = item.get("in")
+        name = item.get("name")
+        if where == "body":
+            value = body.get(name) if isinstance(body, dict) else None
+        elif where == "header":
+            value = request["headers"].get(name)
+        else:
+            value = request.get(where, {}).get(name)
+        values.append(value)
+    return tuple(values)
+
+
+def _request_digest(record: Mapping[str, Any]) -> Any:
+    extension = record["operation"].get("x-kcs-digest-projection", {})
+    return _digest_wire_value(
+        extension["digest"],
+        extension["digestLocation"],
+        record["request"],
+        record["requestBody"],
+        None,
+        {},
+        record["operationId"],
+    )
+
+
+def _validate_example_links(exchanges: Mapping[str, Mapping[str, Any]]) -> None:
+    for scenario, record in exchanges.items():
+        replay_of = record.get("replayOf")
+        if replay_of is not None:
+            target = exchanges.get(replay_of)
+            if target is None:
+                raise ValueError(f"{scenario}: replayOf target {replay_of!r} does not exist")
+            if target["operationId"] != record["operationId"]:
+                raise ValueError(f"{scenario}: replayOf must name the same operation")
+            if target["request"] != record["request"]:
+                raise ValueError(f"{scenario}: replayOf request is not byte-for-byte equivalent")
+            replay_status = record["operation"].get("x-kcs-replay", {}).get("replayStatus")
+            if replay_status is not None and record["status"] != str(replay_status):
+                raise ValueError(f"{scenario}: replayOf response has the wrong status")
+
+        conflicts_with = record.get("conflictsWith")
+        if conflicts_with is not None:
+            target = exchanges.get(conflicts_with)
+            if target is None:
+                raise ValueError(
+                    f"{scenario}: conflictsWith target {conflicts_with!r} does not exist"
+                )
+            if target["operationId"] != record["operationId"]:
+                raise ValueError(f"{scenario}: conflictsWith must name the same operation")
+            if _request_identity(target) != _request_identity(record):
+                raise ValueError(f"{scenario}: conflictsWith does not share intrinsic identity")
+            if _request_digest(target) == _request_digest(record):
+                raise ValueError(f"{scenario}: conflictsWith does not change the request digest")
 
 
 def _validate_examples(source: Path, document: dict[str, Any]) -> int:
     examples_dir = source.parent / "examples"
     example_paths = sorted(examples_dir.glob("*.json"))
     if not example_paths:
-        raise ValueError(f"no sanitized examples found in {examples_dir}")
-
-    schemas = document["components"]["schemas"]
+        raise ValueError(f"no sanitized route examples found in {examples_dir}")
+    operations = _operation_index(document)
+    scenarios: set[str] = set()
+    exchanges: dict[str, dict[str, Any]] = {}
     validated = 0
     for example_path in example_paths:
-        schema_name = example_path.stem
-        if schema_name not in schemas:
-            raise ValueError(f"{example_path.name}: no component schema named {schema_name}")
         try:
-            instance = json.loads(example_path.read_text())
-            Draft202012Validator(
-                {
-                    "$schema": "https://json-schema.org/draft/2020-12/schema",
-                    "$ref": f"#/components/schemas/{schema_name}",
-                    "components": {"schemas": schemas},
-                }
-            ).validate(instance)
-            _check_extended_limits(instance, schemas[schema_name], schemas)
-            _validate_digest_semantics(schema_name, instance)
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            raise ValueError(f"{example_path.name}: {exc}") from exc
-        validated += 1
+            bundle = json.loads(example_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{example_path.name}: invalid JSON") from exc
+        if not isinstance(bundle, dict) or not isinstance(bundle.get("exchanges"), list):
+            raise ValueError(f"{example_path.name}: expected a route exchange bundle")
+        for index, exchange in enumerate(bundle["exchanges"]):
+            label = f"{example_path.name} exchange {index}"
+            if not isinstance(exchange, dict):
+                raise ValueError(f"{label}: exchange must be an object")
+            scenario = exchange.get("scenario")
+            if not isinstance(scenario, str) or scenario in scenarios:
+                raise ValueError(f"{label}: scenario must be a unique string")
+            scenarios.add(scenario)
+            operation_id = exchange.get("operationId")
+            if operation_id not in operations:
+                raise ValueError(f"{label}: unknown operationId {operation_id!r}")
+            _method, path, operation = operations[operation_id]
+            request = exchange.get("request")
+            response_example = exchange.get("response")
+            if not isinstance(request, dict) or not isinstance(response_example, dict):
+                raise ValueError(f"{label}: request and response must be objects")
+            _validate_parameter_examples(document, path, operation, request, label)
+
+            request_body: Any | None = None
+            request_bytes: bytes | None = None
+            request_body_spec = operation.get("requestBody")
+            if request_body_spec is not None:
+                request_body_spec = _dereference(document, request_body_spec)
+                request_body, request_bytes = _validate_media(
+                    document,
+                    request_body_spec["content"],
+                    request,
+                    examples_dir,
+                    f"{label} request",
+                )
+            elif set(request) & {"contentType", "body", "bodyFixture", "bodyFile"}:
+                raise ValueError(f"{label}: operation has no request body")
+
+            status = str(response_example.get("status"))
+            if status not in operation["responses"]:
+                raise ValueError(f"{label}: undeclared response status {status}")
+            response = _dereference(document, operation["responses"][status])
+            _validate_response_headers(document, response, response_example, label)
+            response_body: Any | None = None
+            response_bytes: bytes | None = None
+            if "content" in response:
+                try:
+                    response_body, response_bytes = _validate_media(
+                        document,
+                        response["content"],
+                        response_example,
+                        examples_dir,
+                        f"{label} response",
+                    )
+                except ValueError as exc:
+                    if scenario == "create-tombstone":
+                        raise ValueError(
+                            f"{label}: tombstone scenario must carry sanitized tombstone context"
+                        ) from exc
+                    raise
+            elif set(response_example) & {"contentType", "body", "bodyFixture", "bodyFile"}:
+                raise ValueError(f"{label}: response has no body")
+            _validate_digest_semantics(
+                operation,
+                operation_id,
+                request,
+                request_body,
+                request_bytes,
+                response_body,
+                response_bytes,
+                response_example.get("headers", {}),
+                label,
+            )
+            _validate_response_identity(request, response_body, label)
+            _validate_scenario_semantics(scenario, status, request_body, response_body, label)
+            exchanges[scenario] = {
+                "operationId": operation_id,
+                "operation": operation,
+                "request": {
+                    "path": request.get("path", {}),
+                    "query": request.get("query", {}),
+                    "headers": request.get("headers", {}),
+                    "contentType": request.get("contentType"),
+                    "body": request_body,
+                    "bytes": request_bytes,
+                },
+                "requestBody": request_body,
+                "status": status,
+                "replayOf": exchange.get("replayOf"),
+                "conflictsWith": exchange.get("conflictsWith"),
+            }
+            validated += 1
+    missing = REQUIRED_SCENARIOS - scenarios
+    if missing:
+        raise ValueError(f"route examples are missing required scenarios: {sorted(missing)}")
+    _validate_example_links(exchanges)
     return validated
 
 
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
-    """Parse, validate, and write deterministic artifacts for one canonical source."""
-    document = yaml.safe_load(source.read_text())
-    if not isinstance(document, dict):
-        raise ValueError(f"{source} must contain an OpenAPI object")
+    """Parse, fully validate, and write deterministic artifacts for one source."""
+    document = _load_yaml(source)
     if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.0.0":
         raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.0.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")
+    _validate_references(document)
+    try:
+        validate(document)
+    except Exception as exc:  # validator versions expose several concrete exceptions
+        raise ValueError(f"OpenAPI document is invalid: {exc}") from exc
+
+    component_bundles: dict[str, dict[str, Any]] = {}
+    for name in sorted(schemas):
+        bundle = _component_bundle(name, schemas)
+        try:
+            Draft202012Validator.check_schema(bundle)
+        except SchemaError as exc:
+            raise ValueError(f"component schema {name}: {exc.message}") from exc
+        component_bundles[name] = bundle
 
     validated_examples = _validate_examples(source, document)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,12 +1113,7 @@ def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     checksum.write_text(f"{sha256}  {openapi_json.name}\n")
 
     component_paths: list[Path] = []
-    for name in sorted(schemas):
-        bundle = _component_bundle(name, schemas)
-        try:
-            Draft202012Validator.check_schema(bundle)
-        except SchemaError as exc:
-            raise ValueError(f"component schema {name}: {exc.message}") from exc
+    for name, bundle in component_bundles.items():
         path = schema_dir / f"{name}.schema.json"
         path.write_bytes(_json_bytes(bundle))
         component_paths.append(path)
@@ -205,6 +1135,18 @@ def _artifact_bytes(directory: Path) -> dict[str, bytes]:
     }
 
 
+def check_committed_artifacts(source: Path, committed_dir: Path) -> OpenAPIArtifactSet:
+    """Regenerate into isolation and reject any byte-level committed drift."""
+    with tempfile.TemporaryDirectory(prefix="kcs-v2-openapi-committed-") as temp:
+        generated_dir = Path(temp) / "generated"
+        artifacts = generate_artifacts(source, generated_dir)
+        if not committed_dir.is_dir() or _artifact_bytes(generated_dir) != _artifact_bytes(
+            committed_dir
+        ):
+            raise ValueError("committed generated artifacts are stale")
+        return artifacts
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
@@ -220,8 +1162,12 @@ def main() -> int:
             generate_artifacts(args.source, second_dir)
             if _artifact_bytes(first_dir) != _artifact_bytes(second_dir):
                 raise SystemExit("generated artifacts are not deterministic")
+            if not args.output_dir.is_dir() or _artifact_bytes(first_dir) != _artifact_bytes(
+                args.output_dir
+            ):
+                raise SystemExit("committed generated artifacts are stale")
             print(
-                f"validated {first.validated_examples} examples; "
+                f"validated {first.validated_examples} route exchanges; "
                 f"sha256 {first.sha256}  {first.openapi_json.name}"
             )
             return 0

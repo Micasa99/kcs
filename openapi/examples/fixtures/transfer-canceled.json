@@ -1,0 +1,21 @@
+{
+  "transferRef": "transfer-stage-synthetic-001",
+  "requestDigest": "38db1317fc3b3ea081e61384e2144805d7ce82f42717ab4f076d2cfe3e90fca9",
+  "jobRef": "job-synthetic-001",
+  "jobUid": "11111111-1111-4111-8111-111111111111",
+  "podUid": "22222222-2222-4222-8222-222222222222",
+  "spec": {"direction": "stage_input", "path": "inputs/data.bin", "declaredSizeBytes": 22, "authorizedMaxSizeBytes": 1024, "contentSha256": "2d49c9bb35e58d1787a46337e19fe973bff9f332592af0bf2af412786c0eb254", "mode": "direct", "overwritePolicy": "forbid"},
+  "state": "canceled",
+  "actualSizeBytes": null,
+  "actualSha256": null,
+  "verified": false,
+  "contentAvailable": false,
+  "snapshotRef": null,
+  "createdAt": "2026-08-01T00:03:00Z",
+  "updatedAt": "2026-08-01T00:03:30Z",
+  "completedAt": "2026-08-01T00:03:30Z",
+  "observedAt": "2026-08-01T00:03:30Z",
+  "failureReason": null,
+  "cancelAction": {"actionRef": "transfer-cancel-synthetic-001", "requestDigest": "3b32be230686e5f5064ec9c5a92b0522e34a0a44cb02ba433e1c242fb291e704", "state": "succeeded", "observedAt": "2026-08-01T00:03:30Z"},
+  "discardAction": {"actionRef": null, "requestDigest": null, "state": "not_requested", "observedAt": null}
+}

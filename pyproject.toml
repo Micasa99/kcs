@@ -31,6 +31,7 @@ dev = [
     "ruff>=0.3.0",
     "mypy>=1.8",
     "jsonschema>=4.23",
+    "openapi-spec-validator>=0.9.0",
     "rfc8785>=0.1.4",
 ]
 

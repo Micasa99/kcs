@@ -85,23 +85,16 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
         path: {method for method in item if method in {"get", "post", "put", "delete"}}
         for path, item in openapi["paths"].items()
     } == EXPECTED_OPERATIONS
-    assert openapi["security"] == [{"serviceBearer": []}]
+    assert openapi["security"] == [{"v2ServiceBearer": []}]
+    assert set(openapi["components"]["securitySchemes"]) == {"v2ServiceBearer"}
 
-    log_parameters = openapi["paths"]["/api/v2/jobs/{jobRef}/logs"]["get"]["parameters"]
-    assert log_parameters == [
-        {"$ref": "#/components/parameters/Container"},
-        {"$ref": "#/components/parameters/Cursor"},
-        {"$ref": "#/components/parameters/LogLimit"},
-    ]
+    credential = openapi["paths"]["/api/v2/jobs/{jobRef}/agent/credential-grants"]["post"]
+    assert "security" not in credential
+    assert credential["x-kcs-private-ingress"] is True
 
-    content = openapi["paths"][
-        "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content"
-    ]
-    assert {method for method in content if method in {"put", "get"}} == {"put", "get"}
+    content = openapi["paths"]["/api/v2/jobs/{jobRef}/transfers/{transferRef}/content"]
     assert set(content["put"]["requestBody"]["content"]) == {"application/octet-stream"}
-    assert set(content["get"]["responses"]["200"]["content"]) == {
-        "application/octet-stream"
-    }
+    assert set(content["get"]["responses"]["200"]["content"]) == {"application/octet-stream"}
 
 
 def test_contract_uses_one_typed_error_envelope_for_every_required_status() -> None:
@@ -118,49 +111,40 @@ def test_contract_uses_one_typed_error_envelope_for_every_required_status() -> N
         for status, response in operation["responses"].items():
             if status in EXPECTED_ERROR_STATUSES:
                 schema = response["content"]["application/json"]["schema"]
-                assert schema == {"$ref": "#/components/schemas/ErrorEnvelope"}
+                assert schema in (
+                    {"$ref": "#/components/schemas/ErrorEnvelope"},
+                    {"$ref": "#/components/schemas/TombstonedErrorEnvelope"},
+                )
                 seen_statuses.add(status)
 
     assert seen_statuses == EXPECTED_ERROR_STATUSES
 
 
 def test_contract_enforces_frozen_limits_and_closed_mutating_payloads() -> None:
-    schemas = _load_openapi()["components"]["schemas"]
+    document = _load_openapi()
+    schemas = document["components"]["schemas"]
 
     assert schemas["OpaqueRef"]["maxLength"] == 256
     assert schemas["Environment"]["maxProperties"] == 32
     assert schemas["Environment"]["propertyNames"]["maxLength"] == 64
     assert schemas["Environment"]["additionalProperties"]["maxLength"] == 2048
-    assert (
-        schemas["CredentialGrantRequest"]["properties"]["credential"][
-            "x-kcs-maxDecodedBytes"
-        ]
-        == 65536
+    assert schemas["Environment"]["additionalProperties"]["format"] == (
+        "kcs-non-secret-runtime-value"
     )
-    assert schemas["CreateJobRequest"]["properties"]["deadlineSeconds"]["maximum"] == 86400
-    assert schemas["CreateJobRequest"]["properties"]["deadlineSeconds"]["default"] == 21600
-    assert schemas["WorkspaceResources"]["properties"]["gpu"]["maximum"] == 8
-    assert schemas["AgentResources"]["properties"]["gpu"]["maximum"] == 0
-
-    logs = schemas["RoleLogs"]
-    assert logs["x-kcs-combinedUtf8Bytes"] == 1048576
-    assert logs["properties"]["stdout"]["x-kcs-maxUtf8Bytes"] == 1048576
-    assert logs["properties"]["stderr"]["x-kcs-maxUtf8Bytes"] == 1048576
-    operation = schemas["WorkspaceOperation"]
-    assert operation["properties"]["stdout"]["x-kcs-maxUtf8Bytes"] == 65536
-    assert operation["properties"]["stderr"]["x-kcs-maxUtf8Bytes"] == 65536
-
-    assert schemas["ResourceId"] == {"$ref": "#/components/schemas/OpaqueRef"}
-    assert schemas["ActionId"] == {"$ref": "#/components/schemas/OpaqueRef"}
-    assert "maxLength" not in schemas["AgentSpec"]["properties"]["image"]
-    assert "maxLength" not in schemas["WorkspaceSpec"]["properties"]["image"]
-    assert "maxLength" not in schemas["TransferRegisterRequest"]["properties"]["path"]
-    assert schemas["WorkspaceInvokeRequest"]["properties"]["method"] == {
-        "$ref": "#/components/schemas/OpaqueRef"
+    assert schemas["JobSpec"]["properties"]["activeDeadlineSeconds"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 86400,
+        "default": 21600,
     }
-    assert "maxProperties" not in schemas["WorkspaceInvokeRequest"]["properties"]["spec"]
-    assert "maxLength" not in _load_openapi()["components"]["parameters"]["Cursor"]["schema"]
-    assert "maxLength" not in _load_openapi()["components"]["parameters"]["PageToken"]["schema"]
+    assert schemas["WorkspaceResources"]["properties"]["gpu"]["maximum"] == 8
+    assert "gpu" not in schemas["AgentResources"]["properties"]
+    assert schemas["RoleLogs"]["properties"]["content"]["x-kcs-maxUtf8Bytes"] == 1048576
+    assert (
+        schemas["WorkspaceOperationSnapshot"]["properties"]["stdout"]["x-kcs-maxUtf8Bytes"] == 65536
+    )
+    assert schemas["SafeRelativePath"]["format"] == "kcs-relative-posix-path"
+    assert schemas["WorkspaceFrame"]["x-kcs-maxCanonicalBytes"] == 1048576
 
     for name, schema in schemas.items():
         if name.endswith("Request"):
@@ -179,102 +163,41 @@ def test_generator_emits_deterministic_json_hash_and_validated_component_schemas
     second_bytes = second.openapi_json.read_bytes()
     assert first_bytes == second_bytes
     assert first_bytes.endswith(b"\n")
-    assert first_bytes == (
-        json.dumps(json.loads(first_bytes), sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode()
+    assert (
+        first_bytes
+        == (
+            json.dumps(json.loads(first_bytes), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+    )
 
     expected_hash = hashlib.sha256(first_bytes).hexdigest()
     assert first.sha256 == expected_hash
-    assert len(expected_hash) == 64 and expected_hash == expected_hash.lower()
     assert first.checksum.read_text() == f"{expected_hash}  {first.openapi_json.name}\n"
     assert {path.stem.removesuffix(".schema") for path in first.component_schemas} == set(
         _load_openapi()["components"]["schemas"]
     )
-    assert first.validated_examples == len(list((ROOT / "openapi" / "examples").glob("*.json")))
+    expected_examples = sum(
+        len(json.loads(path.read_text())["exchanges"])
+        for path in (ROOT / "openapi" / "examples").glob("*.json")
+    )
+    assert first.validated_examples == expected_examples
     assert first.validated_examples > 0
 
 
-def test_generator_rejects_an_example_that_violates_its_named_schema(tmp_path: Path) -> None:
-    module = _load_generator_module()
-    copied_source = tmp_path / "openapi" / SOURCE.name
-    copied_source.parent.mkdir()
-    copied_source.write_bytes(SOURCE.read_bytes())
-    examples = copied_source.parent / "examples"
-    examples.mkdir()
-    (examples / "CreateJobRequest.json").write_text("{}\n")
-
-    with pytest.raises(ValueError, match="CreateJobRequest.json"):
-        module.generate_artifacts(copied_source, tmp_path / "generated")
-
-
-def test_digest_examples_match_their_synthetic_payload_bytes() -> None:
-    credential = json.loads((SOURCE.parent / "examples/CredentialGrantRequest.json").read_text())
-    launch = json.loads((SOURCE.parent / "examples/AgentStartRequest.json").read_text())
-    invocation = json.loads((SOURCE.parent / "examples/WorkspaceInvokeRequest.json").read_text())
-
-    assert credential["credentialSha256"] == (
-        "44d8b78bec6ce60168d0849c40fd060d7ddf8d50d9194d99ce1f1240d84f7cbd"
-    )
-    assert launch["launchSha256"] == (
-        "639b6feef1aea8b7b8afdfd30c96ecf7f3599eb1562cdc48836957f40f428146"
-    )
-    assert invocation["spec"] == {"providerRequestId": "attempt-sanitized-001"}
-    assert invocation["specDigest"] == (
-        "68ec081a086f7a5a594b7743e1509bff11715a774f2d522754652ca576c570e2"
-    )
-
-
-@pytest.mark.parametrize(
-    ("filename", "digest_field"),
-    [
-        ("CredentialGrantRequest.json", "credentialSha256"),
-        ("AgentStartRequest.json", "launchSha256"),
-        ("WorkspaceInvokeRequest.json", "specDigest"),
-    ],
-)
-def test_generator_rejects_digest_mismatch(
-    tmp_path: Path, filename: str, digest_field: str
+def test_generator_rejects_an_example_that_violates_its_route_schema(
+    tmp_path: Path,
 ) -> None:
     module = _load_generator_module()
     copied_openapi = tmp_path / "openapi"
-    shutil.copytree(SOURCE.parent, copied_openapi)
-    example_path = copied_openapi / "examples" / filename
-    example = json.loads(example_path.read_text())
-    example[digest_field] = "0" * 64
-    example_path.write_text(json.dumps(example) + "\n")
+    shutil.copytree(SOURCE.parent, copied_openapi, ignore=shutil.ignore_patterns("generated"))
+    bundle_path = copied_openapi / "examples" / "jobs.json"
+    bundle = json.loads(bundle_path.read_text())
+    create = next(item for item in bundle["exchanges"] if item["scenario"] == "create-new")
+    create["request"] = {"contentType": "application/json", "body": {}}
+    bundle_path.write_text(json.dumps(bundle) + "\n")
 
-    with pytest.raises(ValueError, match=filename):
+    with pytest.raises(ValueError, match="jobs.json"):
         module.generate_artifacts(copied_openapi / SOURCE.name, tmp_path / "generated")
-
-
-def test_generator_enforces_combined_log_budget(tmp_path: Path) -> None:
-    module = _load_generator_module()
-    copied_openapi = tmp_path / "openapi"
-    shutil.copytree(SOURCE.parent, copied_openapi)
-    copied_source = copied_openapi / SOURCE.name
-    document = yaml.safe_load(copied_source.read_text())
-    logs = document["components"]["schemas"]["RoleLogs"]
-    logs["x-kcs-combinedUtf8Bytes"] = 1048576
-    logs["properties"]["stdout"]["maxLength"] = 1048576
-    logs["properties"]["stdout"]["x-kcs-maxUtf8Bytes"] = 1048576
-    logs["properties"]["stderr"]["maxLength"] = 1048576
-    logs["properties"]["stderr"]["x-kcs-maxUtf8Bytes"] = 1048576
-    copied_source.write_text(yaml.safe_dump(document, sort_keys=False))
-    (copied_openapi / "examples" / "RoleLogs.json").write_text(
-        json.dumps(
-            {
-                "jobRef": "job-sanitized-001",
-                "container": "agent",
-                "stdout": "a" * 600000,
-                "stderr": "b" * 600000,
-                "truncated": True,
-            }
-        )
-        + "\n"
-    )
-
-    with pytest.raises(ValueError, match="RoleLogs.json"):
-        module.generate_artifacts(copied_source, tmp_path / "generated")
 
 
 def test_regeneration_removes_obsolete_component_artifacts(tmp_path: Path) -> None:

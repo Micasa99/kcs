@@ -24,7 +24,6 @@ htmlcov/
 
 # Local config and data
 local/
-/openapi/generated/
 
 # Claude Code
 .claude/

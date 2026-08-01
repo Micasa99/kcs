@@ -1,0 +1,13 @@
+{
+  "transferRef": "transfer-stage-synthetic-001",
+  "requestDigest": "38db1317fc3b3ea081e61384e2144805d7ce82f42717ab4f076d2cfe3e90fca9",
+  "spec": {
+    "direction": "stage_input",
+    "path": "inputs/data.bin",
+    "declaredSizeBytes": 22,
+    "authorizedMaxSizeBytes": 1024,
+    "contentSha256": "2d49c9bb35e58d1787a46337e19fe973bff9f332592af0bf2af412786c0eb254",
+    "mode": "direct",
+    "overwritePolicy": "forbid"
+  }
+}

@@ -3,73 +3,111 @@ info:
   title: KCS V2 Hosted Attempt API
   version: 2.0.0
   description: >-
-    Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality only;
-    provider references are opaque and no research outcome is inferred.
+    Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
+    only, accepts opaque owner references, and never infers research success.
+  x-kcs-features:
+    transferModes: [direct]
+    rangeRequests: false
+    signedTransfers: false
   x-kcs-limits:
-    ref_utf8_bytes: 256
-    environment_entries: 32
-    environment_key_utf8_bytes: 64
-    environment_value_utf8_bytes: 2048
-    launch_bytes: 1048576
-    credential_bytes: 65536
-    stdout_bytes: 65536
-    stderr_bytes: 65536
-    logs_default_bytes: 65536
-    logs_max_bytes: 1048576
-    direct_transfer_bytes: 107374182400
-    pagination_default: 50
-    pagination_max: 200
-    tombstone_retention_seconds: 604800
-    credential_ttl_default_seconds: 300
-    credential_ttl_max_seconds: 900
+    refUtf8Bytes: 256
+    environmentEntries: 32
+    environmentKeyUtf8Bytes: 64
+    environmentValueUtf8Bytes: 2048
+    launchBundleBytes: 1048576
+    credentialBytes: 65536
+    operationStdoutBytes: 65536
+    operationStderrBytes: 65536
+    logsDefaultBytes: 65536
+    logsMaximumBytes: 1048576
+    directTransferBytes: 107374182400
+    paginationDefault: 50
+    paginationMaximum: 200
+    tombstoneRetentionSeconds: 604800
+    credentialTtlDefaultSeconds: 300
+    credentialTtlMaximumSeconds: 900
+x-kcs-legacy-authorization:
+  v2NamespaceAccess: denied
+  podsExec: denied
+  secrets: denied
+  mutations: denied
 servers:
   - url: /
 security:
-  - serviceBearer: []
+  - v2ServiceBearer: []
 tags:
-  - name: Jobs
-  - name: Credentials
-  - name: Transfers
-  - name: Workspace
-  - name: Contract
+  - {name: Jobs}
+  - {name: Credentials}
+  - {name: Transfers}
+  - {name: Workspace}
+  - {name: Contract}
 paths:
   /api/v2/jobs:
     post:
       tags: [Jobs]
       operationId: createJob
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        CAPACITY_LIMIT: {status: 429, recoveryAction: retry_same}
+        RATE_LIMIT: {status: 429, recoveryAction: retry_same}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: [{in: body, name: providerRequestId}]
+        digest: specDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: '#/components/schemas/CreateJobRequest'}
       responses:
-        '201':
-          description: Created from the canonicalized spec digest.
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Job'}
+        '201': &JobCreated
+          description: New provider binding created.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+        '200': &JobReplay
+          description: Stable same-identity, same-digest replay.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
         '400': &Error400
-          description: Malformed request.
+          description: Malformed or invalid request.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '401': &Error401
-          description: Missing or invalid service bearer token.
+          description: Missing or invalid V2 service authentication.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '403': &Error403
-          description: Authenticated caller is not authorized.
+          description: Caller lacks the operation authorization role.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '409': &Error409
-          description: Idempotency or current-state conflict.
+          description: Stable identity, digest, binding, or state conflict.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '410':
+          description: Retained tombstone prevents recreation.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TombstonedErrorEnvelope'}}}
         '413': &Error413
           description: Payload exceeds a frozen limit.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '415': &Error415
-          description: Unsupported content type.
+          description: Unsupported media type.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '422': &Error422
-          description: Semantically invalid request.
+          description: Semantically invalid request or byte mismatch.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '429': &Error429
           description: Capacity or rate limit reached.
@@ -78,100 +116,334 @@ paths:
           description: Sanitized internal failure.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '503': &Error503
-          description: Runtime dependency unavailable.
+          description: Required dependency unavailable.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '504': &Error504
-          description: Runtime dependency timed out.
+          description: Required dependency timed out.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
     get:
       tags: [Jobs]
       operationId: listJobs
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        INVALID_PAGE_TOKEN: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        STALE_PAGE_TOKEN: {status: 409, recoveryAction: none}
+        CAPACITY_LIMIT: {status: 429, recoveryAction: retry_same}
+        RATE_LIMIT: {status: 429, recoveryAction: retry_same}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-ordering: [createdAt, jobRef]
+      x-kcs-page-token-binding: [namespace, providerRequestId, subjectRef, state, createdAfter, includeDeleted]
       parameters:
-        - $ref: '#/components/parameters/PageToken'
-        - $ref: '#/components/parameters/PageSize'
+        - {$ref: '#/components/parameters/PageToken'}
+        - {$ref: '#/components/parameters/PageSize'}
+        - {$ref: '#/components/parameters/ProviderRequestIdFilter'}
+        - {$ref: '#/components/parameters/SubjectRefFilter'}
+        - {$ref: '#/components/parameters/StateFilter'}
+        - {$ref: '#/components/parameters/CreatedAfterFilter'}
+        - {$ref: '#/components/parameters/IncludeDeletedFilter'}
       responses:
         '200':
-          description: Namespace-scoped live jobs and retained tombstones.
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/JobList'}
+          description: Deterministically ordered live bindings and requested tombstones.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshotList'}}}
+        '400': *Error400
         '401': *Error401
         '403': *Error403
+        '409': *Error409
+        '429': *Error429
         '500': *Error500
         '503': *Error503
   /api/v2/jobs/{jobRef}:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     get:
       tags: [Jobs]
       operationId: inspectJob
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       responses:
         '200':
-          description: Current job or retained tombstone.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+          description: Current immutable binding and observed provider reality.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
         '401': *Error401
         '403': *Error403
         '404': &Error404
-          description: Resource is not known in this namespace.
+          description: Resource is unknown after retention.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
-        '410': &Error410
-          description: Resource existed but its retained representation is gone.
-          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '410':
+          description: Retained tombstone is the authoritative terminal record.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TombstonedErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
     delete:
       tags: [Jobs]
       operationId: deleteJob
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs-empty-object
+        identity:
+          - {in: path, name: jobRef}
+          - {in: header, name: KCS-Delete-Ref}
+        digest: requestDigest
+        digestLocation: header
+        projection: {source: constant, value: {}}
+      x-kcs-replay:
+        newStatus: 200
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - {$ref: '#/components/parameters/DeleteRefHeader'}
+        - {$ref: '#/components/parameters/RequestDigestHeader'}
       responses:
         '200':
-          description: Workload reality removed and tombstone retained.
-          content: {application/json: {schema: {$ref: '#/components/schemas/DeleteJobResponse'}}}
+          description: Workload reality removed and seven-day tombstone retained.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobTombstone'}}}
+        '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
+        '422': *Error422
         '500': *Error500
         '503': *Error503
         '504': *Error504
   /api/v2/jobs/{jobRef}/logs:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     get:
       tags: [Jobs]
       operationId: getRoleLogs
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        INVALID_CURSOR: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STALE_CURSOR: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-cursor-binding: [namespace, jobRef, podUid, container]
       parameters:
-        - $ref: '#/components/parameters/Container'
-        - $ref: '#/components/parameters/Cursor'
-        - $ref: '#/components/parameters/LogLimit'
+        - {$ref: '#/components/parameters/Container'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/LogLimit'}
       responses:
         '200':
-          description: Bounded role logs.
+          description: One bounded continuation of the actual combined Kubernetes container log.
           content: {application/json: {schema: {$ref: '#/components/schemas/RoleLogs'}}}
+        '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
-        '413': *Error413
+        '409': *Error409
+        '410':
+          description: Requested log identity is gone.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
   /api/v2/jobs/{jobRef}/agent/credential-grants:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     post:
       tags: [Credentials]
       operationId: grantCredential
+      x-kcs-service-authorization: v2-private-credential-writer
+      x-kcs-private-ingress: true
+      x-kcs-request-body-logging: forbidden
+      x-kcs-no-request-body-log: true
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Credential-SHA256, KCS-Grant-Metadata-Digest]
+      x-kcs-rbac-boundary: v2-namespace-only
+      x-kcs-legacy-proxy-access: denied
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_grant}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        CREDENTIAL_ACTIVE: {status: 409, recoveryAction: inspect_grant}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: raw-body
+        identity:
+          - {in: path, name: jobRef}
+          - {in: header, name: KCS-Credential-Grant-Ref}
+        digest: credentialSha256
+        digestLocation: header
+        projection: {source: requestBody, encoding: raw-bytes}
+        metadataDigest:
+          field: grantMetadataDigest
+          kind: rfc8785-jcs
+          digestLocation: header
+          projection:
+            - {field: agentRunRef, header: KCS-Agent-Run-Ref}
+            - {field: generation, header: KCS-Generation}
+            - {field: launchBundleDigest, header: KCS-Launch-Bundle-Digest}
+            - {field: audience, header: KCS-Audience}
+            - {field: credentialSha256, header: KCS-Credential-SHA256}
+            - {field: ttlSeconds, header: KCS-Credential-TTL-Seconds}
+            - {field: jobUid, header: KCS-Job-UID}
+            - {field: podUid, header: KCS-Pod-UID}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_grant
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - {$ref: '#/components/parameters/CredentialGrantRefHeader'}
+        - {$ref: '#/components/parameters/CredentialSha256Header'}
+        - {$ref: '#/components/parameters/GrantMetadataDigestHeader'}
+        - {$ref: '#/components/parameters/AgentRunRefHeader'}
+        - {$ref: '#/components/parameters/GenerationHeader'}
+        - {$ref: '#/components/parameters/LaunchBundleDigestHeader'}
+        - {$ref: '#/components/parameters/AudienceHeader'}
+        - {$ref: '#/components/parameters/JobUidHeader'}
+        - {$ref: '#/components/parameters/PodUidHeader'}
+        - {$ref: '#/components/parameters/CredentialTtlHeader'}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, maxLength: 65536, x-kcs-maxBytes: 65536}
+      responses:
+        '201': &GrantCreated
+          description: New bound credential grant accepted.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
+        '200': &GrantReplay
+          description: Stable grant replay or cleanup retry without replacement Secret.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
+        '400': &CredentialNoStoreError
+          description: Sanitized credential-route error; no credential bytes are returned.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '401': *CredentialNoStoreError
+        '403': *CredentialNoStoreError
+        '404': *CredentialNoStoreError
+        '409': *CredentialNoStoreError
+        '413': *CredentialNoStoreError
+        '415': *CredentialNoStoreError
+        '422': *CredentialNoStoreError
+        '500': *CredentialNoStoreError
+        '503': *CredentialNoStoreError
+  /api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/CredentialGrantRef'}
+    get:
+      tags: [Credentials]
+      operationId: inspectCredentialGrant
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        CREDENTIAL_EXPIRED: {status: 410, recoveryAction: inspect_grant}
+        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: Non-secret grant lifecycle and destruction observation.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
+        '401': *CredentialNoStoreError
+        '403': *CredentialNoStoreError
+        '404': *CredentialNoStoreError
+        '409': *CredentialNoStoreError
+        '410': *CredentialNoStoreError
+        '500': *CredentialNoStoreError
+        '503': *CredentialNoStoreError
+  /api/v2/jobs/{jobRef}/agent/start:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Jobs]
+      operationId: startAgent
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        ILLEGAL_GENERATION: {status: 409, recoveryAction: inspect_job}
+        CREDENTIAL_EXPIRED: {status: 409, recoveryAction: inspect_grant}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        PRECONDITION_FAILED: {status: 422, recoveryAction: inspect_job}
+        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: generation}
+        digest: startMetadataDigest
+        digestLocation: response
+        projection: {source: requestBody, exclude: [generation]}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
       requestBody:
         required: true
         content:
           application/json:
-            schema: {$ref: '#/components/schemas/CredentialGrantRequest'}
+            schema: {$ref: '#/components/schemas/AgentStartRequest'}
       responses:
-        '201':
-          description: At most one active agent-only credential projection.
-          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrant'}}}
+        '202': &StartAccepted
+          description: New generation accepted by the bound live supervisor.
+          content: {application/json: {schema: {$ref: '#/components/schemas/GenerationSnapshot'}}}
+        '200': &StartReplay
+          description: Stable same-generation, same-metadata replay.
+          content: {application/json: {schema: {$ref: '#/components/schemas/GenerationSnapshot'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
@@ -182,67 +454,59 @@ paths:
         '422': *Error422
         '500': *Error500
         '503': *Error503
-  /api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}:
-    parameters:
-      - $ref: '#/components/parameters/JobRef'
-      - $ref: '#/components/parameters/CredentialGrantRef'
-    get:
-      tags: [Credentials]
-      operationId: inspectCredentialGrant
-      responses:
-        '200':
-          description: Sanitized grant lifecycle, including deletion failure.
-          content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrant'}}}
-        '401': *Error401
-        '403': *Error403
-        '404': *Error404
-        '410': *Error410
-        '500': *Error500
-        '503': *Error503
-  /api/v2/jobs/{jobRef}/agent/start:
-    parameters:
-      - $ref: '#/components/parameters/JobRef'
-    post:
-      tags: [Jobs]
-      operationId: startAgent
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: '#/components/schemas/AgentStartRequest'}
-      responses:
-        '202':
-          description: Launch accepted by the agent supervisor.
-          content: {application/json: {schema: {$ref: '#/components/schemas/AgentStartResponse'}}}
-        '400': *Error400
-        '401': *Error401
-        '403': *Error403
-        '404': *Error404
-        '409': *Error409
-        '413': *Error413
-        '422': *Error422
-        '500': *Error500
-        '503': *Error503
         '504': *Error504
   /api/v2/jobs/{jobRef}/transfers:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     post:
       tags: [Transfers]
       operationId: registerTransfer
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        OVERWRITE_FORBIDDEN: {status: 409, recoveryAction: inspect_transfer}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        PRECONDITION_FAILED: {status: 422, recoveryAction: inspect_transfer}
+        UNSAFE_PATH: {status: 422, recoveryAction: none}
+        CAPACITY_LIMIT: {status: 429, recoveryAction: retry_same}
+        RATE_LIMIT: {status: 429, recoveryAction: retry_same}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: transferRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_transfer
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: '#/components/schemas/TransferRegisterRequest'}
       responses:
-        '201':
-          description: Direct transfer registered.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+        '201': &TransferCreated
+          description: New direct transfer registered.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
+        '200': &TransferReplay
+          description: Stable same-transfer, same-spec replay.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
@@ -256,52 +520,134 @@ paths:
         '503': *Error503
   /api/v2/jobs/{jobRef}/transfers/{transferRef}:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
-      - $ref: '#/components/parameters/TransferRef'
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TransferRef'}
     get:
       tags: [Transfers]
       operationId: inspectTransfer
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        GONE: {status: 410, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       responses:
         '200':
-          description: Transfer control state.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+          description: Durable transfer control and byte verification state.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
         '401': *Error401
         '403': *Error403
         '404': *Error404
-        '410': *Error410
+        '409': *Error409
+        '410':
+          description: Resource is gone after retained control-plane state expired.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
     delete:
       tags: [Transfers]
       operationId: discardTransfer
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs-empty-object
+        identity:
+          - {in: path, name: jobRef}
+          - {in: path, name: transferRef}
+          - {in: header, name: KCS-Discard-Ref}
+        digest: requestDigest
+        digestLocation: header
+        projection: {source: constant, value: {}}
+      x-kcs-replay:
+        newStatus: 200
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_transfer
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - {$ref: '#/components/parameters/DiscardRefHeader'}
+        - {$ref: '#/components/parameters/RequestDigestHeader'}
       responses:
         '200':
-          description: Staged or snapshot content discarded.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+          description: Registered temporary or snapshot content discarded.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
+        '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
+        '422': *Error422
         '500': *Error500
         '503': *Error503
   /api/v2/jobs/{jobRef}/transfers/{transferRef}/content:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
-      - $ref: '#/components/parameters/TransferRef'
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TransferRef'}
     put:
       tags: [Transfers]
       operationId: putTransferContent
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-no-request-body-log: true
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        OVERWRITE_FORBIDDEN: {status: 409, recoveryAction: inspect_transfer}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        UNSAFE_PATH: {status: 422, recoveryAction: none}
+        TRANSFER_BYTES_MISMATCH: {status: 422, recoveryAction: inspect_transfer}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: raw-body
+        identity:
+          - {in: path, name: jobRef}
+          - {in: path, name: transferRef}
+        digest: contentSha256
+        digestLocation: header
+        projection: {source: requestBody, encoding: raw-bytes}
+      x-kcs-replay:
+        newStatus: 200
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: TRANSFER_BYTES_MISMATCH
+        recoveryAction: inspect_transfer
+      parameters:
+        - {$ref: '#/components/parameters/ContentSha256Header'}
+        - {$ref: '#/components/parameters/ContentLengthHeader'}
       requestBody:
         required: true
         content:
           application/octet-stream:
-            schema: {type: string, format: binary, maxLength: 107374182400}
+            schema: {type: string, format: binary, maxLength: 107374182400, x-kcs-maxBytes: 107374182400}
       responses:
         '200':
-          description: Staged, validated, and atomically renamed.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+          description: Bytes counted, verified, fsynced as applicable, and atomically installed or replayed.
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
@@ -316,129 +662,310 @@ paths:
     get:
       tags: [Transfers]
       operationId: getTransferContent
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        TRANSFER_BYTES_MISMATCH: {status: 409, recoveryAction: inspect_transfer}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        GONE: {status: 410, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
       responses:
         '200':
-          description: Authorized immutable snapshot with verified digest.
+          description: Authorized immutable collect snapshot streamed and digest verified.
           headers:
-            X-Content-SHA256:
-              schema: {$ref: '#/components/schemas/Sha256'}
+            Content-Length: {schema: {type: integer, minimum: 0, maximum: 107374182400}}
+            X-Content-SHA256: {schema: {$ref: '#/components/schemas/Sha256'}}
+            X-KCS-Snapshot-Ref: {schema: {$ref: '#/components/schemas/OpaqueRef'}}
+            Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/octet-stream:
-              schema: {type: string, format: binary, maxLength: 107374182400}
+              schema: {type: string, format: binary, maxLength: 107374182400, x-kcs-maxBytes: 107374182400}
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
-        '410': *Error410
+        '410':
+          description: Transfer content is no longer retained.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
         '504': *Error504
   /api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
-      - $ref: '#/components/parameters/TransferRef'
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TransferRef'}
     post:
       tags: [Transfers]
       operationId: cancelTransfer
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: path, name: transferRef}
+          - {in: body, name: cancelRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_transfer
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/TransferCancelRequest'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransferCancelRequest'}
       responses:
+        '202':
+          description: New transfer cancellation accepted.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
         '200':
-          description: Transfer cancellation state.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Transfer'}}}
+          description: Stable transfer cancellation replay.
+          content: {application/json: {schema: {$ref: '#/components/schemas/TransferSnapshot'}}}
+        '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
+        '415': *Error415
+        '422': *Error422
         '500': *Error500
         '503': *Error503
   /api/v2/jobs/{jobRef}/workspace/invoke:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     post:
       tags: [Workspace]
       operationId: invokeWorkspace
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-forward-body-unchanged: true
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_operation}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_operation}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        PRECONDITION_FAILED: {status: 422, recoveryAction: inspect_operation}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: external-owner-digest
+        identity:
+          - {in: path, name: jobRef}
+          - {in: header, name: KCS-Operation-Ref}
+        digest: requestDigest
+        digestLocation: header
+        digestOwnership: platform
+        storedIntegrityDigest:
+          field: storedFrameDigest
+          kind: rfc8785-jcs
+          digestLocation: response
+          projection: {source: requestBody}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_operation
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - {$ref: '#/components/parameters/OperationRefHeader'}
+        - {$ref: '#/components/parameters/RequestDigestHeader'}
+        - {$ref: '#/components/parameters/JobUidHeader'}
+        - {$ref: '#/components/parameters/PodUidHeader'}
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceInvokeRequest'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceFrame'}
       responses:
         '202':
-          description: Invocation accepted by the workspace sidecar.
-          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperation'}}}
+          description: New opaque frame persisted before dispatch.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperationSnapshot'}}}
+        '200':
+          description: Stable operation replay without redispatch.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperationSnapshot'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
         '413': *Error413
+        '415': *Error415
         '422': *Error422
-        '429': *Error429
         '500': *Error500
         '503': *Error503
         '504': *Error504
   /api/v2/jobs/{jobRef}/operations/{operationRef}:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
-      - $ref: '#/components/parameters/OperationRef'
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/OperationRef'}
     get:
       tags: [Workspace]
       operationId: inspectWorkspaceOperation
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
+        GONE: {status: 410, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       responses:
         '200':
-          description: Current operation state and bounded output.
-          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperation'}}}
-        '401': *Error401
-        '403': *Error403
-        '404': *Error404
-        '410': *Error410
-        '500': *Error500
-        '503': *Error503
-  /api/v2/jobs/{jobRef}/finalize:
-    parameters:
-      - $ref: '#/components/parameters/JobRef'
-    post:
-      tags: [Jobs]
-      operationId: finalizeJob
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/FinalizeJobRequest'}}}
-      responses:
-        '200':
-          description: Successful provider work quiesced; terminal reality retained.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+          description: Durable operation and bounded result reality.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceOperationSnapshot'}}}
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
+        '410':
+          description: Workspace operation state is no longer retained.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '500': *Error500
+        '503': *Error503
+  /api/v2/jobs/{jobRef}/finalize:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Jobs]
+      operationId: finalizeJob
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-provider-only-quiesce: true
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: finalizeRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FinalizeJobRequest'}
+      responses:
+        '202':
+          description: Provider-only quiesce accepted; no research success is inferred.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+        '200': *JobReplay
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '415': *Error415
+        '422': *Error422
         '500': *Error500
         '503': *Error503
         '504': *Error504
   /api/v2/jobs/{jobRef}/cancel:
     parameters:
-      - $ref: '#/components/parameters/JobRef'
+      - {$ref: '#/components/parameters/JobRef'}
     post:
       tags: [Jobs]
       operationId: cancelJob
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: cancelRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/CancelJobRequest'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CancelJobRequest'}
       responses:
-        '200':
-          description: Provider work interrupted; outputs may be incomplete or lost.
-          content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}
+        '202':
+          description: Interruption accepted; possible output loss is reported in the snapshot.
+          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+        '200': *JobReplay
+        '400': *Error400
         '401': *Error401
         '403': *Error403
         '404': *Error404
         '409': *Error409
+        '415': *Error415
+        '422': *Error422
         '500': *Error500
         '503': *Error503
         '504': *Error504
@@ -446,9 +973,19 @@ paths:
     get:
       tags: [Contract]
       operationId: getCanonicalOpenApi
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+      x-kcs-cache-control: no-store
       responses:
         '200':
-          description: Canonical OpenAPI 3.1 document.
+          description: Exact committed compact canonical OpenAPI JSON artifact.
+          headers:
+            ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.0.0}}
+            Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OpenApiDocument'}
@@ -457,65 +994,58 @@ paths:
         '500': *Error500
 components:
   securitySchemes:
-    serviceBearer:
+    v2ServiceBearer:
       type: http
       scheme: bearer
       bearerFormat: opaque service token
-      description: Fail-closed token from KCS_V2_SERVICE_TOKEN over TLS/private ingress.
+      description: >-
+        Fail-closed KCS_V2_SERVICE_TOKEN over TLS; credential bytes are further
+        restricted to the private ingress and credential-writer authorization role.
   parameters:
-    IdempotencyKey:
-      name: Idempotency-Key
-      in: header
-      required: true
-      schema: {$ref: '#/components/schemas/ActionId'}
-    JobRef:
-      name: jobRef
-      in: path
-      required: true
-      schema: {$ref: '#/components/schemas/ResourceId'}
-    CredentialGrantRef:
-      name: credentialGrantRef
-      in: path
-      required: true
-      schema: {$ref: '#/components/schemas/ResourceId'}
-    TransferRef:
-      name: transferRef
-      in: path
-      required: true
-      schema: {$ref: '#/components/schemas/ResourceId'}
-    OperationRef:
-      name: operationRef
-      in: path
-      required: true
-      schema: {$ref: '#/components/schemas/ResourceId'}
-    Container:
-      name: container
+    JobRef: {name: jobRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    CredentialGrantRef: {name: credentialGrantRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    TransferRef: {name: transferRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    OperationRef: {name: operationRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    Container: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace]}}
+    Cursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
+    LogLimit: {name: limitBytes, in: query, schema: {type: integer, minimum: 1, maximum: 1048576, default: 65536}}
+    PageToken: {name: pageToken, in: query, schema: {$ref: '#/components/schemas/OpaquePageToken'}}
+    PageSize: {name: pageSize, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+    ProviderRequestIdFilter: {name: providerRequestId, in: query, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    SubjectRefFilter: {name: subjectRef, in: query, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    StateFilter:
+      name: state
       in: query
-      required: true
-      schema: {type: string, enum: [agent, workspace]}
-    Cursor:
-      name: cursor
-      in: query
-      schema: {type: string}
-    PageToken:
-      name: page_token
-      in: query
-      schema: {type: string}
-    PageSize:
-      name: page_size
-      in: query
-      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
-    LogLimit:
-      name: limitBytes
-      in: query
-      schema: {type: integer, minimum: 1, maximum: 1048576, default: 65536}
+      style: form
+      explode: true
+      schema: {type: array, items: {$ref: '#/components/schemas/JobBindingState'}}
+    CreatedAfterFilter: {name: createdAfter, in: query, schema: {$ref: '#/components/schemas/Timestamp'}}
+    IncludeDeletedFilter: {name: includeDeleted, in: query, schema: {type: boolean, default: false}}
+    DeleteRefHeader: {name: KCS-Delete-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    DiscardRefHeader: {name: KCS-Discard-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    RequestDigestHeader: {name: KCS-Request-Digest, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    CredentialGrantRefHeader: {name: KCS-Credential-Grant-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    CredentialSha256Header: {name: KCS-Credential-SHA256, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    GrantMetadataDigestHeader: {name: KCS-Grant-Metadata-Digest, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    AgentRunRefHeader: {name: KCS-Agent-Run-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    GenerationHeader: {name: KCS-Generation, in: header, required: true, schema: {type: integer, minimum: 1}}
+    LaunchBundleDigestHeader: {name: KCS-Launch-Bundle-Digest, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    AudienceHeader: {name: KCS-Audience, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    JobUidHeader: {name: KCS-Job-UID, in: header, required: true, schema: {$ref: '#/components/schemas/KubernetesUid'}}
+    PodUidHeader: {name: KCS-Pod-UID, in: header, required: true, schema: {$ref: '#/components/schemas/KubernetesUid'}}
+    CredentialTtlHeader: {name: KCS-Credential-TTL-Seconds, in: header, required: true, schema: {type: integer, minimum: 1, maximum: 900}}
+    ContentSha256Header: {name: KCS-Content-SHA256, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    ContentLengthHeader: {name: Content-Length, in: header, required: true, schema: {type: integer, minimum: 0, maximum: 107374182400}}
+    OperationRefHeader: {name: KCS-Operation-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
   responses:
     BadRequest: *Error400
     Unauthorized: *Error401
     Forbidden: *Error403
     NotFound: *Error404
-    Gone: *Error410
     Conflict: *Error409
+    Gone:
+      description: Resource is no longer retained.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
     TooLarge: *Error413
     UnsupportedMediaType: *Error415
     Unprocessable: *Error422
@@ -524,22 +1054,41 @@ components:
     Unavailable: *Error503
     Timeout: *Error504
   schemas:
-    ResourceId:
-      $ref: '#/components/schemas/OpaqueRef'
-    ActionId:
-      $ref: '#/components/schemas/OpaqueRef'
     OpaqueRef:
       type: string
       minLength: 1
       maxLength: 256
       pattern: '^[^\u0000-\u001f\u007f]+$'
       x-kcs-maxUtf8Bytes: 256
-    Sha256:
+    OpaqueCursor:
       type: string
-      pattern: '^[0-9a-f]{64}$'
-    Timestamp:
+      minLength: 1
+      maxLength: 4096
+      pattern: '^[A-Za-z0-9_-]+$'
+      x-kcs-maxUtf8Bytes: 4096
+      description: Opaque base64url cursor bound to namespace, job, immutable Pod UID, and role.
+    OpaquePageToken:
       type: string
-      format: date-time
+      minLength: 1
+      maxLength: 4096
+      pattern: '^[A-Za-z0-9_-]+$'
+      x-kcs-maxUtf8Bytes: 4096
+      description: Opaque base64url token bound to namespace and the complete filter set.
+    Sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    KubernetesUid: {type: string, format: uuid}
+    Timestamp: {type: string, format: date-time}
+    NullableTimestamp:
+      oneOf: [{$ref: '#/components/schemas/Timestamp'}, {type: 'null'}]
+    NullableString:
+      oneOf: [{type: string}, {type: 'null'}]
+    NullableInteger:
+      oneOf: [{type: integer}, {type: 'null'}]
+    NullableBoolean:
+      oneOf: [{type: boolean}, {type: 'null'}]
+    NullableOpaqueRef:
+      oneOf: [{$ref: '#/components/schemas/OpaqueRef'}, {type: 'null'}]
+    NullableSha256:
+      oneOf: [{$ref: '#/components/schemas/Sha256'}, {type: 'null'}]
     Environment:
       type: object
       maxProperties: 32
@@ -552,208 +1101,525 @@ components:
         type: string
         maxLength: 2048
         x-kcs-maxUtf8Bytes: 2048
+        format: kcs-non-secret-runtime-value
+      x-kcs-secret-value-policy: reject-secret-shaped-values
+    NodeSelector:
+      type: object
+      additionalProperties: false
+      required: [researchcosmos.io/pool]
+      properties:
+        researchcosmos.io/pool: {type: string, const: gpu}
     AgentResources:
       type: object
       additionalProperties: false
       properties:
-        cpu_millicores: {type: integer, minimum: 1, maximum: 8000, default: 1000}
-        memory_mib: {type: integer, minimum: 1, maximum: 32768, default: 2048}
-        gpu: {type: integer, minimum: 0, maximum: 0, default: 0}
+        cpuMillis: {type: integer, minimum: 1, maximum: 8000, default: 1000}
+        memoryMiB: {type: integer, minimum: 1, maximum: 32768, default: 2048}
     WorkspaceResources:
       type: object
       additionalProperties: false
       properties:
-        cpu_millicores: {type: integer, minimum: 1, maximum: 64000, default: 2000}
-        memory_mib: {type: integer, minimum: 1, maximum: 262144, default: 8192}
+        cpuMillis: {type: integer, minimum: 1, maximum: 64000, default: 2000}
+        memoryMiB: {type: integer, minimum: 1, maximum: 262144, default: 8192}
         gpu: {type: integer, minimum: 0, maximum: 8, default: 0}
-        storage_gib: {type: integer, minimum: 1, maximum: 100, default: 20}
     AgentSpec:
       type: object
       additionalProperties: false
-      required: [image]
+      required: [image, command]
       properties:
-        image:
-          type: string
-          pattern: '^.+@sha256:[0-9a-f]{64}$'
-        env: {$ref: '#/components/schemas/Environment'}
+        image: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        command: {type: array, const: [/opt/kcs/agent-supervisor]}
         resources: {$ref: '#/components/schemas/AgentResources'}
+        runtimeEnv: {$ref: '#/components/schemas/Environment'}
     WorkspaceSpec:
       type: object
       additionalProperties: false
-      required: [image]
+      required: [image, command]
       properties:
-        image:
-          type: string
-          pattern: '^.+@sha256:[0-9a-f]{64}$'
-        env: {$ref: '#/components/schemas/Environment'}
+        image: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        command: {type: array, const: [/opt/kcs/workspace-sidecar]}
         resources: {$ref: '#/components/schemas/WorkspaceResources'}
+        runtimeEnv: {$ref: '#/components/schemas/Environment'}
+    SharedWorkspaceSpec:
+      type: object
+      additionalProperties: false
+      required: [kind, mountPath, sizeLimitGiB]
+      properties:
+        kind: {type: string, const: ephemeral}
+        mountPath: {type: string, const: /workspace}
+        sizeLimitGiB: {type: integer, minimum: 1, maximum: 100, default: 20}
     JobSpec:
       type: object
       additionalProperties: false
-      required: [providerRequestId, agent, workspace]
+      x-kcs-default-semantics: omission-is-distinct
+      required: [subjectRef, runtimePlanDigest, agent, workspace, sharedWorkspace, nodeSelector, activeDeadlineSeconds]
       properties:
-        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
         agent: {$ref: '#/components/schemas/AgentSpec'}
         workspace: {$ref: '#/components/schemas/WorkspaceSpec'}
+        sharedWorkspace: {$ref: '#/components/schemas/SharedWorkspaceSpec'}
+        nodeSelector: {$ref: '#/components/schemas/NodeSelector'}
+        activeDeadlineSeconds: {type: integer, minimum: 1, maximum: 86400, default: 21600}
     CreateJobRequest:
       type: object
       additionalProperties: false
-      required: [spec]
+      required: [providerRequestId, specDigest, spec]
       properties:
-        spec: {$ref: '#/components/schemas/JobSpec'}
-        deadlineSeconds: {type: integer, minimum: 1, maximum: 86400, default: 21600}
-    Job:
-      type: object
-      additionalProperties: false
-      required: [jobRef, state, specDigest, createdAt]
-      properties:
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        state:
-          type: string
-          enum: [provisioning, running, finalizing, succeeded, failed, canceling, canceled, indeterminate, deleted]
+        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
         specDigest: {$ref: '#/components/schemas/Sha256'}
-        createdAt: {$ref: '#/components/schemas/Timestamp'}
-        updatedAt: {$ref: '#/components/schemas/Timestamp'}
-        podUid:
-          oneOf:
-            - {type: string, format: uuid}
-            - {type: 'null'}
-        provisioningMessage:
-          oneOf:
-            - {type: string}
-            - {type: 'null'}
-        outputLossPossible: {type: boolean, default: false}
-        tombstoneExpiresAt:
-          oneOf:
-            - {$ref: '#/components/schemas/Timestamp'}
-            - {type: 'null'}
-    JobList:
+        spec: {$ref: '#/components/schemas/JobSpec'}
+    JobBindingState: {type: string, enum: [provisioning, bound, running, finalizing, succeeded, failed, canceling, canceled, indeterminate, deleting, deleted]}
+    ProviderTerminalState: {type: string, enum: [succeeded, failed, canceled, indeterminate]}
+    RoleState: {type: string, enum: [waiting, running, terminated, unknown, indeterminate]}
+    RunnerState: {type: string, enum: [not_started, accepted, starting, running, exited, failed, indeterminate]}
+    CredentialState: {type: string, enum: [accepted, available, acknowledged, consumed, destroyed, expired, revoked, destroy_failed, indeterminate]}
+    TransferState: {type: string, enum: [registered, staging, available, streaming, completed, canceling, canceled, discarded, failed, indeterminate]}
+    OperationState: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
+    ActionState: {type: string, enum: [not_requested, accepted, running, succeeded, failed, indeterminate]}
+    CleanupState: {type: string, enum: [not_required, pending, complete, failed, indeterminate]}
+    RequestedResources:
       type: object
       additionalProperties: false
-      required: [items]
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Job'}}
-        nextPageToken:
-          oneOf:
-            - {type: string}
-            - {type: 'null'}
-    RoleLogs:
+        cpuMillis: {type: integer, minimum: 0}
+        memoryMiB: {type: integer, minimum: 0}
+        gpu: {type: integer, minimum: 0}
+        storageGiB: {type: integer, minimum: 0}
+    ObservedResources:
       type: object
       additionalProperties: false
-      description: stdout and stderr share the requested limitBytes budget.
-      x-kcs-combinedUtf8Bytes: 1048576
-      x-kcs-combinedUtf8Properties: [stdout, stderr]
-      required: [jobRef, container, stdout, stderr, truncated]
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        container: {type: string, enum: [agent, workspace]}
-        stdout: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
-        stderr: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
-        truncated: {type: boolean}
-    CredentialGrantRequest:
+        cpuMillis: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        memoryMiB: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        gpu: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        storageGiB: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+    AgentRequestedResources:
       type: object
       additionalProperties: false
-      required: [credential, credentialSha256]
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        credential:
-          type: string
-          contentEncoding: base64
-          maxLength: 87384
-          x-kcs-maxDecodedBytes: 65536
-        credentialSha256: {$ref: '#/components/schemas/Sha256'}
-        ttlSeconds: {type: integer, minimum: 1, maximum: 900, default: 300}
-    CredentialGrant:
+        cpuMillis: {type: integer, minimum: 0, maximum: 8000}
+        memoryMiB: {type: integer, minimum: 0, maximum: 32768}
+        gpu: {type: integer, const: 0}
+        storageGiB: {type: integer, minimum: 0, maximum: 100}
+    AgentObservedResources:
       type: object
       additionalProperties: false
-      required: [credentialGrantRef, jobRef, state, expiresAt]
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        credentialGrantRef: {$ref: '#/components/schemas/ResourceId'}
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        state: {type: string, enum: [pending, projected, acknowledged, deletion_failed, expired]}
-        mountPath: {type: string, const: /var/run/kcs/credential}
-        expiresAt: {$ref: '#/components/schemas/Timestamp'}
-        deletionError:
-          oneOf:
-            - {type: string}
-            - {type: 'null'}
+        cpuMillis: {oneOf: [{type: integer, minimum: 0, maximum: 8000}, {type: 'null'}]}
+        memoryMiB: {oneOf: [{type: integer, minimum: 0, maximum: 32768}, {type: 'null'}]}
+        gpu: {oneOf: [{type: integer, const: 0}, {type: 'null'}]}
+        storageGiB: {oneOf: [{type: integer, minimum: 0, maximum: 100}, {type: 'null'}]}
+    WorkspaceRequestedResources:
+      type: object
+      additionalProperties: false
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
+      properties:
+        cpuMillis: {type: integer, minimum: 0, maximum: 64000}
+        memoryMiB: {type: integer, minimum: 0, maximum: 262144}
+        gpu: {type: integer, minimum: 0, maximum: 8}
+        storageGiB: {type: integer, minimum: 0, maximum: 100}
+    WorkspaceObservedResources:
+      type: object
+      additionalProperties: false
+      required: [cpuMillis, memoryMiB, gpu, storageGiB]
+      properties:
+        cpuMillis: {oneOf: [{type: integer, minimum: 0, maximum: 64000}, {type: 'null'}]}
+        memoryMiB: {oneOf: [{type: integer, minimum: 0, maximum: 262144}, {type: 'null'}]}
+        gpu: {oneOf: [{type: integer, minimum: 0, maximum: 8}, {type: 'null'}]}
+        storageGiB: {oneOf: [{type: integer, minimum: 0, maximum: 100}, {type: 'null'}]}
+    RoleSnapshot:
+      type: object
+      additionalProperties: false
+      required: [containerId, imageId, state, ready, restartCount, exitCode, reason, startedAt, finishedAt, requested, observed]
+      properties:
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        imageId: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/RoleState'}
+        ready: {type: boolean}
+        restartCount: {type: integer, minimum: 0}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        requested: {$ref: '#/components/schemas/RequestedResources'}
+        observed: {$ref: '#/components/schemas/ObservedResources'}
+    AgentRoleSnapshot:
+      type: object
+      additionalProperties: false
+      required: [containerId, imageId, state, ready, restartCount, exitCode, reason, startedAt, finishedAt, requested, observed]
+      properties:
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        imageId: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/RoleState'}
+        ready: {type: boolean}
+        restartCount: {type: integer, minimum: 0}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        requested: {$ref: '#/components/schemas/AgentRequestedResources'}
+        observed: {$ref: '#/components/schemas/AgentObservedResources'}
+    WorkspaceRoleSnapshot:
+      type: object
+      additionalProperties: false
+      required: [containerId, imageId, state, ready, restartCount, exitCode, reason, startedAt, finishedAt, requested, observed]
+      properties:
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        imageId: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/RoleState'}
+        ready: {type: boolean}
+        restartCount: {type: integer, minimum: 0}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        requested: {$ref: '#/components/schemas/WorkspaceRequestedResources'}
+        observed: {$ref: '#/components/schemas/WorkspaceObservedResources'}
+    BindingIdentity:
+      type: object
+      additionalProperties: false
+      required: [jobUid, podUid]
+      properties:
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+    GenerationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, generation, agentRunRef, executionEnvelopeRef, executionEnvelopeDigest, launchBundlePath, launchBundleDigest, launchBundleSizeBytes, materialPaths, credentialGrantRef, startMetadataDigest, runnerState, supervisorAlive, pid, exitCode, startedAt, finishedAt, observedAt, replayed, credentialAcknowledgedAt, credentialDestroyedAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        executionEnvelopeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        executionEnvelopeDigest: {$ref: '#/components/schemas/Sha256'}
+        launchBundlePath: {$ref: '#/components/schemas/SafeRelativePath'}
+        launchBundleDigest: {$ref: '#/components/schemas/Sha256'}
+        launchBundleSizeBytes: {type: integer, minimum: 0, maximum: 1048576}
+        materialPaths: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        startMetadataDigest: {$ref: '#/components/schemas/Sha256'}
+        runnerState: {$ref: '#/components/schemas/RunnerState'}
+        supervisorAlive: {type: boolean}
+        pid: {$ref: '#/components/schemas/NullableInteger'}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        replayed: {type: boolean}
+        credentialAcknowledgedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        credentialDestroyedAt: {$ref: '#/components/schemas/NullableTimestamp'}
     AgentStartRequest:
       type: object
       additionalProperties: false
-      required: [launch, launchSha256]
+      required: [executionEnvelopeRef, executionEnvelopeDigest, agentRunRef, generation, launchBundlePath, launchBundleDigest, launchBundleSizeBytes, materialPaths, credentialGrantRef]
       properties:
-        launch: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
-        launchSha256: {$ref: '#/components/schemas/Sha256'}
-    AgentStartResponse:
+        executionEnvelopeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        executionEnvelopeDigest: {$ref: '#/components/schemas/Sha256'}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        launchBundlePath: {$ref: '#/components/schemas/SafeRelativePath'}
+        launchBundleDigest: {$ref: '#/components/schemas/Sha256'}
+        launchBundleSizeBytes: {type: integer, minimum: 0, maximum: 1048576}
+        materialPaths: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+    ActionSnapshot:
       type: object
       additionalProperties: false
-      required: [jobRef, accepted]
+      required: [actionRef, requestDigest, state, observedAt]
       properties:
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        accepted: {type: boolean, const: true}
+        actionRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/NullableSha256'}
+        state: {$ref: '#/components/schemas/ActionState'}
+        observedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+    CleanupObservation:
+      type: object
+      additionalProperties: false
+      required: [state, reason, observedAt]
+      properties:
+        state: {$ref: '#/components/schemas/CleanupState'}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+    CredentialObservation:
+      type: object
+      additionalProperties: false
+      required: [credentialGrantRef, state, secretPresent, observedAt]
+      properties:
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        state: {$ref: '#/components/schemas/CredentialState'}
+        secretPresent: {$ref: '#/components/schemas/NullableBoolean'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    TransferObservation:
+      type: object
+      additionalProperties: false
+      required: [transferRef, state, observedAt]
+      properties:
+        transferRef: {$ref: '#/components/schemas/OpaqueRef'}
+        state: {$ref: '#/components/schemas/TransferState'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    JobBindingSnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, createdAt, updatedAt, startedAt, finishedAt, observedAt, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        providerHandle: {$ref: '#/components/schemas/OpaqueRef'}
+        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid:
+          oneOf: [{$ref: '#/components/schemas/KubernetesUid'}, {type: 'null'}]
+        resourceVersion: {$ref: '#/components/schemas/NullableString'}
+        nodeName: {$ref: '#/components/schemas/NullableString'}
+        bindingState: {$ref: '#/components/schemas/JobBindingState'}
+        bindingReason: {$ref: '#/components/schemas/NullableString'}
+        observedPodCount: {type: integer, minimum: 0}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        updatedAt: {$ref: '#/components/schemas/Timestamp'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        agent:
+          oneOf: [{$ref: '#/components/schemas/AgentRoleSnapshot'}, {type: 'null'}]
+        workspace:
+          oneOf: [{$ref: '#/components/schemas/WorkspaceRoleSnapshot'}, {type: 'null'}]
+        latestAgentGeneration:
+          oneOf: [{$ref: '#/components/schemas/GenerationSnapshot'}, {type: 'null'}]
+        activeOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        terminalOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        credentialObservations: {type: array, items: {$ref: '#/components/schemas/CredentialObservation'}}
+        transferObservations: {type: array, items: {$ref: '#/components/schemas/TransferObservation'}}
+        finalizeAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        cancelAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        deleteAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        outputLossPossible: {type: boolean}
+        cleanup: {$ref: '#/components/schemas/CleanupObservation'}
+        gpuRelease: {$ref: '#/components/schemas/CleanupObservation'}
+    JobBindingSnapshotList:
+      type: object
+      additionalProperties: false
+      x-kcs-combinedMaxItems: {limit: 200, properties: [items, tombstones]}
+      required: [items, tombstones, nextPageToken, observedAt]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/JobBindingSnapshot'}}
+        tombstones: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/JobTombstone'}}
+        nextPageToken:
+          oneOf: [{$ref: '#/components/schemas/OpaquePageToken'}, {type: 'null'}]
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    RoleLogs:
+      type: object
+      additionalProperties: false
+      required: [jobRef, jobUid, podUid, container, inputCursor, startCursor, nextCursor, content, truncated, terminal, containerId, observedAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        container: {type: string, enum: [agent, workspace]}
+        inputCursor:
+          oneOf: [{$ref: '#/components/schemas/OpaqueCursor'}, {type: 'null'}]
+        startCursor: {$ref: '#/components/schemas/OpaqueCursor'}
+        nextCursor:
+          oneOf: [{$ref: '#/components/schemas/OpaqueCursor'}, {type: 'null'}]
+        content: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
+        truncated: {type: boolean}
+        terminal: {type: boolean}
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    CredentialGrantSnapshot:
+      type: object
+      additionalProperties: false
+      required: [credentialGrantRef, credentialSha256, grantMetadataDigest, agentRunRef, generation, launchBundleDigest, audience, ttlSeconds, jobRef, jobUid, podUid, state, acceptedAt, availableAt, acknowledgedAt, ackAgentRunRef, ackGeneration, consumedAt, destroyedAt, expiresAt, tombstoneExpiresAt, secretPresent, destroyFailureReason, observedAt]
+      properties:
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        credentialSha256: {$ref: '#/components/schemas/Sha256'}
+        grantMetadataDigest: {$ref: '#/components/schemas/Sha256'}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        launchBundleDigest: {$ref: '#/components/schemas/Sha256'}
+        audience: {$ref: '#/components/schemas/OpaqueRef'}
+        ttlSeconds: {type: integer, minimum: 1, maximum: 900}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        state: {$ref: '#/components/schemas/CredentialState'}
+        acceptedAt: {$ref: '#/components/schemas/Timestamp'}
+        availableAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        acknowledgedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        ackAgentRunRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        ackGeneration:
+          oneOf: [{type: integer, minimum: 1}, {type: 'null'}]
+        consumedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        destroyedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        tombstoneExpiresAt: {$ref: '#/components/schemas/Timestamp'}
+        secretPresent: {$ref: '#/components/schemas/NullableBoolean'}
+        destroyFailureReason: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    SafeRelativePath:
+      type: string
+      minLength: 1
+      format: kcs-relative-posix-path
+      description: Normalized relative POSIX path with no empty, dot, dot-dot, control, symlink, case, or normalization ambiguity.
+    TransferSpec:
+      type: object
+      additionalProperties: false
+      x-kcs-relations:
+        - {left: declaredSizeBytes, operator: '<=', right: authorizedMaxSizeBytes}
+      required: [direction, path, declaredSizeBytes, authorizedMaxSizeBytes, contentSha256, mode, overwritePolicy]
+      properties:
+        direction: {type: string, enum: [stage_input, collect_output]}
+        path: {$ref: '#/components/schemas/SafeRelativePath'}
+        declaredSizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
+        authorizedMaxSizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
+        contentSha256: {$ref: '#/components/schemas/Sha256'}
+        mode: {type: string, const: direct}
+        overwritePolicy: {type: string, enum: [forbid, replace_authorized]}
     TransferRegisterRequest:
       type: object
       additionalProperties: false
-      required: [direction, path, sizeBytes, contentSha256]
+      required: [transferRef, requestDigest, spec]
       properties:
-        direction: {type: string, enum: [stage, collect]}
-        path: {type: string, minLength: 1, pattern: '^/workspace(?:/.*)?$'}
-        sizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
-        contentSha256: {$ref: '#/components/schemas/Sha256'}
-        mode: {type: string, const: direct}
-    Transfer:
+        transferRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/TransferSpec'}
+    TransferCancelSpec:
       type: object
       additionalProperties: false
-      required: [transferRef, jobRef, direction, state, sizeBytes, contentSha256]
       properties:
-        transferRef: {$ref: '#/components/schemas/ResourceId'}
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        direction: {type: string, enum: [stage, collect]}
-        state: {type: string, enum: [registered, staging, available, streaming, completed, canceling, canceled, discarded, failed]}
-        sizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
-        contentSha256: {$ref: '#/components/schemas/Sha256'}
-        verified: {type: boolean}
+        reason: {$ref: '#/components/schemas/OpaqueRef'}
     TransferCancelRequest:
       type: object
       additionalProperties: false
+      required: [cancelRef, requestDigest, spec]
       properties:
-        reason: {$ref: '#/components/schemas/OpaqueRef'}
-    WorkspaceInvokeRequest:
+        cancelRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/TransferCancelSpec'}
+    TransferSnapshot:
       type: object
       additionalProperties: false
-      required: [method, spec, specDigest]
+      required: [transferRef, requestDigest, jobRef, jobUid, podUid, spec, state, actualSizeBytes, actualSha256, verified, contentAvailable, snapshotRef, createdAt, updatedAt, completedAt, observedAt, failureReason, cancelAction, discardAction]
       properties:
-        method: {$ref: '#/components/schemas/OpaqueRef'}
-        spec: {type: object}
-        specDigest: {$ref: '#/components/schemas/Sha256'}
-    WorkspaceOperation:
+        transferRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        spec: {$ref: '#/components/schemas/TransferSpec'}
+        state: {$ref: '#/components/schemas/TransferState'}
+        actualSizeBytes:
+          oneOf: [{type: integer, minimum: 0, maximum: 107374182400}, {type: 'null'}]
+        actualSha256: {$ref: '#/components/schemas/NullableSha256'}
+        verified: {type: boolean}
+        contentAvailable: {type: boolean}
+        snapshotRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        updatedAt: {$ref: '#/components/schemas/Timestamp'}
+        completedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        failureReason: {$ref: '#/components/schemas/NullableString'}
+        cancelAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        discardAction: {$ref: '#/components/schemas/ActionSnapshot'}
+    WorkspaceFrame:
+      type: object
+      required: [protocol]
+      properties:
+        protocol: {type: string, const: cosmos.workspace/1}
+      additionalProperties: true
+      x-kcs-forward-unchanged: true
+      x-kcs-maxCanonicalBytes: 1048576
+    WorkspaceOperationSnapshot:
       type: object
       additionalProperties: false
-      required: [operationRef, jobRef, state]
+      required: [operationRef, requestDigest, storedFrameDigest, binding, state, exitCode, stdout, stderr, stdoutTruncated, stderrTruncated, inlineResultSize, inlineResultDigest, inlineResult, resultTransferRef, acceptedAt, startedAt, finishedAt, observedAt, failureReason]
       properties:
-        operationRef: {$ref: '#/components/schemas/ResourceId'}
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
-        state: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
+        operationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        storedFrameDigest: {$ref: '#/components/schemas/Sha256'}
+        binding: {$ref: '#/components/schemas/BindingIdentity'}
+        state: {$ref: '#/components/schemas/OperationState'}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
         stdout: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
         stderr: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
-        result: {type: object}
+        stdoutTruncated: {type: boolean}
+        stderrTruncated: {type: boolean}
+        inlineResultSize:
+          oneOf: [{type: integer, minimum: 0, maximum: 65536}, {type: 'null'}]
+        inlineResultDigest: {$ref: '#/components/schemas/NullableSha256'}
+        inlineResult:
+          oneOf: [{type: object, x-kcs-maxCanonicalBytes: 65536}, {type: 'null'}]
+        resultTransferRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        acceptedAt: {$ref: '#/components/schemas/Timestamp'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        failureReason: {$ref: '#/components/schemas/NullableString'}
+    FinalizeSpec:
+      type: object
+      additionalProperties: false
+      required: [operationRefs, transferRefs, drainTimeoutSeconds]
+      properties:
+        operationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        transferRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        drainTimeoutSeconds: {type: integer, minimum: 1, maximum: 86400}
     FinalizeJobRequest:
       type: object
       additionalProperties: false
+      required: [finalizeRef, requestDigest, spec]
       properties:
-        providerResultRef: {$ref: '#/components/schemas/OpaqueRef'}
+        finalizeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/FinalizeSpec'}
+    CancelSpec:
+      type: object
+      additionalProperties: false
+      required: [finishCollectTransferRefs]
+      properties:
+        finishCollectTransferRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        reason: {$ref: '#/components/schemas/OpaqueRef'}
     CancelJobRequest:
       type: object
       additionalProperties: false
+      required: [cancelRef, requestDigest, spec]
       properties:
-        reason: {$ref: '#/components/schemas/OpaqueRef'}
-    DeleteJobResponse:
+        cancelRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/CancelSpec'}
+    JobTombstone:
       type: object
       additionalProperties: false
-      required: [jobRef, state, tombstoneExpiresAt]
+      x-kcs-time-ordering: [createdAt, deletedAt, expiresAt]
+      required: [providerRequestId, specDigest, jobRef, jobUid, podUid, state, finalState, deleteRef, deleteRequestDigest, createdAt, cleanup, gpuRelease, credentialObservations, transferObservations, deletedAt, expiresAt]
       properties:
-        jobRef: {$ref: '#/components/schemas/ResourceId'}
+        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid:
+          oneOf: [{$ref: '#/components/schemas/KubernetesUid'}, {type: 'null'}]
         state: {type: string, const: deleted}
-        tombstoneExpiresAt: {$ref: '#/components/schemas/Timestamp'}
+        finalState: {$ref: '#/components/schemas/ProviderTerminalState'}
+        deleteRef: {$ref: '#/components/schemas/OpaqueRef'}
+        deleteRequestDigest: {$ref: '#/components/schemas/Sha256'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        cleanup: {$ref: '#/components/schemas/CleanupObservation'}
+        gpuRelease: {$ref: '#/components/schemas/CleanupObservation'}
+        credentialObservations: {type: array, items: {$ref: '#/components/schemas/CredentialObservation'}}
+        transferObservations: {type: array, items: {$ref: '#/components/schemas/TransferObservation'}}
+        deletedAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+    ErrorCode:
+      type: string
+      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
+    RecoveryAction:
+      type: string
+      enum: [retry_same, inspect_job, inspect_grant, inspect_transfer, inspect_operation, reconcile, new_attempt, none]
     ErrorDetail:
       type: object
       additionalProperties: false
@@ -761,6 +1627,15 @@ components:
       properties:
         field: {type: string}
         reason: {type: string}
+    ErrorContext:
+      type: object
+      additionalProperties: false
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        transferRef: {$ref: '#/components/schemas/OpaqueRef'}
+        operationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        tombstone: {$ref: '#/components/schemas/JobTombstone'}
     ErrorEnvelope:
       type: object
       additionalProperties: false
@@ -769,13 +1644,38 @@ components:
         error:
           type: object
           additionalProperties: false
-          required: [code, message, retryable, requestId]
+          required: [code, message, retryable, recoveryAction, requestId]
           properties:
-            code: {type: string, minLength: 1, pattern: '^[A-Z][A-Z0-9_]*$'}
+            code: {$ref: '#/components/schemas/ErrorCode'}
             message: {type: string, minLength: 1}
             retryable: {type: boolean}
-            requestId: {$ref: '#/components/schemas/ResourceId'}
+            recoveryAction: {$ref: '#/components/schemas/RecoveryAction'}
+            requestId: {$ref: '#/components/schemas/OpaqueRef'}
             details: {type: array, items: {$ref: '#/components/schemas/ErrorDetail'}}
+            context: {$ref: '#/components/schemas/ErrorContext'}
+    TombstonedErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable, recoveryAction, requestId, context]
+          properties:
+            code: {type: string, const: TOMBSTONED}
+            message: {type: string, minLength: 1}
+            retryable: {type: boolean, const: false}
+            recoveryAction: {type: string, const: inspect_job}
+            requestId: {$ref: '#/components/schemas/OpaqueRef'}
+            details: {type: array, items: {$ref: '#/components/schemas/ErrorDetail'}}
+            context:
+              type: object
+              additionalProperties: false
+              required: [tombstone]
+              properties:
+                jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+                tombstone: {$ref: '#/components/schemas/JobTombstone'}
     OpenApiDocument:
       type: object
       additionalProperties: true

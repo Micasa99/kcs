@@ -1,0 +1,59 @@
+{
+  "exchanges": [
+    {
+      "scenario": "transfer-stage",
+      "operationId": "registerTransfer",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/transfer-stage-request.json"},
+      "response": {"status": 201, "contentType": "application/json", "bodyFixture": "fixtures/transfer-stage.json"}
+    },
+    {
+      "scenario": "transfer-stage-content",
+      "operationId": "putTransferContent",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-stage-synthetic-001"},
+        "headers": {"KCS-Content-SHA256": "2d49c9bb35e58d1787a46337e19fe973bff9f332592af0bf2af412786c0eb254", "Content-Length": 22},
+        "contentType": "application/octet-stream",
+        "bodyFile": "fixtures/transfer-stage.bin"
+      },
+      "response": {"status": 200, "headers": {"Cache-Control": "no-store"}, "contentType": "application/json", "bodyFixture": "fixtures/transfer-stage-completed.json"}
+    },
+    {
+      "scenario": "transfer-collect",
+      "operationId": "registerTransfer",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/transfer-collect-request.json"},
+      "response": {"status": 201, "contentType": "application/json", "bodyFixture": "fixtures/transfer-collect.json"}
+    },
+    {
+      "scenario": "transfer-collect-content",
+      "operationId": "getTransferContent",
+      "request": {"path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-collect-synthetic-001"}},
+      "response": {
+        "status": 200,
+        "headers": {"Content-Length": 25, "X-Content-SHA256": "1935471030f117528cf66775ad964c979324cce9c15490a456f937d4bcfe724e", "X-KCS-Snapshot-Ref": "snapshot-collect-synthetic-001", "Cache-Control": "no-store"},
+        "contentType": "application/octet-stream",
+        "bodyFile": "fixtures/transfer-collect.bin"
+      }
+    },
+    {
+      "scenario": "transfer-cancel",
+      "operationId": "cancelTransfer",
+      "request": {"path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-stage-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/transfer-cancel-request.json"},
+      "response": {"status": 202, "contentType": "application/json", "bodyFixture": "fixtures/transfer-canceled.json"}
+    },
+    {
+      "scenario": "transfer-discard",
+      "operationId": "discardTransfer",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-stage-synthetic-001"},
+        "headers": {"KCS-Discard-Ref": "discard-synthetic-001", "KCS-Request-Digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}
+      },
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/transfer-discarded.json"}
+    },
+    {
+      "scenario": "transfer-restart",
+      "operationId": "inspectTransfer",
+      "request": {"path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-stage-synthetic-001"}},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/transfer-indeterminate.json"}
+    }
+  ]
+}

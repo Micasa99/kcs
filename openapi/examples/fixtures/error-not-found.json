@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "provider binding is unknown",
+    "retryable": false,
+    "recoveryAction": "none",
+    "requestId": "request-synthetic-not-found",
+    "context": {"jobRef": "missing-synthetic"}
+  }
+}

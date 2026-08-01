@@ -1,0 +1,29 @@
+{
+  "exchanges": [
+    {
+      "scenario": "start-new",
+      "operationId": "startAgent",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/agent-start-request.json"},
+      "response": {"status": 202, "contentType": "application/json", "bodyFixture": "fixtures/generation.json"}
+    },
+    {
+      "scenario": "start-replay",
+      "operationId": "startAgent",
+      "replayOf": "start-new",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/agent-start-request.json"},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/generation-replay.json"}
+    },
+    {
+      "scenario": "start-next-generation",
+      "operationId": "startAgent",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/agent-start-next-request.json"},
+      "response": {"status": 202, "contentType": "application/json", "bodyFixture": "fixtures/generation-next.json"}
+    },
+    {
+      "scenario": "start-pod-loss",
+      "operationId": "startAgent",
+      "request": {"path": {"jobRef": "job-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/agent-start-request.json"},
+      "response": {"status": 409, "contentType": "application/json", "bodyFixture": "fixtures/error-replacement-pod.json"}
+    }
+  ]
+}

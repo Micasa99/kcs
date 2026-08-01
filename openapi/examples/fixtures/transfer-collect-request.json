@@ -1,0 +1,13 @@
+{
+  "transferRef": "transfer-collect-synthetic-001",
+  "requestDigest": "98b25f46e36d26eac418c2f43f01977e28fbef11102242af9474163fe3c656fc",
+  "spec": {
+    "direction": "collect_output",
+    "path": "outputs/result.bin",
+    "declaredSizeBytes": 25,
+    "authorizedMaxSizeBytes": 2048,
+    "contentSha256": "1935471030f117528cf66775ad964c979324cce9c15490a456f937d4bcfe724e",
+    "mode": "direct",
+    "overwritePolicy": "forbid"
+  }
+}

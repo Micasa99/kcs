@@ -1,0 +1,5 @@
+{
+  "cancelRef": "transfer-cancel-synthetic-001",
+  "requestDigest": "3b32be230686e5f5064ec9c5a92b0522e34a0a44cb02ba433e1c242fb291e704",
+  "spec": {"reason": "provider-requested"}
+}

@@ -1,0 +1,11 @@
+{
+  "executionEnvelopeRef": "envelope-synthetic-002",
+  "executionEnvelopeDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "agentRunRef": "agent-run-synthetic-002",
+  "generation": 2,
+  "launchBundlePath": "runtime/launch-2.json",
+  "launchBundleDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "launchBundleSizeBytes": 768,
+  "materialPaths": ["runtime/prompt-2.txt", "runtime/tools-2.json"],
+  "credentialGrantRef": "grant-synthetic-002"
+}

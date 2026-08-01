@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "IDENTITY_CONFLICT",
+    "message": "stable identity is already bound to another digest",
+    "retryable": false,
+    "recoveryAction": "inspect_job",
+    "requestId": "request-synthetic-001",
+    "details": [{"field": "specDigest", "reason": "digest differs"}],
+    "context": {"jobRef": "job-synthetic-001"}
+  }
+}

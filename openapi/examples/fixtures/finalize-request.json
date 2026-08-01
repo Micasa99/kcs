@@ -1,0 +1,5 @@
+{
+  "finalizeRef": "finalize-synthetic-001",
+  "requestDigest": "4987a939c1d4a813b6ba372d12ded252ccca650d40ac89222c430e3c305e1a80",
+  "spec": {"operationRefs": ["operation-synthetic-001"], "transferRefs": ["transfer-collect-synthetic-001"], "drainTimeoutSeconds": 300}
+}
