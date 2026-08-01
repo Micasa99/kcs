@@ -215,7 +215,10 @@ def _create_v2_app(
 
     async def reconcile_loop() -> None:
         while not reconcile_stop.is_set():
-            provider.reconcile_credentials()
+            try:
+                await asyncio.to_thread(provider.reconcile_credentials)
+            except Exception:
+                log.warning("V2 credential reconciliation failed; retrying", exc_info=True)
             try:
                 await asyncio.wait_for(reconcile_stop.wait(), timeout=30)
             except TimeoutError:
@@ -223,7 +226,7 @@ def _create_v2_app(
 
     @app.on_event("startup")
     async def start_reconciliation() -> None:
-        provider.reconcile_credentials()
+        await asyncio.to_thread(provider.reconcile_credentials)
         app.state.kcs_reconcile_task = asyncio.create_task(reconcile_loop())
 
     @app.on_event("shutdown")

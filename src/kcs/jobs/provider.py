@@ -527,6 +527,8 @@ class V2JobProvider:
                 is not RunnerState.ACCEPTED
             ):
                 return self._generation_snapshot(existing, replayed=True)
+            values = _runtime_values(existing)
+            grant = None
         else:
             previous = self._latest_generation(job_ref)
             expected = 1 if previous is None else previous.generation + 1
@@ -537,19 +539,20 @@ class V2JobProvider:
                 )
             ):
                 raise IllegalGenerationError()
-        grant = self.inspect_credential_grant(job_ref, request.credential_grant_ref)
-        if grant.state is not CredentialState.AVAILABLE or self._now() >= grant.expires_at:
-            self._expire_grant_if_needed(grant)
-            raise CredentialExpiredError()
-        if (
-            grant.agent_run_ref != request.agent_run_ref
-            or grant.generation != request.generation
-            or grant.launch_bundle_digest != request.launch_bundle_digest
-            or str(grant.job_uid) != str(binding.job_uid)
-            or str(grant.pod_uid) != str(binding.pod_uid)
-        ):
-            raise StateConflictError("The credential grant is not bound to this start request")
-        values = self._generation_values(job_ref, request, digest, binding)
+        if existing is None:
+            grant = self.inspect_credential_grant(job_ref, request.credential_grant_ref)
+            if grant.state is not CredentialState.AVAILABLE or self._now() >= grant.expires_at:
+                self._expire_grant_if_needed(grant)
+                raise CredentialExpiredError()
+            if (
+                grant.agent_run_ref != request.agent_run_ref
+                or grant.generation != request.generation
+                or grant.launch_bundle_digest != request.launch_bundle_digest
+                or str(grant.job_uid) != str(binding.job_uid)
+                or str(grant.pod_uid) != str(binding.pod_uid)
+            ):
+                raise StateConflictError("The credential grant is not bound to this start request")
+            values = self._generation_values(job_ref, request, digest, binding, grant)
         if existing is None:
             record, created = self._store.reserve_runtime(
                 "generation", str(request.generation), job_ref, values
@@ -560,22 +563,27 @@ class V2JobProvider:
             record = existing
         if self._transport is None:
             raise DependencyUnavailableError("agent RPC transport is not configured")
-        rpc = self._agent_rpc(binding, request, grant)
+        audience = grant.audience if grant is not None else values["grantAudience"]
+        credential_sha = (
+            grant.credential_sha256 if grant is not None else values["credentialSha256"]
+        )
+        rpc = self._agent_rpc(binding, request, audience, credential_sha)
         if (
             rpc.protocol_version != 1
             or rpc.generation != request.generation
             or rpc.agent_run_ref != request.agent_run_ref
             or rpc.launch_bundle_digest != request.launch_bundle_digest
-            or rpc.credential_grant_ref != grant.credential_grant_ref
-            or rpc.audience != grant.audience
-            or rpc.credential_sha256 != grant.credential_sha256
+            or rpc.credential_grant_ref != request.credential_grant_ref
+            or rpc.audience != audience
+            or rpc.credential_sha256 != credential_sha
             or not rpc.credential_consumed
         ):
             raise StateConflictError(
                 "The supervisor acknowledgement does not match the start request"
             )
         now = self._now()
-        self._acknowledge_grant(grant, request, now)
+        if grant is not None:
+            self._acknowledge_grant(grant, request, now)
         state = RunnerState.EXITED if rpc.state == "exited" else RunnerState.RUNNING
         generation = self._generation_snapshot(record, replayed=False).model_copy(
             update={
@@ -588,8 +596,10 @@ class V2JobProvider:
                 "observed_at": now,
                 "credential_acknowledged_at": now,
                 "credential_destroyed_at": self.inspect_credential_grant(
-                    job_ref, grant.credential_grant_ref
-                ).destroyed_at,
+                    job_ref, request.credential_grant_ref
+                ).destroyed_at
+                if grant is not None
+                else now,
             }
         )
         self._store.update_runtime(
@@ -849,10 +859,13 @@ class V2JobProvider:
         return self._grant_snapshot(written)
 
     def _expire_grant_if_needed(self, grant: CredentialGrantSnapshot) -> None:
-        if self._now() < grant.expires_at or grant.state not in {
-            CredentialState.ACCEPTED,
-            CredentialState.AVAILABLE,
-        }:
+        retryable = grant.state in {
+            CredentialState.DESTROY_FAILED,
+            CredentialState.INDETERMINATE,
+            CredentialState.EXPIRED,
+        }
+        expired_live = self._now() >= grant.expires_at and grant.secret_present is not False
+        if not retryable and not expired_live:
             return
         record = self._store.read_runtime("credential", grant.job_ref, grant.credential_grant_ref)
         if record is None:
@@ -938,7 +951,12 @@ class V2JobProvider:
         }
 
     def _generation_values(
-        self, job_ref: str, request: AgentStartRequest, digest: str, binding: JobBindingSnapshot
+        self,
+        job_ref: str,
+        request: AgentStartRequest,
+        digest: str,
+        binding: JobBindingSnapshot,
+        grant: CredentialGrantSnapshot,
     ) -> dict[str, str]:
         now = self._now()
         snapshot = GenerationSnapshot(
@@ -968,6 +986,8 @@ class V2JobProvider:
             "identityDigest": digest,
             "jobUid": str(binding.job_uid),
             "podUid": str(binding.pod_uid),
+            "grantAudience": grant.audience,
+            "credentialSha256": grant.credential_sha256,
             "payload": snapshot.model_dump_json(by_alias=True),
         }
 
@@ -987,7 +1007,8 @@ class V2JobProvider:
         self,
         binding: JobBindingSnapshot,
         request: AgentStartRequest,
-        grant: CredentialGrantSnapshot,
+        audience: str,
+        credential_sha: str,
     ) -> AgentRpcResponse:
         if self._transport is None or binding.pod_uid is None:
             raise DependencyUnavailableError()
@@ -1008,8 +1029,8 @@ class V2JobProvider:
                 "launchBundleSizeBytes": request.launch_bundle_size_bytes,
                 "materialPaths": request.material_paths,
                 "credentialGrantRef": request.credential_grant_ref,
-                "audience": grant.audience,
-                "credentialSha256": grant.credential_sha256,
+                "audience": audience,
+                "credentialSha256": credential_sha,
             },
         )
 
