@@ -105,6 +105,11 @@ class VerifiedContent:
     size: int
     sha256: str
     snapshot_ref: str
+    confirm_delivery: Callable[[], None] | None = None
+
+    def confirm(self) -> None:
+        if self.confirm_delivery is not None:
+            self.confirm_delivery()
 
     def cleanup(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -278,13 +283,92 @@ class WorkspaceRuntime:
             completed = self._complete_transfer(record, snapshot, reply, snapshot_ref=snapshot_ref)
             if completed.snapshot_ref != snapshot_ref:
                 raise TransferBytesMismatchError()
-            return VerifiedContent(content, size, digest, snapshot_ref)
+
+            def confirm_delivery() -> None:
+                self.confirm_collect_delivery(job_ref, transfer_ref, snapshot_ref)
+
+            return VerifiedContent(
+                content,
+                size,
+                digest,
+                snapshot_ref,
+                confirm_delivery,
+            )
         except Exception:
             content.unlink(missing_ok=True)
             raise
 
     def inspect_transfer(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
         return self._transfer_snapshot(self._transfer_record(job_ref, transfer_ref))
+
+    def confirm_collect_delivery(
+        self, job_ref: str, transfer_ref: str, snapshot_ref: str
+    ) -> TransferSnapshot:
+        """Record that the verified direct response body finished leaving KCS."""
+        record = self._transfer_record(job_ref, transfer_ref)
+        snapshot = self._transfer_snapshot(record)
+        if (
+            snapshot.spec.direction is not TransferDirection.COLLECT_OUTPUT
+            or snapshot.state is not TransferState.COMPLETED
+            or snapshot.snapshot_ref != snapshot_ref
+        ):
+            raise StateConflictError("collect delivery confirmation does not match the snapshot")
+        values = _values(record)
+        retained = values.get("deliveryConfirmedSnapshotRef")
+        if retained is not None and retained != snapshot_ref:
+            raise TransferIdentityConflictError()
+        if retained == snapshot_ref:
+            return snapshot
+        self._store.update_runtime(
+            "transfer",
+            job_ref,
+            transfer_ref,
+            {
+                **values,
+                "deliveryConfirmedSnapshotRef": snapshot_ref,
+                "deliveryConfirmedAt": self._clock().isoformat(),
+            },
+        )
+        return snapshot
+
+    def drain_pre_authorized_collect(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
+        """Prove a named collect was delivered before cancel closed normal admission."""
+        record = self._transfer_record(job_ref, transfer_ref)
+        snapshot = self._transfer_snapshot(record)
+        if snapshot.spec.direction is not TransferDirection.COLLECT_OUTPUT:
+            raise StateConflictError("cancel may drain only pre-authorized collect transfers")
+        if snapshot.state not in {
+            TransferState.COMPLETED,
+            TransferState.INDETERMINATE,
+        }:
+            snapshot = self.reconcile_transfer(job_ref, transfer_ref)
+            record = self._transfer_record(job_ref, transfer_ref)
+        values = _values(record)
+        delivered = values.get("deliveryConfirmedSnapshotRef")
+        if (
+            snapshot.state is TransferState.COMPLETED
+            and snapshot.snapshot_ref is not None
+            and delivered == snapshot.snapshot_ref
+        ):
+            return snapshot
+        now = self._clock()
+        indeterminate = snapshot.model_copy(
+            update={
+                "state": TransferState.INDETERMINATE,
+                "content_available": False,
+                "updated_at": now,
+                "completed_at": snapshot.completed_at or now,
+                "observed_at": now,
+                "failure_reason": "cancel could not prove collect delivery before supervisor stop",
+            }
+        )
+        self._store.update_runtime(
+            "transfer",
+            job_ref,
+            transfer_ref,
+            {**values, "payload": indeterminate.model_dump_json(by_alias=True)},
+        )
+        raise TransferIndeterminateError()
 
     def cancel_transfer(
         self, job_ref: str, transfer_ref: str, request: TransferCancelRequest

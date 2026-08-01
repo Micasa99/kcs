@@ -28,6 +28,8 @@ from .contracts import (
     AgentRequestedResources,
     AgentRoleSnapshot,
     AgentStartRequest,
+    CancelJobRequest,
+    CancelSpec,
     CleanupObservation,
     CleanupState,
     CreateJobRequest,
@@ -43,6 +45,7 @@ from .contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    OperationState,
     ProviderTerminalState,
     RoleLogs,
     RoleState,
@@ -82,6 +85,7 @@ from .errors import (
     TombstonedError,
     TransferIndeterminateError,
 )
+from .lifecycle import ReconcileReport, action_snapshot, phase_payload, read_phase
 from .renderer import credential_secret_name
 from .transport import (
     AgentRpcResponse,
@@ -145,6 +149,8 @@ class V2KubeAdapterProtocol(Protocol):
 
     def create_secret(self, body: object) -> object: ...
 
+    def read_secret(self, name: str) -> object | None: ...
+
     def delete_secret(self, name: str) -> bool: ...
 
 
@@ -195,6 +201,10 @@ class V2JobStoreProtocol(Protocol):
         expected_resource_version: str,
     ) -> object | None: ...
 
+    def delete_runtime_records(self, job_ref: str) -> int: ...
+
+    def has_runtime_records(self, job_ref: str) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CreateResult:
@@ -211,6 +221,18 @@ class CreateResult:
 @dataclass(frozen=True, slots=True)
 class FinalizeResult:
     """A finalize snapshot plus the atomic slot reservation outcome."""
+
+    snapshot: JobBindingSnapshot
+    created: bool
+
+    @property
+    def replayed(self) -> bool:
+        return not self.created
+
+
+@dataclass(frozen=True, slots=True)
+class CancelResult:
+    """A cancel snapshot plus the durable slot reservation outcome."""
 
     snapshot: JobBindingSnapshot
     created: bool
@@ -266,6 +288,7 @@ class V2JobProvider:
         self._delete_poll_interval_seconds = delete_poll_interval_seconds
         self._sleeper = sleeper or time.sleep
         self._transport = transport
+        self._workspace_transport = workspace_transport
         self._workspace_runtime = WorkspaceRuntime(
             store,
             workspace_transport,
@@ -276,7 +299,7 @@ class V2JobProvider:
         self.reconcile_credentials()
 
     def reconcile_credentials(self) -> None:
-        """Run restart-safe TTL cleanup without depending on grant inspection."""
+        """Reconcile retained grant intent against namespace-bound Secret reality."""
         method = getattr(self._store, "list_runtime", None)
         if not callable(method):
             return
@@ -285,8 +308,112 @@ class V2JobProvider:
         except TypeError:
             return
         for record in records:
-            grant = self._grant_snapshot(record)
-            self._expire_grant_if_needed(grant)
+            try:
+                grant = self._grant_snapshot(record)
+                read_secret = getattr(self._kube, "read_secret", None)
+                if callable(read_secret):
+                    present = read_secret(credential_secret_name(grant.job_ref)) is not None
+                    if grant.secret_present is True and not present:
+                        target = self._cleanup_target(record)
+                        if target is None:
+                            self._update_grant(
+                                record,
+                                state=CredentialState.INDETERMINATE,
+                                secret_present=False,
+                                reason="Secret disappeared without a retained destruction phase",
+                            )
+                            continue
+                    elif grant.secret_present is False and present:
+                        updated = self._update_grant(
+                            record,
+                            state=CredentialState.INDETERMINATE,
+                            secret_present=True,
+                            reason="Secret remains after retained absence observation",
+                        )
+                        updated_record = self._store.read_runtime(
+                            "credential", updated.job_ref, updated.credential_grant_ref
+                        )
+                        if updated_record is not None:
+                            self._destroy_grant(updated_record, CredentialState.REVOKED)
+                        continue
+                self._expire_grant_if_needed(grant)
+            except Exception:
+                continue
+
+    def reconcile_all(self) -> ReconcileReport:
+        """Repeatably recover bindings and lifecycle actions from provider reality."""
+        report = ReconcileReport()
+        self.reconcile_credentials()
+        for record in self._store.list_create():
+            report.scanned += 1
+            job_ref = str(_field(record, "job_ref"))
+            try:
+                if _is_deleted(record):
+                    if str(_field(record, "cleanup_state", "pending")) != "complete":
+                        self.delete(
+                            job_ref,
+                            str(_field(record, "delete_ref")),
+                            str(_field(record, "delete_request_digest")),
+                        )
+                        report.deleted += 1
+                    continue
+                self.inspect(job_ref)
+                self._validate_job_annotations(record)
+                cancellations = self._runtime_records("cancel", job_ref)
+                if cancellations:
+                    values = _runtime_values(cancellations[-1])
+                    cancel_spec = CancelSpec.model_validate_json(values["requestSpec"])
+                    self.cancel(
+                        job_ref,
+                        CancelJobRequest(
+                            cancel_ref=values["cancelRef"],
+                            request_digest=values["identityDigest"],
+                            spec=cancel_spec,
+                        ),
+                    )
+                    report.reconciled += 1
+                    continue
+                finalizations = self._runtime_records("finalize", job_ref)
+                if finalizations and _finalize_phase(finalizations[-1]) != "succeeded":
+                    values = _runtime_values(finalizations[-1])
+                    finalize_spec = FinalizeSpec.model_validate_json(values["requestSpec"])
+                    self.finalize(
+                        job_ref,
+                        FinalizeJobRequest(
+                            finalize_ref=values["finalizeRef"],
+                            request_digest=values["identityDigest"],
+                            spec=finalize_spec,
+                        ),
+                    )
+                    report.reconciled += 1
+                    continue
+                for operation in self._store.list_runtime("operation", job_ref):
+                    operation_state = self._workspace_runtime.inspect_operation(
+                        job_ref, str(_field(operation, "identity"))
+                    ).state
+                    if operation_state in {OperationState.ACCEPTED, OperationState.RUNNING}:
+                        self._workspace_runtime.reconcile_operation(
+                            job_ref, str(_field(operation, "identity"))
+                        )
+                        report.reconciled += 1
+                for transfer in self._store.list_runtime("transfer", job_ref):
+                    transfer_state = self._workspace_runtime.inspect_transfer(
+                        job_ref, str(_field(transfer, "identity"))
+                    ).state
+                    if transfer_state not in {
+                        TransferState.COMPLETED,
+                        TransferState.CANCELED,
+                        TransferState.DISCARDED,
+                        TransferState.FAILED,
+                        TransferState.INDETERMINATE,
+                    }:
+                        self._workspace_runtime.reconcile_transfer(
+                            job_ref, str(_field(transfer, "identity"))
+                        )
+                        report.reconciled += 1
+            except Exception:
+                report.indeterminate += 1
+        return report
 
     def create(self, request: CreateJobRequest) -> CreateResult:
         """Reserve before create and reconcile a response lost after API acceptance."""
@@ -500,6 +627,7 @@ class V2JobProvider:
     ) -> CredentialGrantSnapshot:
         """Persist a non-secret grant then create the fixed agent-only Secret."""
         self.reconcile_credentials()
+        self._assert_accepting_workspace_work(job_ref)
         if len(raw_bytes) > 65536:
             raise PayloadTooLargeError()
         if not hmac.compare_digest(
@@ -526,6 +654,7 @@ class V2JobProvider:
             grant = self._grant_snapshot(existing)
             self._expire_grant_if_needed(grant)
             if grant.state is CredentialState.ACCEPTED:
+                self._assert_accepting_workspace_work(job_ref)
                 try:
                     self._kube.create_secret(self._credential_secret(job_ref, metadata, raw_bytes))
                 except Exception as error:
@@ -552,6 +681,7 @@ class V2JobProvider:
             self._expire_grant_if_needed(grant)
             return self.inspect_credential_grant(job_ref, metadata.credential_grant_ref)
         try:
+            self._assert_accepting_workspace_work(job_ref)
             self._kube.create_secret(self._credential_secret(job_ref, metadata, raw_bytes))
         except Exception as error:
             raise DependencyUnavailableError(
@@ -623,7 +753,7 @@ class V2JobProvider:
     def start_agent(self, job_ref: str, request: AgentStartRequest) -> GenerationSnapshot:
         """Dispatch exactly one legal generation to the bound live supervisor."""
         binding = self._live_binding(job_ref)
-        self._assert_not_finalizing(job_ref)
+        self._assert_accepting_workspace_work(job_ref)
         digest = canonical_digest(request.digest_payload())
         existing = self._store.read_runtime("generation", job_ref, str(request.generation))
         if existing is not None:
@@ -675,6 +805,7 @@ class V2JobProvider:
             raise DependencyUnavailableError("retained generation grant metadata is inconsistent")
         retained_request = self._request_from_generation(retained)
         try:
+            self._assert_accepting_workspace_work(job_ref)
             rpc = self._agent_rpc(binding, retained_request, audience, credential_sha)
         except KcsV2Error:
             raise
@@ -708,6 +839,7 @@ class V2JobProvider:
     def finalize(self, job_ref: str, request: FinalizeJobRequest) -> FinalizeResult:
         """Quiesce supervisors and revoke credentials without deleting Job/Pod/log reality."""
         self.reconcile_credentials()
+        self._assert_no_cancel(job_ref)
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
         binding = self._live_binding(job_ref)
@@ -756,9 +888,101 @@ class V2JobProvider:
             raise DependencyUnavailableError("retained finalize phase is indeterminate")
         return FinalizeResult(snapshot=self.inspect(job_ref), created=created)
 
-    def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
-        """Persist deletion identity before removing workload reality."""
+    def cancel(self, job_ref: str, request: CancelJobRequest) -> CancelResult:
+        """Interrupt one binding from a durable slot without inventing output manifests."""
+        if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
+            raise DigestMismatchError()
+        self._assert_not_finalizing(job_ref)
+        binding = self._live_binding(job_ref)
+        values = {
+            "identityDigest": request.request_digest,
+            "cancelRef": request.cancel_ref,
+            "jobUid": str(binding.job_uid),
+            "podUid": str(binding.pod_uid),
+            "requestSpec": request.spec.model_dump_json(by_alias=True),
+            # Interrupt acceptance closes admission immediately. Until every requested collect
+            # has been reconciled and its delivery proven, loss must be reported conservatively.
+            "payload": phase_payload("accepted", self._now(), output_loss_possible=True),
+        }
+        record, created = self._reserve_cancel(job_ref, request, values)
+        retained = _runtime_values(record)
+        if (
+            retained.get("identityDigest") != request.request_digest
+            or retained.get("cancelRef") != request.cancel_ref
+        ):
+            raise IdentityDigestConflict()
+        state, output_loss, resume_from = read_phase(record)
+        if state == "succeeded" or (state == "indeterminate" and resume_from is None):
+            return CancelResult(snapshot=self.inspect(job_ref), created=False)
+        phase = resume_from or state
+        try:
+            if phase == "accepted":
+                self._reconcile_active_operations_before_cancel(job_ref)
+                collect_indeterminate = self._drain_cancel_collects(job_ref, request.spec)
+                output_loss = self._cancel_output_loss(job_ref) or collect_indeterminate
+                record = self._set_cancel_phase(
+                    record,
+                    "collections_drained",
+                    output_loss_possible=output_loss,
+                    collect_indeterminate=collect_indeterminate,
+                )
+                phase = "collections_drained"
+            if phase == "collections_drained":
+                for grant_record in self._store.list_runtime("credential", job_ref):
+                    grant = self._grant_snapshot(grant_record)
+                    if grant.secret_present is not False:
+                        self._revoke_grant(grant)
+                record = self._set_cancel_phase(
+                    record, "credentials_revoked", output_loss_possible=output_loss
+                )
+                phase = "credentials_revoked"
+            identity = {
+                "jobRef": job_ref,
+                "jobUid": str(binding.job_uid),
+                "podUid": str(binding.pod_uid),
+            }
+            if phase == "credentials_revoked":
+                self._stop_or_recover(job_ref, identity, "agent")
+                record = self._set_cancel_phase(
+                    record, "agent_stopped", output_loss_possible=output_loss
+                )
+                phase = "agent_stopped"
+            if phase == "agent_stopped":
+                self._stop_or_recover(job_ref, identity, "workspace")
+                record = self._set_cancel_phase(
+                    record, "workspace_stopped", output_loss_possible=output_loss
+                )
+                phase = "workspace_stopped"
+            if phase == "workspace_stopped":
+                if not self._roles_are_terminal(job_ref):
+                    raise DependencyTimeoutError(
+                        "Kubernetes has not confirmed both canceled containers terminated"
+                    )
+                self._mark_active_operations_indeterminate(job_ref)
+                output_loss = self._cancel_output_loss(job_ref) or output_loss
+                final_state = (
+                    "indeterminate"
+                    if _runtime_values(record).get("collectIndeterminate") == "true"
+                    else "succeeded"
+                )
+                record = self._set_cancel_phase(
+                    record, final_state, output_loss_possible=output_loss
+                )
+                phase = final_state
+        except KcsV2Error as error:
+            self._set_cancel_indeterminate(record, phase, output_loss, type(error).__name__)
+            raise
+        except Exception as error:
+            self._set_cancel_indeterminate(record, phase, output_loss, type(error).__name__)
+            raise DependencyUnavailableError("cancel lifecycle did not complete") from error
+        if phase not in {"succeeded", "indeterminate"}:
+            raise DependencyUnavailableError("retained cancel phase is indeterminate")
+        return CancelResult(snapshot=self.inspect(job_ref), created=created)
 
+    cancel_job = cancel
+
+    def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
+        """Persist an ownerless tombstone, then prove foreground cleanup in phases."""
         if not hmac.compare_digest(request_digest, EMPTY_OBJECT_DIGEST):
             raise DigestMismatchError
         record = self._store.read_by_job_ref(job_ref)
@@ -769,8 +993,18 @@ class V2JobProvider:
             if _field(record, "cleanup_state", "complete") == "complete":
                 return _as_tombstone(record)
             final_state = _provider_terminal_state(_field(record, "final_state", "indeterminate"))
+            credential_observations, transfer_observations = _stored_tombstone_observations(record)
         else:
-            final_state = _terminal_state_for_binding(self.inspect(job_ref).binding_state)
+            snapshot = self.inspect(job_ref)
+            final_state = _terminal_state_for_binding(snapshot.binding_state)
+            credential_observations = [
+                item.model_dump(mode="json", by_alias=True)
+                for item in snapshot.credential_observations
+            ]
+            transfer_observations = [
+                item.model_dump(mode="json", by_alias=True)
+                for item in snapshot.transfer_observations
+            ]
 
         deleted_at = _as_datetime(_field(record, "deleted_at", None), self._now())
         expires_at = _as_datetime(
@@ -784,11 +1018,58 @@ class V2JobProvider:
             deleted_at=deleted_at,
             expires_at=expires_at,
             cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "tombstone_persisted"),
+            gpu_release_state=(
+                CleanupState.COMPLETE
+                if _workspace_gpu(record) > 0 and final_state is ProviderTerminalState.CANCELED
+                else CleanupState.PENDING
+                if _workspace_gpu(record) > 0
+                else CleanupState.NOT_REQUIRED
+            ),
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
+        )
+
+        for grant_record in self._store.list_runtime("credential", job_ref):
+            grant = self._grant_snapshot(grant_record)
+            if grant.secret_present is not False:
+                self._revoke_grant(grant)
+        self._prove_secret_absent(job_ref)
+        observed_credentials, observed_transfers = self._deletion_observations(job_ref)
+        credential_observations = observed_credentials or credential_observations
+        transfer_observations = observed_transfers or transfer_observations
+        record = self._mark_deleted(
+            record,
+            delete_ref=delete_ref,
+            request_digest=request_digest,
+            final_state=final_state,
+            deleted_at=deleted_at,
+            expires_at=expires_at,
+            cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "credentials_destroyed"),
+            gpu_release_state=_cleanup_state(record, "gpu_release_state", CleanupState.PENDING),
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
         )
 
         self._delete_job(job_ref)
+        record = self._mark_deleted(
+            record,
+            delete_ref=delete_ref,
+            request_digest=request_digest,
+            final_state=final_state,
+            deleted_at=deleted_at,
+            expires_at=expires_at,
+            cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "job_delete_requested"),
+            gpu_release_state=_cleanup_state(record, "gpu_release_state", CleanupState.PENDING),
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
+        )
         if not self._wait_for_job_absence(job_ref):
             raise DependencyTimeoutError("Kubernetes has not yet confirmed Job deletion")
+        if self._list_job_pods(job_ref, str(_field(record, "job_uid"))):
+            raise DependencyTimeoutError("Kubernetes has not confirmed Pod deletion")
         gpu_requested = _workspace_gpu(record) > 0
         record = self._mark_deleted(
             record,
@@ -797,8 +1078,40 @@ class V2JobProvider:
             final_state=final_state,
             deleted_at=deleted_at,
             expires_at=expires_at,
-            cleanup_state=CleanupState.COMPLETE,
+            cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "workload_absent"),
             gpu_release_state=CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED,
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
+        )
+        self._store.delete_runtime_records(job_ref)
+        if self._store.has_runtime_records(job_ref):
+            raise DependencyTimeoutError("Kubernetes owner runtime records remain after deletion")
+        record = self._mark_deleted(
+            record,
+            delete_ref=delete_ref,
+            request_digest=request_digest,
+            final_state=final_state,
+            deleted_at=deleted_at,
+            expires_at=expires_at,
+            cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "owner_records_deleted"),
+            gpu_release_state=CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED,
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
+        )
+        record = self._mark_deleted(
+            record,
+            delete_ref=delete_ref,
+            request_digest=request_digest,
+            final_state=final_state,
+            deleted_at=deleted_at,
+            expires_at=expires_at,
+            cleanup_state=CleanupState.COMPLETE,
+            cleanup_phase="complete",
+            gpu_release_state=CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED,
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
         )
         return _as_tombstone(record)
 
@@ -828,14 +1141,184 @@ class V2JobProvider:
             raise ReplacementPodError()
         return binding
 
+    def _validate_job_annotations(self, record: object) -> None:
+        job_ref = str(_field(record, "job_ref"))
+        job = self._read_job(job_ref)
+        if job is None:
+            raise DependencyUnavailableError("retained Job is absent during reconciliation")
+        annotations = _path(job, "metadata", "annotations")
+        if not isinstance(annotations, Mapping) or not annotations:
+            return
+        spec = _field(record, "spec_payload", {})
+        expected = {
+            "researchcosmos.io/provider-request-id": str(_field(record, "provider_request_id")),
+            "researchcosmos.io/subject-ref": str(_field(spec, "subjectRef")),
+            "researchcosmos.io/runtime-plan-digest": str(_field(spec, "runtimePlanDigest")),
+            "researchcosmos.io/spec-digest": str(_field(record, "spec_digest")),
+        }
+        if any(annotations.get(key) != value for key, value in expected.items()):
+            self._mark_indeterminate(record, "Job annotations differ from the create reservation")
+            raise StateConflictError("Job annotations differ from the create reservation")
+
     def _assert_not_finalizing(self, job_ref: str) -> None:
         if self._runtime_records("finalize", job_ref):
             raise StateConflictError("The provider is already quiescing this Job")
 
-    def _assert_accepting_workspace_work(self, job_ref: str) -> None:
-        self._assert_not_finalizing(job_ref)
+    def _assert_no_cancel(self, job_ref: str) -> None:
         if self._runtime_records("cancel", job_ref):
             raise StateConflictError("The provider is already canceling this Job")
+
+    def _assert_accepting_workspace_work(self, job_ref: str) -> None:
+        self._assert_not_finalizing(job_ref)
+        self._assert_no_cancel(job_ref)
+
+    def _reserve_cancel(
+        self,
+        job_ref: str,
+        request: CancelJobRequest,
+        values: Mapping[str, str],
+    ) -> tuple[object, bool]:
+        slot = self._store.read_runtime("cancel", job_ref, "slot")
+        if slot is not None:
+            return slot, False
+        return self._store.reserve_runtime("cancel", "slot", job_ref, values)
+
+    def _drain_cancel_collects(self, job_ref: str, spec: CancelSpec) -> bool:
+        indeterminate = False
+        for transfer_ref in spec.finish_collect_transfer_refs:
+            try:
+                self._workspace_runtime.drain_pre_authorized_collect(job_ref, transfer_ref)
+            except TransferIndeterminateError:
+                indeterminate = True
+        return indeterminate
+
+    def _cancel_output_loss(self, job_ref: str) -> bool:
+        for record in self._store.list_runtime("transfer", job_ref):
+            snapshot = self._workspace_runtime.inspect_transfer(
+                job_ref, str(_field(record, "identity"))
+            )
+            if snapshot.spec.direction.value != "collect_output":
+                continue
+            values = _runtime_values(record)
+            if (
+                snapshot.state is not TransferState.COMPLETED
+                or snapshot.snapshot_ref is None
+                or values.get("deliveryConfirmedSnapshotRef") != snapshot.snapshot_ref
+            ):
+                return True
+        return False
+
+    def _reconcile_active_operations_before_cancel(self, job_ref: str) -> None:
+        for record in self._store.list_runtime("operation", job_ref):
+            snapshot = self._workspace_runtime.inspect_operation(
+                job_ref, str(_field(record, "identity"))
+            )
+            if snapshot.state in {OperationState.ACCEPTED, OperationState.RUNNING}:
+                try:
+                    self._workspace_runtime.reconcile_operation(job_ref, snapshot.operation_ref)
+                except Exception:
+                    self._mark_operation_indeterminate(
+                        record,
+                        snapshot,
+                        "operation terminal truth could not be proven before workspace shutdown",
+                    )
+
+    def _mark_active_operations_indeterminate(self, job_ref: str) -> None:
+        for record in self._store.list_runtime("operation", job_ref):
+            snapshot = self._workspace_runtime.inspect_operation(
+                job_ref, str(_field(record, "identity"))
+            )
+            if snapshot.state not in {OperationState.ACCEPTED, OperationState.RUNNING}:
+                continue
+            self._mark_operation_indeterminate(
+                record,
+                snapshot,
+                "workspace stopped before operation terminal truth was proven",
+            )
+
+    def _mark_operation_indeterminate(
+        self, record: object, snapshot: WorkspaceOperationSnapshot, reason: str
+    ) -> None:
+        now = self._now()
+        retained = snapshot.model_copy(
+            update={
+                "state": OperationState.INDETERMINATE,
+                "finished_at": now,
+                "observed_at": now,
+                "failure_reason": reason,
+            }
+        )
+        self._store.update_runtime(
+            "operation",
+            snapshot.job_ref,
+            snapshot.operation_ref,
+            _runtime_values_with(record, {"payload": retained.model_dump_json(by_alias=True)}),
+        )
+
+    def _set_cancel_phase(
+        self,
+        record: object,
+        phase: str,
+        *,
+        output_loss_possible: bool,
+        collect_indeterminate: bool | None = None,
+    ) -> object:
+        changes = {
+            "payload": phase_payload(phase, self._now(), output_loss_possible=output_loss_possible)
+        }
+        if collect_indeterminate is not None:
+            changes["collectIndeterminate"] = "true" if collect_indeterminate else "false"
+        return self._store.update_runtime(
+            "cancel",
+            str(_field(record, "job_ref")),
+            str(_field(record, "identity")),
+            _runtime_values_with(record, changes),
+        )
+
+    def _set_cancel_indeterminate(
+        self,
+        record: object,
+        resume_from: str,
+        output_loss_possible: bool,
+        reason: str,
+    ) -> object:
+        return self._store.update_runtime(
+            "cancel",
+            str(_field(record, "job_ref")),
+            str(_field(record, "identity")),
+            _runtime_values_with(
+                record,
+                {
+                    "payload": phase_payload(
+                        "indeterminate",
+                        self._now(),
+                        output_loss_possible=output_loss_possible,
+                        resume_from=resume_from,
+                        reason=reason,
+                    )
+                },
+            ),
+        )
+
+    def _roles_are_terminal(self, job_ref: str) -> bool:
+        snapshot = self.inspect(job_ref)
+        roles_terminal = (
+            snapshot.agent is not None
+            and snapshot.workspace is not None
+            and snapshot.agent.state is RoleState.TERMINATED
+            and snapshot.workspace.state is RoleState.TERMINATED
+        )
+        job = self._read_job(job_ref)
+        return (
+            roles_terminal
+            and job is not None
+            and (
+                _job_condition_true(job, "Complete")
+                or _job_condition_true(job, "Failed")
+                or int(_path(job, "status", "succeeded") or 0) > 0
+                or int(_path(job, "status", "failed") or 0) > 0
+            )
+        )
 
     def _reserve_finalize(
         self,
@@ -944,8 +1427,38 @@ class V2JobProvider:
         role_snapshot = snapshot.agent if role == "agent" else snapshot.workspace
         if role_snapshot is not None and role_snapshot.state is RoleState.TERMINATED:
             return
+        if role == "workspace":
+            if self._workspace_transport is None:
+                if self._transport is None:
+                    raise DependencyUnavailableError(
+                        "workspace sidecar RPC transport is not configured"
+                    )
+                self._validate_stop_ack(self._transport.stop_supervisor(identity, role))
+                return
+            inspection = self._workspace_transport.rpc(
+                identity, {"action": "inspectSupervisor"}
+            ).header
+            alive = inspection.get("supervisorAlive")
+            if type(alive) is not bool:
+                raise StateConflictError("workspace supervisor inspection is invalid")
+            if alive:
+                stopped = self._workspace_transport.rpc(identity, {"action": "shutdown"}).header
+                if (
+                    stopped.get("ok") is not True
+                    or stopped.get("state") != "stopped"
+                    or stopped.get("supervisorAlive") is not False
+                ):
+                    raise StateConflictError("workspace shutdown acknowledgement is invalid")
+            return
         if self._transport is None:
             raise DependencyUnavailableError("supervisor RPC transport is not configured")
+        inspect_supervisor = getattr(self._transport, "inspect_supervisor", None)
+        if callable(inspect_supervisor):
+            observed = inspect_supervisor(identity, role)
+            if type(observed.supervisor_alive) is not bool:
+                raise StateConflictError("agent supervisor inspection is invalid")
+            if not observed.supervisor_alive:
+                return
         self._validate_stop_ack(self._transport.stop_supervisor(identity, role))
 
     def _set_finalize_phase(self, record: object, phase: str) -> object:
@@ -1095,8 +1608,14 @@ class V2JobProvider:
             )
         try:
             deletion = self._kube.delete_secret(credential_secret_name(grant.job_ref))
-            if type(deletion) is not bool:
+            if deletion is not True:
                 raise DependencyUnavailableError("Kubernetes Secret absence was not confirmed")
+            read_secret = getattr(self._kube, "read_secret", None)
+            if (
+                callable(read_secret)
+                and read_secret(credential_secret_name(grant.job_ref)) is not None
+            ):
+                raise DependencyUnavailableError("Kubernetes Secret remains observable")
         except Exception:
             return self._update_grant(
                 record,
@@ -1155,6 +1674,45 @@ class V2JobProvider:
         destroyed = self._destroy_grant(record, CredentialState.REVOKED)
         if destroyed.state is CredentialState.DESTROY_FAILED:
             raise CredentialDestroyFailedError()
+
+    def _prove_secret_absent(self, job_ref: str) -> None:
+        name = credential_secret_name(job_ref)
+        try:
+            deleted = self._kube.delete_secret(name)
+            read_secret = getattr(self._kube, "read_secret", None)
+            present = callable(read_secret) and read_secret(name) is not None
+        except Exception as error:
+            raise CredentialDestroyFailedError() from error
+        if deleted is not True or present:
+            raise CredentialDestroyFailedError()
+
+    def _deletion_observations(
+        self, job_ref: str
+    ) -> tuple[list[Mapping[str, object]], list[Mapping[str, object]]]:
+        credentials: list[Mapping[str, object]] = [
+            CredentialObservation(
+                credential_grant_ref=grant.credential_grant_ref,
+                state=grant.state,
+                secret_present=grant.secret_present,
+                observed_at=grant.observed_at,
+            ).model_dump(mode="json", by_alias=True)
+            for grant in (
+                self._grant_snapshot(record)
+                for record in self._store.list_runtime("credential", job_ref)
+            )
+        ]
+        transfers: list[Mapping[str, object]] = [
+            TransferObservation(
+                transfer_ref=snapshot.transfer_ref,
+                state=snapshot.state,
+                observed_at=snapshot.observed_at,
+            ).model_dump(mode="json", by_alias=True)
+            for snapshot in (
+                self._workspace_runtime.inspect_transfer(job_ref, str(_field(record, "identity")))
+                for record in self._store.list_runtime("transfer", job_ref)
+            )
+        ]
+        return credentials, transfers
 
     def _cleanup_target(self, record: object) -> CredentialState | None:
         values = _runtime_values(record)
@@ -1376,7 +1934,7 @@ class V2JobProvider:
     def _runtime_records(self, kind: str, job_ref: str) -> Sequence[object]:
         method = getattr(self._store, "list_runtime", None)
         records = tuple(method(kind, job_ref)) if callable(method) else ()
-        if kind == "finalize":
+        if kind in {"finalize", "cancel"}:
             slot = tuple(record for record in records if str(_field(record, "identity")) == "slot")
             return slot or records
         return records
@@ -1456,6 +2014,10 @@ class V2JobProvider:
         observed_at = self._now()
         pod = pods[0] if len(pods) == 1 else None
         binding_state, binding_reason = _binding_state(job, pod, replacement_reason)
+        workload_terminal = binding_state in {
+            JobBindingState.SUCCEEDED,
+            JobBindingState.FAILED,
+        }
         spec_payload = _field(record, "spec_payload", {})
         agent = _role_snapshot(spec_payload, pod, "agent") if pod is not None else None
         workspace = _role_snapshot(spec_payload, pod, "workspace") if pod is not None else None
@@ -1506,6 +2068,7 @@ class V2JobProvider:
             for item in self._runtime_records("transfer", runtime_job_ref)
         ]
         finalizations = self._runtime_records("finalize", runtime_job_ref)
+        cancellations = self._runtime_records("cancel", runtime_job_ref)
         latest = max(generations, key=lambda item: item.generation) if generations else None
         finalize_action = _finalize_action(finalizations)
         if finalizations and binding_state not in {
@@ -1513,6 +2076,39 @@ class V2JobProvider:
             JobBindingState.FAILED,
         }:
             binding_state = JobBindingState.FINALIZING
+        cancel_action = action_snapshot(cancellations, "cancelRef")
+        output_loss_possible = False
+        if cancellations:
+            cancel_state, output_loss_possible, resume_from = read_phase(cancellations[-1])
+            if cancel_state == "succeeded":
+                binding_state = JobBindingState.CANCELED
+                binding_reason = "provider cancellation completed"
+                cleanup = CleanupObservation(
+                    state=CleanupState.COMPLETE,
+                    reason=None,
+                    observed_at=observed_at,
+                )
+            elif cancel_state == "indeterminate" and resume_from is None:
+                binding_state = JobBindingState.INDETERMINATE
+                binding_reason = "provider cancellation is indeterminate"
+                cleanup = CleanupObservation(
+                    state=CleanupState.INDETERMINATE,
+                    reason=binding_reason,
+                    observed_at=observed_at,
+                )
+            else:
+                binding_state = JobBindingState.CANCELING
+                binding_reason = "provider cancellation is in progress"
+        if (
+            workload_terminal
+            and agent is not None
+            and workspace is not None
+            and agent.state is RoleState.TERMINATED
+            and workspace.state is RoleState.TERMINATED
+        ):
+            gpu_release_state = (
+                CleanupState.COMPLETE if _workspace_gpu(record) > 0 else CleanupState.NOT_REQUIRED
+            )
         return JobBindingSnapshot(
             job_ref=str(_field(record, "job_ref")),
             provider_handle=str(_field(record, "job_ref")),
@@ -1559,9 +2155,9 @@ class V2JobProvider:
                 for ref, state, observed in sorted(transfers)
             ],
             finalize_action=finalize_action,
-            cancel_action=_not_requested_action(),
+            cancel_action=cancel_action,
             delete_action=_not_requested_action(),
-            output_loss_possible=False,
+            output_loss_possible=output_loss_possible,
             cleanup=cleanup,
             gpu_release=CleanupObservation(
                 state=gpu_release_state,
@@ -1574,6 +2170,9 @@ class V2JobProvider:
         observed_at = self._now()
         spec_payload = _field(record, "spec_payload", {})
         created_at = _as_datetime(_field(record, "created_at"), observed_at)
+        cancellations = self._runtime_records("cancel", str(_field(record, "job_ref")))
+        cancel_action = action_snapshot(cancellations, "cancelRef")
+        output_loss = read_phase(cancellations[-1])[1] if cancellations else False
         return JobBindingSnapshot(
             job_ref=str(_field(record, "job_ref")),
             provider_handle=str(_field(record, "job_ref")),
@@ -1604,9 +2203,9 @@ class V2JobProvider:
             finalize_action=_finalize_action(
                 self._runtime_records("finalize", str(_field(record, "job_ref")))
             ),
-            cancel_action=_not_requested_action(),
+            cancel_action=cancel_action,
             delete_action=_not_requested_action(),
-            output_loss_possible=False,
+            output_loss_possible=output_loss,
             cleanup=CleanupObservation(
                 state=CleanupState.INDETERMINATE,
                 reason="Job absence is not a confirmed delete",
@@ -1629,7 +2228,10 @@ class V2JobProvider:
         deleted_at: datetime,
         expires_at: datetime,
         cleanup_state: CleanupState,
+        cleanup_phase: str,
         gpu_release_state: CleanupState = CleanupState.PENDING,
+        credential_observations: Sequence[Mapping[str, object]] = (),
+        transfer_observations: Sequence[Mapping[str, object]] = (),
     ) -> object:
         try:
             return self._store.mark_deleted(
@@ -1640,7 +2242,10 @@ class V2JobProvider:
                 delete_request_digest=request_digest,
                 final_state=final_state.value,
                 cleanup_state=cleanup_state.value,
+                cleanup_phase=cleanup_phase,
                 gpu_release_state=gpu_release_state.value,
+                credential_observations=list(credential_observations),
+                transfer_observations=list(transfer_observations),
             )
         except KcsV2Error:
             raise
@@ -2078,6 +2683,7 @@ def _as_tombstone(record: object) -> JobTombstone:
     deleted_at = _as_datetime(_field(record, "deleted_at"), datetime.now(UTC))
     cleanup_state = CleanupState(str(_field(record, "cleanup_state", "complete")))
     gpu_release_state = CleanupState(str(_field(record, "gpu_release_state", "not_required")))
+    credential_values, transfer_values = _stored_tombstone_observations(record)
     return JobTombstone(
         provider_request_id=str(_field(record, "provider_request_id")),
         spec_digest=str(_field(record, "spec_digest")),
@@ -2099,11 +2705,56 @@ def _as_tombstone(record: object) -> JobTombstone:
             reason=_optional_text(record, "gpu_release_reason"),
             observed_at=deleted_at,
         ),
-        credential_observations=[],
-        transfer_observations=[],
+        credential_observations=[
+            CredentialObservation.model_validate(item) for item in credential_values
+        ],
+        transfer_observations=[
+            TransferObservation.model_validate(item) for item in transfer_values
+        ],
         deleted_at=deleted_at,
         expires_at=_as_datetime(_field(record, "expires_at"), deleted_at),
     )
+
+
+def _stored_tombstone_observations(
+    record: object,
+) -> tuple[list[Mapping[str, object]], list[Mapping[str, object]]]:
+    def load(name: str) -> list[Mapping[str, object]]:
+        raw = _field(record, name, None)
+        try:
+            value: object = json.loads(str(raw)) if raw is not None else []
+        except json.JSONDecodeError as error:
+            raise DependencyUnavailableError(
+                "retained tombstone observations are invalid"
+            ) from error
+        if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+            raise DependencyUnavailableError("retained tombstone observations are invalid")
+        return [dict(item) for item in value]
+
+    return load("credential_observations_json"), load("transfer_observations_json")
+
+
+def _cleanup_state(record: object, field_name: str, fallback: CleanupState) -> CleanupState:
+    try:
+        return CleanupState(str(_field(record, field_name, fallback.value)))
+    except ValueError as error:
+        raise DependencyUnavailableError("retained cleanup state is invalid") from error
+
+
+def _later_delete_phase(record: object, desired: str) -> str:
+    order = {
+        None: 0,
+        "tombstone_persisted": 1,
+        "credentials_destroyed": 2,
+        "job_delete_requested": 3,
+        "workload_absent": 4,
+        "owner_records_deleted": 5,
+        "complete": 6,
+    }
+    retained = _field(record, "cleanup_phase", None)
+    if retained not in order or desired not in order:
+        raise DependencyUnavailableError("retained deletion phase is invalid")
+    return str(retained) if order[retained] >= order[desired] else desired
 
 
 def _encode_token(payload: Mapping[str, object]) -> str:

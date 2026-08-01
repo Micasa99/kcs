@@ -45,6 +45,10 @@ class AgentRpcTransportProtocol(Protocol):
         self, binding: Mapping[str, str], request: Mapping[str, object]
     ) -> AgentRpcResponse: ...
 
+    def inspect_supervisor(
+        self, binding: Mapping[str, str], container: str
+    ) -> AgentRpcResponse: ...
+
     def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse: ...
 
 
@@ -155,16 +159,28 @@ class ExecRpcTransport:
         return _response(output)
 
     def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse:
-        command = (
-            ["/opt/kcs/agent-supervisor", "rpc"]
-            if container == "agent"
-            else ["/opt/kcs/workspace-sidecar", "rpc"]
-        )
+        if container != "agent":
+            raise DependencyUnavailableError(
+                "workspace shutdown must use the framed workspace transport"
+            )
         output = self._execute(
             binding,
-            container,
-            command,
+            "agent",
+            ["/opt/kcs/agent-supervisor", "rpc"],
             b'{"protocolVersion":1,"action":"shutdown"}',
+        )
+        return _response(output)
+
+    def inspect_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse:
+        if container != "agent":
+            raise DependencyUnavailableError(
+                "workspace inspection must use the framed workspace transport"
+            )
+        output = self._execute(
+            binding,
+            "agent",
+            ["/opt/kcs/agent-supervisor", "rpc"],
+            b'{"protocolVersion":1,"action":"inspect"}',
         )
         return _response(output)
 

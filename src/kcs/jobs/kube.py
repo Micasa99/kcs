@@ -76,6 +76,8 @@ class CoreV1Api(Protocol):
 
     def create_namespaced_secret(self, *, namespace: str, body: Any) -> Any: ...
 
+    def read_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
+
     def delete_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
 
     def connect_get_namespaced_pod_exec(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
@@ -292,14 +294,28 @@ class V2KubeAdapter:
     def create_secret(self, body: Any) -> Any:
         return self._core.create_namespaced_secret(namespace=self.namespace, body=body)
 
+    def read_secret(self, name: str) -> Any | None:
+        """Observe one namespace-bound Secret, returning ``None`` only for a proven 404."""
+        try:
+            return self._core.read_namespaced_secret(name=name, namespace=self.namespace)
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise
+
     def delete_secret(self, name: str) -> bool:
+        """Request deletion and return true only after namespace-bound absence proof."""
         try:
             self._core.delete_namespaced_secret(name=name, namespace=self.namespace)
         except Exception as exc:
-            if _status(exc) == 404:
-                return False
-            raise
-        return True
+            if _status(exc) != 404:
+                raise
+        for attempt in range(20):
+            if self.read_secret(name) is None:
+                return True
+            if attempt < 19:
+                time.sleep(0.05)
+        return False
 
     def exec_supervisor_rpc(
         self, binding: Mapping[str, str], container: str, command: list[str], frame: bytes

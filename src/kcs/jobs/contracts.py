@@ -625,6 +625,17 @@ class FinalizeJobRequest(ContractModel):
     spec: FinalizeSpec
 
 
+class CancelSpec(ContractModel):
+    finish_collect_transfer_refs: list[OpaqueRef]
+    reason: OpaqueRef | None = None
+
+
+class CancelJobRequest(ContractModel):
+    cancel_ref: OpaqueRef
+    request_digest: Sha256
+    spec: CancelSpec
+
+
 class JobBindingSnapshot(ContractModel):
     job_ref: OpaqueRef
     provider_handle: OpaqueRef

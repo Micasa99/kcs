@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 from kcs.jobs.canonical import DigestMismatchError as CanonicalDigestMismatchError
 from kcs.jobs.contracts import (
     AgentStartRequest,
+    CancelJobRequest,
     CreateJobRequest,
     CredentialGrantMetadata,
     CredentialGrantSnapshot,
@@ -59,6 +60,7 @@ from kcs.jobs.provider import (
     JobListQuery,
     V2JobProvider,
 )
+from kcs.jobs.workspace_runtime import VerifiedContent
 
 API_VERSION = "2.0.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
@@ -232,13 +234,11 @@ async def _transfer_body_file(request: Request, content_length: int) -> Path:
         raise
 
 
-def _content_chunks(path: Path) -> Iterator[bytes]:
-    try:
-        with path.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                yield chunk
-    finally:
-        path.unlink(missing_ok=True)
+def _content_chunks(content: VerifiedContent) -> Iterator[bytes]:
+    with content.path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            yield chunk
+    content.confirm()
 
 
 def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
@@ -619,7 +619,7 @@ def create_jobs_router(
     ) -> StreamingResponse:
         content = provider.open_collected_content(job_ref, transfer_ref)
         return StreamingResponse(
-            _content_chunks(content.path),
+            _content_chunks(content),
             media_type="application/octet-stream",
             headers={
                 "Content-Length": str(content.size),
@@ -727,6 +727,23 @@ def create_jobs_router(
         payload: FinalizeJobRequest,
     ) -> Response:
         result = provider.finalize(job_ref, payload)
+        return _json_model(result.snapshot, status_code=202 if result.created else 200)
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/cancel",
+        operation_id="cancelJob",
+        tags=["Jobs"],
+        status_code=202,
+        response_model=JobBindingSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
+    )
+    def cancel_job(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: CancelJobRequest,
+    ) -> Response:
+        result = provider.cancel(job_ref, payload)
         return _json_model(result.snapshot, status_code=202 if result.created else 200)
 
     @router.delete(

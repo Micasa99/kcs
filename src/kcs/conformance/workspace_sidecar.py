@@ -54,6 +54,7 @@ class WorkspaceSidecar:
         self._operation_lock = RLock()
         self._stage_installs = 0
         self._operation_side_effects = 0
+        self.shutdown_requested = False
 
     def dispatch(self, frame: bytes, body: Path | None, response_path: Path) -> None:
         """Handle one framed request and write one framed response atomically."""
@@ -124,6 +125,11 @@ class WorkspaceSidecar:
             return self._end_operation(request, str(action)), None
         if action == "stats":
             return {"ok": True, **self.stats()}, None
+        if action == "inspectSupervisor":
+            return {"ok": True, "state": "idle", "supervisorAlive": True}, None
+        if action == "shutdown":
+            self.shutdown_requested = True
+            return {"ok": True, "state": "stopped", "supervisorAlive": False}, None
         raise _RpcRejectedError("INVALID_REQUEST", "unsupported workspace RPC action")
 
     def _validate_transfer_path(
@@ -767,6 +773,8 @@ def serve(socket_path: Path, workspace: Path) -> None:
             connection, _ = listener.accept()
             with connection:
                 _serve_connection(connection, sidecar)
+            if sidecar.shutdown_requested:
+                return
 
 
 def _serve_connection(connection: socket.socket, sidecar: WorkspaceSidecar) -> None:

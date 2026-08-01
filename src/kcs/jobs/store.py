@@ -32,6 +32,15 @@ _RECORD_VERSION = "1"
 _UPDATE_ATTEMPTS = 4
 _TERMINAL_STATES = frozenset(("succeeded", "failed", "canceled", "indeterminate"))
 _CLEANUP_STATES = frozenset(("not_required", "pending", "complete", "failed", "indeterminate"))
+_DELETE_PHASE_ORDER = {
+    None: 0,
+    "tombstone_persisted": 1,
+    "credentials_destroyed": 2,
+    "job_delete_requested": 3,
+    "workload_absent": 4,
+    "owner_records_deleted": 5,
+    "complete": 6,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,8 +61,11 @@ class CreateRecord:
     delete_request_digest: str | None = None
     cleanup_state: str | None = None
     cleanup_reason: str | None = None
+    cleanup_phase: str | None = None
     gpu_release_state: str | None = None
     gpu_release_reason: str | None = None
+    credential_observations_json: str | None = None
+    transfer_observations_json: str | None = None
     indeterminate_reason: str | None = None
     deleted_at: str | None = None
     expires_at: str | None = None
@@ -99,8 +111,12 @@ class CreateRecord:
                 "reason": self.gpu_release_reason,
                 "observedAt": observed_at,
             },
-            "credentialObservations": [],
-            "transferObservations": [],
+            "credentialObservations": _observation_json(
+                self.credential_observations_json, "credential observations"
+            ),
+            "transferObservations": _observation_json(
+                self.transfer_observations_json, "transfer observations"
+            ),
             "deletedAt": self.deleted_at,
             "expiresAt": self.expires_at,
         }
@@ -284,11 +300,18 @@ class V2JobStore:
         final_state = _string(values.pop("final_state", None), "final_state")
         cleanup_state = _string(values.pop("cleanup_state", "complete"), "cleanup_state")
         cleanup_reason = _optional_string(values.pop("cleanup_reason", None), "cleanup_reason")
+        cleanup_phase = _optional_string(values.pop("cleanup_phase", None), "cleanup_phase")
         gpu_release_state = _string(
             values.pop("gpu_release_state", "complete"), "gpu_release_state"
         )
         gpu_release_reason = _optional_string(
             values.pop("gpu_release_reason", None), "gpu_release_reason"
+        )
+        credential_observations_json = _optional_observation_json(
+            values.pop("credential_observations", None), "credential_observations"
+        )
+        transfer_observations_json = _optional_observation_json(
+            values.pop("transfer_observations", None), "transfer_observations"
         )
         if values:
             raise ValueError(f"unknown deletion fields: {', '.join(sorted(values))}")
@@ -314,19 +337,42 @@ class V2JobStore:
                     raise StateConflictError(
                         "A retained tombstone cannot change terminal state or retention times"
                     )
+                retained_phase = cleanup_phase or current.cleanup_phase
+                retained_credentials = (
+                    credential_observations_json or current.credential_observations_json
+                )
+                retained_transfers = (
+                    transfer_observations_json or current.transfer_observations_json
+                )
+                if current.cleanup_state == "complete" and cleanup_state != "complete":
+                    raise StateConflictError("A complete tombstone cleanup cannot regress")
+                if current.gpu_release_state in {"complete", "not_required"} and (
+                    gpu_release_state != current.gpu_release_state
+                ):
+                    raise StateConflictError("A proven GPU release cannot regress")
+                if _DELETE_PHASE_ORDER.get(retained_phase, -1) < _DELETE_PHASE_ORDER.get(
+                    current.cleanup_phase, -1
+                ):
+                    raise StateConflictError("A deletion cleanup phase cannot regress")
                 if (
                     current.cleanup_state == cleanup_state
                     and current.cleanup_reason == cleanup_reason
+                    and current.cleanup_phase == retained_phase
                     and current.gpu_release_state == gpu_release_state
                     and current.gpu_release_reason == gpu_release_reason
+                    and current.credential_observations_json == retained_credentials
+                    and current.transfer_observations_json == retained_transfers
                 ):
                     return current
                 return replace(
                     current,
                     cleanup_state=cleanup_state,
                     cleanup_reason=cleanup_reason,
+                    cleanup_phase=retained_phase,
                     gpu_release_state=gpu_release_state,
                     gpu_release_reason=gpu_release_reason,
+                    credential_observations_json=retained_credentials,
+                    transfer_observations_json=retained_transfers,
                     updated_at=_timestamp(self._clock()),
                 )
             if current.job_uid is None:
@@ -339,8 +385,11 @@ class V2JobStore:
                 delete_request_digest=delete_request_digest,
                 cleanup_state=cleanup_state,
                 cleanup_reason=cleanup_reason,
+                cleanup_phase=cleanup_phase,
                 gpu_release_state=gpu_release_state,
                 gpu_release_reason=gpu_release_reason,
+                credential_observations_json=credential_observations_json or "[]",
+                transfer_observations_json=transfer_observations_json or "[]",
                 deleted_at=deleted,
                 expires_at=expires,
                 updated_at=deleted,
@@ -401,6 +450,26 @@ class V2JobStore:
             if (record := _runtime_record_from_config_map(item)).job_ref == job_ref
             or job_ref is None
         ]
+
+    def delete_runtime_records(self, job_ref: str) -> int:
+        """Remove owner-scoped runtime records left after foreground Job deletion."""
+        selector = f"{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
+        deleted = 0
+        for item in self._kube.list_config_maps(selector):
+            data = _data(item)
+            if data.get("jobRef") != job_ref or "kind" not in data:
+                continue
+            name = _value(_value(item, "metadata"), "name")
+            if isinstance(name, str) and self._kube.delete_config_map(name):
+                deleted += 1
+        return deleted
+
+    def has_runtime_records(self, job_ref: str) -> bool:
+        selector = f"{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
+        return any(
+            _data(item).get("jobRef") == job_ref and "kind" in _data(item)
+            for item in self._kube.list_config_maps(selector)
+        )
 
     def update_runtime(
         self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
@@ -485,6 +554,8 @@ class V2JobStore:
         for record in self.list_create():
             if (
                 record.is_tombstone
+                and record.cleanup_state == "complete"
+                and record.gpu_release_state in {"complete", "not_required"}
                 and record.expires_at is not None
                 and _parse_timestamp(record.expires_at) <= boundary
                 and self._kube.delete_config_map(_record_name(record.provider_request_id))
@@ -599,8 +670,11 @@ def _config_map_body(
         "deleteRequestDigest": record.delete_request_digest,
         "cleanupState": record.cleanup_state,
         "cleanupReason": record.cleanup_reason,
+        "cleanupPhase": record.cleanup_phase,
         "gpuReleaseState": record.gpu_release_state,
         "gpuReleaseReason": record.gpu_release_reason,
+        "credentialObservationsJson": record.credential_observations_json,
+        "transferObservationsJson": record.transfer_observations_json,
         "indeterminateReason": record.indeterminate_reason,
         "deletedAt": record.deleted_at,
         "expiresAt": record.expires_at,
@@ -645,8 +719,11 @@ def _record_from_config_map(config_map: Any) -> CreateRecord:
         delete_request_digest=data.get("deleteRequestDigest"),
         cleanup_state=data.get("cleanupState"),
         cleanup_reason=data.get("cleanupReason"),
+        cleanup_phase=data.get("cleanupPhase"),
         gpu_release_state=data.get("gpuReleaseState"),
         gpu_release_reason=data.get("gpuReleaseReason"),
+        credential_observations_json=data.get("credentialObservationsJson"),
+        transfer_observations_json=data.get("transferObservationsJson"),
         indeterminate_reason=data.get("indeterminateReason"),
         deleted_at=data.get("deletedAt"),
         expires_at=data.get("expiresAt"),
@@ -773,6 +850,26 @@ def _optional_string(value: object, field: str) -> str | None:
     if value is None:
         return None
     return _string(value, field)
+
+
+def _optional_observation_json(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+    if not all(isinstance(item, Mapping) for item in value):
+        raise ValueError(f"{field} entries must be objects")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _observation_json(value: str | None, field: str) -> list[object]:
+    try:
+        decoded: object = json.loads(value or "[]")
+    except json.JSONDecodeError as exc:
+        raise DependencyUnavailableError(f"retained {field} are invalid") from exc
+    if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+        raise DependencyUnavailableError(f"retained {field} are invalid")
+    return decoded
 
 
 def _parse_timestamp(value: str) -> datetime:

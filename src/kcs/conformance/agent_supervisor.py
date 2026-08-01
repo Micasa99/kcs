@@ -99,6 +99,20 @@ def serve(socket_path: Path, credential_path: Path) -> None:
                         )
                     )
                     return
+                if request.get("action") == "inspect":
+                    connection.sendall(
+                        _frame(
+                            {
+                                "protocolVersion": 1,
+                                "generation": 0,
+                                "agentRunRef": "",
+                                "launchBundleDigest": "",
+                                "state": "idle",
+                                "supervisorAlive": True,
+                            }
+                        )
+                    )
+                    continue
                 _validate_start(request)
                 connection.sendall(slots.dispatch(request))
 
