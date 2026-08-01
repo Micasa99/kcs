@@ -143,7 +143,7 @@ class _V2Route(APIRoute):
         return route_handler
 
 
-def _auth_dependency(service_token: str) -> Callable[[Request], V2Caller]:
+def _auth_dependency(service_token: str, roles: frozenset[str]) -> Callable[[Request], V2Caller]:
     if not service_token or any(character.isspace() for character in service_token):
         raise ValueError("KCS V2 service token must be configured")
     expected_digest = hashlib.sha256(service_token.encode("utf-8")).digest()
@@ -155,7 +155,7 @@ def _auth_dependency(service_token: str) -> Callable[[Request], V2Caller]:
         token_matches = hmac.compare_digest(supplied_digest, expected_digest)
         if separator != " " or scheme.casefold() != "bearer" or not token_matches:
             raise _UnauthenticatedError
-        return V2Caller()
+        return V2Caller(roles=roles)
 
     return require_v2_caller
 
@@ -182,9 +182,9 @@ def _json_model(model: BaseModel, *, status_code: int = 200) -> JSONResponse:
 async def _credential_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > 65536:
+        if len(body) + len(chunk) > 65536:
             raise PayloadTooLargeError()
+        body.extend(chunk)
     return bytes(body)
 
 
@@ -200,12 +200,15 @@ def create_jobs_router(
     service_token: str,
     *,
     canonical_openapi_path: Path | None = None,
+    caller_roles: frozenset[str] = frozenset(
+        {"v2-reader", "v2-mutator", "v2-private-credential-writer"}
+    ),
 ) -> APIRouter:
     """Build the minimal V2 Job router around explicitly injected runtime dependencies."""
 
     openapi_bytes = (canonical_openapi_path or _DEFAULT_OPENAPI_PATH).read_bytes()
     openapi_sha256 = hashlib.sha256(openapi_bytes).hexdigest()
-    require_v2_caller = _auth_dependency(service_token)
+    require_v2_caller = _auth_dependency(service_token, caller_roles)
 
     def require_role(role: str) -> Callable[[Request], V2Caller]:
         def enforce(request: Request) -> V2Caller:

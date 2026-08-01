@@ -17,6 +17,7 @@ def serve(socket_path: Path, credential_path: Path) -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(socket_path))
         listener.listen(1)
+        completed: dict[str, bytes] = {}
         while True:
             connection, _ = listener.accept()
             with connection:
@@ -35,29 +36,34 @@ def serve(socket_path: Path, credential_path: Path) -> None:
                         )
                     )
                     return
+                _validate_start(request)
+                identity = _start_identity(request)
+                if identity in completed:
+                    connection.sendall(completed[identity])
+                    continue
                 credential = credential_path.read_bytes()
                 if hashlib.sha256(credential).hexdigest() != request["credentialSha256"]:
                     raise ValueError("projected credential digest does not match the frame")
                 child = subprocess.Popen(["/bin/true"])
                 child.wait()
-                connection.sendall(
-                    _frame(
-                        {
-                            "protocolVersion": 1,
-                            "generation": request["generation"],
-                            "agentRunRef": request["agentRunRef"],
-                            "launchBundleDigest": request["launchBundleDigest"],
-                            "credentialGrantRef": request["credentialGrantRef"],
-                            "audience": request["audience"],
-                            "credentialSha256": request["credentialSha256"],
-                            "credentialConsumed": True,
-                            "state": "exited",
-                            "supervisorAlive": True,
-                            "pid": child.pid,
-                            "exitCode": child.returncode,
-                        }
-                    )
+                response = _frame(
+                    {
+                        "protocolVersion": 1,
+                        "generation": request["generation"],
+                        "agentRunRef": request["agentRunRef"],
+                        "launchBundleDigest": request["launchBundleDigest"],
+                        "credentialGrantRef": request["credentialGrantRef"],
+                        "audience": request["audience"],
+                        "credentialSha256": request["credentialSha256"],
+                        "credentialConsumed": True,
+                        "state": "exited",
+                        "supervisorAlive": True,
+                        "pid": child.pid,
+                        "exitCode": child.returncode,
+                    }
                 )
+                completed[identity] = response
+                connection.sendall(response)
 
 
 def _frame(value: Mapping[str, object]) -> bytes:
@@ -69,3 +75,25 @@ def _json(payload: bytes) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("RPC request must be a JSON object")
     return value
+
+
+def _validate_start(request: Mapping[str, Any]) -> None:
+    required = (
+        "credentialGrantRef",
+        "agentRunRef",
+        "launchBundleDigest",
+        "audience",
+        "credentialSha256",
+    )
+    if (
+        request.get("protocolVersion") != 1
+        or not isinstance(request.get("generation"), int)
+        or request["generation"] < 1
+    ):
+        raise ValueError("invalid supervisor protocol or generation")
+    if any(not isinstance(request.get(field), str) or not request[field] for field in required):
+        raise ValueError("start frame is missing bound credential identity")
+
+
+def _start_identity(request: Mapping[str, Any]) -> str:
+    return json.dumps(request, sort_keys=True, separators=(",", ":"))

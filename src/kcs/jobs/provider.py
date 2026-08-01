@@ -616,21 +616,19 @@ class V2JobProvider:
             raise StateConflictError(
                 "finalize references an operation or transfer that is not registered"
             )
-        existing_actions = self._runtime_records("finalize", job_ref)
-        if (
-            existing_actions
-            and str(_field(existing_actions[0], "identity")) != request.finalize_ref
-        ):
-            raise StateConflictError("A different finalize action is already retained")
         values = {
             "identityDigest": request.request_digest,
+            "finalizeRef": request.finalize_ref,
             "jobUid": str(binding.job_uid),
             "podUid": str(binding.pod_uid),
             "payload": json.dumps({"state": "accepted", "observedAt": self._now().isoformat()}),
         }
-        record, created = self._store.reserve_runtime(
-            "finalize", request.finalize_ref, job_ref, values
-        )
+        record, created = self._store.reserve_runtime("finalize", "slot", job_ref, values)
+        if not created and (
+            _runtime_values(record).get("identityDigest") != request.request_digest
+            or _runtime_values(record).get("finalizeRef") != request.finalize_ref
+        ):
+            raise IdentityDigestConflict()
         phase = _finalize_phase(record)
         if phase == "accepted":
             deadline = self._now() + timedelta(seconds=request.spec.drain_timeout_seconds)
@@ -1364,7 +1362,7 @@ def _finalize_action(records: Sequence[object]) -> ActionSnapshot:
         state = ActionState.INDETERMINATE
         observed_at = datetime.now(UTC)
     return ActionSnapshot(
-        action_ref=str(_field(record, "identity")),
+        action_ref=values.get("finalizeRef") or str(_field(record, "identity")),
         request_digest=values.get("identityDigest"),
         state=state,
         observed_at=observed_at,

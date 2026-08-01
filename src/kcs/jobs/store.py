@@ -356,6 +356,11 @@ class V2JobStore:
         self, kind: str, identity: str, job_ref: str, values: Mapping[str, str]
     ) -> tuple[RuntimeRecord, bool]:
         """Reserve one non-secret runtime identity before side effects."""
+        existing = self.read_runtime(kind, job_ref, identity)
+        if existing is not None:
+            if existing.values.get("identityDigest") != values.get("identityDigest"):
+                raise IdentityDigestConflict()
+            return existing, False
         record = RuntimeRecord(kind=kind, identity=identity, job_ref=job_ref, values=dict(values))
         try:
             created = self._kube.create_config_map(_runtime_config_map_body(record))
@@ -376,6 +381,8 @@ class V2JobStore:
 
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> RuntimeRecord | None:
         config_map = self._kube.read_config_map(_runtime_record_name(kind, job_ref, identity))
+        if config_map is None:
+            config_map = self._kube.read_config_map(_legacy_runtime_record_name(kind, identity))
         if config_map is None:
             return None
         record = _runtime_record_from_config_map(config_map)
@@ -501,6 +508,10 @@ def _record_name(provider_request_id: str) -> str:
 
 def _runtime_record_name(kind: str, job_ref: str, identity: str) -> str:
     return f"kcs-v2-{kind}-{_short_hash(f'{job_ref}:{identity}', 32)}"
+
+
+def _legacy_runtime_record_name(kind: str, identity: str) -> str:
+    return f"kcs-v2-{kind}-{_short_hash(identity, 32)}"
 
 
 def _short_hash(value: str, length: int = 40) -> str:

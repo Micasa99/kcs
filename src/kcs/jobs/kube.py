@@ -11,6 +11,7 @@ import base64
 import json
 import math
 import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -314,10 +315,23 @@ class V2KubeAdapter:
             _preload_content=False,
         )
         websocket.write_stdin(frame.decode("utf-8"))
-        websocket.update(timeout=10)
-        output = websocket.read_stdout()
-        websocket.close()
-        return str(output).encode("utf-8")
+        output: list[str] = []
+        errors: list[str] = []
+        deadline = time.monotonic() + 10
+        try:
+            while websocket.is_open() and time.monotonic() < deadline:
+                websocket.update(timeout=1)
+                while websocket.peek_stdout():
+                    output.append(str(websocket.read_stdout()))
+                while websocket.peek_stderr():
+                    errors.append(str(websocket.read_stderr()))
+            if websocket.is_open():
+                raise TimeoutError("supervisor exec did not complete")
+            if errors:
+                raise RuntimeError("supervisor exec returned stderr")
+            return "".join(output).encode("utf-8")
+        finally:
+            websocket.close()
 
     def _pod_with_uid(self, job_ref: str, pod_uid: str) -> Any:
         matches = [

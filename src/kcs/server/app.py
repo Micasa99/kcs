@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -102,6 +103,7 @@ def create_app(
         version=__version__,
         openapi_tags=tags_metadata,
     )
+
     app.state.limiter = limiter
     app.add_exception_handler(
         RateLimitExceeded,
@@ -208,6 +210,26 @@ def _create_v2_app(
         redoc_url=None,
         openapi_url=None,
     )
+
+    reconcile_stop = asyncio.Event()
+
+    async def reconcile_loop() -> None:
+        while not reconcile_stop.is_set():
+            provider.reconcile_credentials()
+            try:
+                await asyncio.wait_for(reconcile_stop.wait(), timeout=30)
+            except TimeoutError:
+                pass
+
+    @app.on_event("startup")
+    async def start_reconciliation() -> None:
+        provider.reconcile_credentials()
+        app.state.kcs_reconcile_task = asyncio.create_task(reconcile_loop())
+
+    @app.on_event("shutdown")
+    async def stop_reconciliation() -> None:
+        reconcile_stop.set()
+        await app.state.kcs_reconcile_task
 
     @app.get("/api/v1/health", include_in_schema=False)
     def health() -> dict[str, str]:
