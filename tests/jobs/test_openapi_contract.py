@@ -87,6 +87,10 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     } == EXPECTED_OPERATIONS
     assert openapi["security"] == [{"v2ServiceBearer": []}]
     assert set(openapi["components"]["securitySchemes"]) == {"v2ServiceBearer"}
+    assert openapi["x-kcs-network-boundary"] == {
+        "tlsRequired": True,
+        "privateIngressRequired": True,
+    }
 
     credential = openapi["paths"]["/api/v2/jobs/{jobRef}/agent/credential-grants"]["post"]
     assert "security" not in credential
@@ -111,13 +115,11 @@ def test_contract_uses_one_typed_error_envelope_for_every_required_status() -> N
         for status, response in operation["responses"].items():
             if status in EXPECTED_ERROR_STATUSES:
                 schema = response["content"]["application/json"]["schema"]
-                assert schema in (
-                    {"$ref": "#/components/schemas/ErrorEnvelope"},
-                    {"$ref": "#/components/schemas/TombstonedErrorEnvelope"},
-                )
+                assert schema == {"$ref": "#/components/schemas/ErrorEnvelope"}
                 seen_statuses.add(status)
 
     assert seen_statuses == EXPECTED_ERROR_STATUSES
+    assert "TombstonedErrorEnvelope" not in openapi["components"]["schemas"]
 
 
 def test_contract_enforces_frozen_limits_and_closed_mutating_payloads() -> None:

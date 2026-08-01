@@ -35,6 +35,12 @@
       }
     },
     {
+      "scenario": "transfer-collect-completed",
+      "operationId": "inspectTransfer",
+      "request": {"path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-collect-synthetic-001"}},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/transfer-collect-completed.json"}
+    },
+    {
       "scenario": "transfer-cancel",
       "operationId": "cancelTransfer",
       "request": {"path": {"jobRef": "job-synthetic-001", "transferRef": "transfer-stage-synthetic-001"}, "contentType": "application/json", "bodyFixture": "fixtures/transfer-cancel-request.json"},

@@ -35,6 +35,9 @@ servers:
   - url: /
 security:
   - v2ServiceBearer: []
+x-kcs-network-boundary:
+  tlsRequired: true
+  privateIngressRequired: true
 tags:
   - {name: Jobs}
   - {name: Credentials}
@@ -73,6 +76,16 @@ paths:
         conflictStatus: 409
         conflictCode: IDENTITY_CONFLICT
         recoveryAction: inspect_job
+      x-kcs-unknown-outcome-recovery:
+        operationId: listJobs
+        method: GET
+        path: /api/v2/jobs
+        query:
+          providerRequestId: '$request.body#/providerRequestId'
+          includeDeleted: true
+        combinedCollections: [items, tombstones]
+        maximumMatches: 1
+        compareDigest: {responseField: specDigest, requestField: specDigest}
       requestBody:
         required: true
         content:
@@ -99,7 +112,7 @@ paths:
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '410':
           description: Retained tombstone prevents recreation.
-          content: {application/json: {schema: {$ref: '#/components/schemas/TombstonedErrorEnvelope'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '413': &Error413
           description: Payload exceeds a frozen limit.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
@@ -181,7 +194,7 @@ paths:
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '410':
           description: Retained tombstone is the authoritative terminal record.
-          content: {application/json: {schema: {$ref: '#/components/schemas/TombstonedErrorEnvelope'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
     delete:
@@ -375,8 +388,6 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        CREDENTIAL_EXPIRED: {status: 410, recoveryAction: inspect_grant}
-        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       responses:
@@ -389,7 +400,6 @@ paths:
         '403': *CredentialNoStoreError
         '404': *CredentialNoStoreError
         '409': *CredentialNoStoreError
-        '410': *CredentialNoStoreError
         '500': *CredentialNoStoreError
         '503': *CredentialNoStoreError
   /api/v2/jobs/{jobRef}/agent/start:
@@ -531,7 +541,6 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
         GONE: {status: 410, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -616,7 +625,7 @@ paths:
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
         DIGEST_MISMATCH: {status: 422, recoveryAction: none}
         UNSAFE_PATH: {status: 422, recoveryAction: none}
-        TRANSFER_BYTES_MISMATCH: {status: 422, recoveryAction: inspect_transfer}
+        TRANSFER_BYTES_MISMATCH: {status: 409, recoveryAction: inspect_transfer}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
         DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
@@ -837,7 +846,6 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
         GONE: {status: 410, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -982,6 +990,10 @@ paths:
       responses:
         '200':
           description: Exact committed compact canonical OpenAPI JSON artifact.
+          x-kcs-etag-derivation:
+            algorithm: sha256
+            source: exact-response-bytes
+            encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
             X-KCS-API-Version: {schema: {type: string, const: 2.0.0}}
@@ -1065,6 +1077,7 @@ components:
       minLength: 1
       maxLength: 4096
       pattern: '^[A-Za-z0-9_-]+$'
+      format: kcs-base64url
       x-kcs-maxUtf8Bytes: 4096
       description: Opaque base64url cursor bound to namespace, job, immutable Pod UID, and role.
     OpaquePageToken:
@@ -1072,6 +1085,7 @@ components:
       minLength: 1
       maxLength: 4096
       pattern: '^[A-Za-z0-9_-]+$'
+      format: kcs-base64url
       x-kcs-maxUtf8Bytes: 4096
       description: Opaque base64url token bound to namespace and the complete filter set.
     Sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
@@ -1178,33 +1192,15 @@ components:
     OperationState: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
     ActionState: {type: string, enum: [not_requested, accepted, running, succeeded, failed, indeterminate]}
     CleanupState: {type: string, enum: [not_required, pending, complete, failed, indeterminate]}
-    RequestedResources:
-      type: object
-      additionalProperties: false
-      required: [cpuMillis, memoryMiB, gpu, storageGiB]
-      properties:
-        cpuMillis: {type: integer, minimum: 0}
-        memoryMiB: {type: integer, minimum: 0}
-        gpu: {type: integer, minimum: 0}
-        storageGiB: {type: integer, minimum: 0}
-    ObservedResources:
-      type: object
-      additionalProperties: false
-      required: [cpuMillis, memoryMiB, gpu, storageGiB]
-      properties:
-        cpuMillis: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
-        memoryMiB: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
-        gpu: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
-        storageGiB: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
     AgentRequestedResources:
       type: object
       additionalProperties: false
       required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        cpuMillis: {type: integer, minimum: 0, maximum: 8000}
-        memoryMiB: {type: integer, minimum: 0, maximum: 32768}
+        cpuMillis: {type: integer, minimum: 1, maximum: 8000}
+        memoryMiB: {type: integer, minimum: 1, maximum: 32768}
         gpu: {type: integer, const: 0}
-        storageGiB: {type: integer, minimum: 0, maximum: 100}
+        storageGiB: {type: integer, minimum: 1, maximum: 100}
     AgentObservedResources:
       type: object
       additionalProperties: false
@@ -1219,10 +1215,10 @@ components:
       additionalProperties: false
       required: [cpuMillis, memoryMiB, gpu, storageGiB]
       properties:
-        cpuMillis: {type: integer, minimum: 0, maximum: 64000}
-        memoryMiB: {type: integer, minimum: 0, maximum: 262144}
+        cpuMillis: {type: integer, minimum: 1, maximum: 64000}
+        memoryMiB: {type: integer, minimum: 1, maximum: 262144}
         gpu: {type: integer, minimum: 0, maximum: 8}
-        storageGiB: {type: integer, minimum: 0, maximum: 100}
+        storageGiB: {type: integer, minimum: 1, maximum: 100}
     WorkspaceObservedResources:
       type: object
       additionalProperties: false
@@ -1232,22 +1228,6 @@ components:
         memoryMiB: {oneOf: [{type: integer, minimum: 0, maximum: 262144}, {type: 'null'}]}
         gpu: {oneOf: [{type: integer, minimum: 0, maximum: 8}, {type: 'null'}]}
         storageGiB: {oneOf: [{type: integer, minimum: 0, maximum: 100}, {type: 'null'}]}
-    RoleSnapshot:
-      type: object
-      additionalProperties: false
-      required: [containerId, imageId, state, ready, restartCount, exitCode, reason, startedAt, finishedAt, requested, observed]
-      properties:
-        containerId: {$ref: '#/components/schemas/NullableString'}
-        imageId: {$ref: '#/components/schemas/NullableString'}
-        state: {$ref: '#/components/schemas/RoleState'}
-        ready: {type: boolean}
-        restartCount: {type: integer, minimum: 0}
-        exitCode: {$ref: '#/components/schemas/NullableInteger'}
-        reason: {$ref: '#/components/schemas/NullableString'}
-        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
-        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
-        requested: {$ref: '#/components/schemas/RequestedResources'}
-        observed: {$ref: '#/components/schemas/ObservedResources'}
     AgentRoleSnapshot:
       type: object
       additionalProperties: false
@@ -1300,7 +1280,7 @@ components:
         launchBundlePath: {$ref: '#/components/schemas/SafeRelativePath'}
         launchBundleDigest: {$ref: '#/components/schemas/Sha256'}
         launchBundleSizeBytes: {type: integer, minimum: 0, maximum: 1048576}
-        materialPaths: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
+        materialPaths: {type: array, uniqueItems: true, x-kcs-casefoldUnique: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
         startMetadataDigest: {$ref: '#/components/schemas/Sha256'}
         runnerState: {$ref: '#/components/schemas/RunnerState'}
@@ -1325,7 +1305,7 @@ components:
         launchBundlePath: {$ref: '#/components/schemas/SafeRelativePath'}
         launchBundleDigest: {$ref: '#/components/schemas/Sha256'}
         launchBundleSizeBytes: {type: integer, minimum: 0, maximum: 1048576}
-        materialPaths: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
+        materialPaths: {type: array, uniqueItems: true, x-kcs-casefoldUnique: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
     ActionSnapshot:
       type: object
@@ -1465,10 +1445,12 @@ components:
       type: string
       minLength: 1
       format: kcs-relative-posix-path
+      x-kcs-case-policy: preserve-case-reject-casefold-collisions
       description: Normalized relative POSIX path with no empty, dot, dot-dot, control, symlink, case, or normalization ambiguity.
     TransferSpec:
       type: object
       additionalProperties: false
+      x-kcs-path-collision-policy: reject-existing-workspace-casefold-collision
       x-kcs-relations:
         - {left: declaredSizeBytes, operator: '<=', right: authorizedMaxSizeBytes}
       required: [direction, path, declaredSizeBytes, authorizedMaxSizeBytes, contentSha256, mode, overwritePolicy]
@@ -1537,8 +1519,15 @@ components:
     WorkspaceOperationSnapshot:
       type: object
       additionalProperties: false
-      required: [operationRef, requestDigest, storedFrameDigest, binding, state, exitCode, stdout, stderr, stdoutTruncated, stderrTruncated, inlineResultSize, inlineResultDigest, inlineResult, resultTransferRef, acceptedAt, startedAt, finishedAt, observedAt, failureReason]
+      x-kcs-inline-result-relation:
+        canonicalization: rfc8785-jcs
+        value: inlineResult
+        size: inlineResultSize
+        digest: inlineResultDigest
+        exclusiveWith: resultTransferRef
+      required: [jobRef, operationRef, requestDigest, storedFrameDigest, binding, state, exitCode, stdout, stderr, stdoutTruncated, stderrTruncated, inlineResultSize, inlineResultDigest, inlineResult, resultTransferRef, acceptedAt, startedAt, finishedAt, observedAt, failureReason]
       properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
         operationRef: {$ref: '#/components/schemas/OpaqueRef'}
         requestDigest: {$ref: '#/components/schemas/Sha256'}
         storedFrameDigest: {$ref: '#/components/schemas/Sha256'}
@@ -1645,6 +1634,18 @@ components:
           type: object
           additionalProperties: false
           required: [code, message, retryable, recoveryAction, requestId]
+          allOf:
+            - if:
+                required: [code]
+                properties:
+                  code: {const: TOMBSTONED}
+              then:
+                required: [context]
+                properties:
+                  retryable: {const: false}
+                  recoveryAction: {const: inspect_job}
+                  context:
+                    required: [tombstone]
           properties:
             code: {$ref: '#/components/schemas/ErrorCode'}
             message: {type: string, minLength: 1}
@@ -1653,29 +1654,6 @@ components:
             requestId: {$ref: '#/components/schemas/OpaqueRef'}
             details: {type: array, items: {$ref: '#/components/schemas/ErrorDetail'}}
             context: {$ref: '#/components/schemas/ErrorContext'}
-    TombstonedErrorEnvelope:
-      type: object
-      additionalProperties: false
-      required: [error]
-      properties:
-        error:
-          type: object
-          additionalProperties: false
-          required: [code, message, retryable, recoveryAction, requestId, context]
-          properties:
-            code: {type: string, const: TOMBSTONED}
-            message: {type: string, minLength: 1}
-            retryable: {type: boolean, const: false}
-            recoveryAction: {type: string, const: inspect_job}
-            requestId: {$ref: '#/components/schemas/OpaqueRef'}
-            details: {type: array, items: {$ref: '#/components/schemas/ErrorDetail'}}
-            context:
-              type: object
-              additionalProperties: false
-              required: [tombstone]
-              properties:
-                jobRef: {$ref: '#/components/schemas/OpaqueRef'}
-                tombstone: {$ref: '#/components/schemas/JobTombstone'}
     OpenApiDocument:
       type: object
       additionalProperties: true

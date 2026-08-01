@@ -23,6 +23,12 @@
       "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/workspace-operation-result-transfer.json"}
     },
     {
+      "scenario": "invoke-inline-result",
+      "operationId": "inspectWorkspaceOperation",
+      "request": {"path": {"jobRef": "job-synthetic-001", "operationRef": "operation-inline-synthetic-001"}},
+      "response": {"status": 200, "contentType": "application/json", "bodyFixture": "fixtures/workspace-operation-inline.json"}
+    },
+    {
       "scenario": "invoke-indeterminate",
       "operationId": "inspectWorkspaceOperation",
       "request": {"path": {"jobRef": "job-synthetic-001", "operationRef": "operation-synthetic-001"}},

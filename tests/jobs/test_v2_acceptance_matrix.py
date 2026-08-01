@@ -231,6 +231,7 @@ def test_job_binding_snapshot_exposes_recoverable_kubernetes_reality() -> None:
     assert required <= set(snapshot["required"])
     assert snapshot["additionalProperties"] is False
     assert "indeterminate" in schemas["JobBindingState"]["enum"]
+    assert {"RequestedResources", "ObservedResources", "RoleSnapshot"}.isdisjoint(schemas)
 
     for role_name, requested_name, maxima in (
         ("AgentRoleSnapshot", "AgentRequestedResources", (8000, 32768, 0, 100)),
@@ -255,6 +256,10 @@ def test_job_binding_snapshot_exposes_recoverable_kubernetes_reality() -> None:
         assert requested["memoryMiB"]["maximum"] == maxima[1]
         assert requested["gpu"].get("maximum", requested["gpu"].get("const")) == maxima[2]
         assert requested["storageGiB"]["maximum"] == maxima[3]
+        assert requested["cpuMillis"]["minimum"] == 1
+        assert requested["memoryMiB"]["minimum"] == 1
+        assert requested["storageGiB"]["minimum"] == 1
+        assert requested["gpu"].get("minimum", requested["gpu"].get("const")) == 0
     assert snapshot["properties"]["agent"] == {
         "oneOf": [{"$ref": "#/components/schemas/AgentRoleSnapshot"}, {"type": "null"}]
     }
@@ -423,6 +428,10 @@ def test_transfer_contract_freezes_relative_paths_direct_mode_and_recovery() -> 
     assert set(spec["properties"]["direction"]["enum"]) == {"stage_input", "collect_output"}
     assert spec["properties"]["path"] == {"$ref": "#/components/schemas/SafeRelativePath"}
     assert schemas["SafeRelativePath"]["format"] == "kcs-relative-posix-path"
+    assert schemas["SafeRelativePath"]["x-kcs-case-policy"] == (
+        "preserve-case-reject-casefold-collisions"
+    )
+    assert spec["x-kcs-path-collision-policy"] == "reject-existing-workspace-casefold-collision"
     assert spec["properties"]["mode"]["const"] == "direct"
     assert spec["properties"]["authorizedMaxSizeBytes"]["maximum"] == 107374182400
     assert spec["x-kcs-relations"] == [
@@ -471,6 +480,7 @@ def test_workspace_invoke_preserves_opaque_cosmos_frame_and_both_digest_domains(
 
     operation = schemas["WorkspaceOperationSnapshot"]
     assert {
+        "jobRef",
         "operationRef",
         "requestDigest",
         "storedFrameDigest",
@@ -549,7 +559,22 @@ def test_terminal_actions_tombstone_states_and_recovery_are_typed() -> None:
     create = _operation(document, "createJob")
     assert "410" in create["responses"]
     assert create["responses"]["410"]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/TombstonedErrorEnvelope"
+        "$ref": "#/components/schemas/ErrorEnvelope"
+    }
+    assert create["x-kcs-unknown-outcome-recovery"] == {
+        "operationId": "listJobs",
+        "method": "GET",
+        "path": "/api/v2/jobs",
+        "query": {
+            "providerRequestId": "$request.body#/providerRequestId",
+            "includeDeleted": True,
+        },
+        "combinedCollections": ["items", "tombstones"],
+        "maximumMatches": 1,
+        "compareDigest": {
+            "responseField": "specDigest",
+            "requestField": "specDigest",
+        },
     }
     assert set(schemas["ActionState"]["enum"]) >= {
         "not_requested",
@@ -645,6 +670,11 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
 
     discovery = _operation(document, "getCanonicalOpenApi")["responses"]["200"]
     assert discovery["headers"]["ETag"]["schema"]["pattern"] == "^[0-9a-f]{64}$"
+    assert discovery["x-kcs-etag-derivation"] == {
+        "algorithm": "sha256",
+        "source": "exact-response-bytes",
+        "encoding": "lowercase-hex",
+    }
     assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.0.0"
     assert discovery["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
     assert document["x-kcs-legacy-authorization"] == {
@@ -653,6 +683,35 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "secrets": "denied",
         "mutations": "denied",
     }
+
+
+def test_recovery_gets_return_retained_indeterminate_and_cleanup_states_as_snapshots() -> None:
+    document = _openapi()
+
+    grant = _operation(document, "inspectCredentialGrant")
+    assert "CREDENTIAL_EXPIRED" not in grant["x-kcs-error-codes"]
+    assert "CREDENTIAL_DESTROY_FAILED" not in grant["x-kcs-error-codes"]
+    assert "410" not in grant["responses"]
+
+    transfer = _operation(document, "inspectTransfer")
+    assert "TRANSFER_INDETERMINATE" not in transfer["x-kcs-error-codes"]
+
+    workspace = _operation(document, "inspectWorkspaceOperation")
+    assert "OPERATION_INDETERMINATE" not in workspace["x-kcs-error-codes"]
+
+
+def test_every_replay_conflict_status_matches_its_error_map() -> None:
+    document = _openapi()
+    checked: set[str] = set()
+    for path_item in document["paths"].values():
+        for method, operation in path_item.items():
+            if method not in MUTATING_METHODS or "x-kcs-replay" not in operation:
+                continue
+            replay = operation["x-kcs-replay"]
+            rule = operation["x-kcs-error-codes"][replay["conflictCode"]]
+            assert rule["status"] == replay["conflictStatus"], operation["operationId"]
+            checked.add(operation["operationId"])
+    assert "putTransferContent" in checked
 
 
 def test_route_examples_cover_every_required_recovery_scenario() -> None:
@@ -673,12 +732,16 @@ def test_route_examples_cover_every_required_recovery_scenario() -> None:
         "start-next-generation",
         "start-pod-loss",
         "transfer-stage",
+        "transfer-stage-content",
         "transfer-collect",
+        "transfer-collect-content",
+        "transfer-collect-completed",
         "transfer-cancel",
         "transfer-discard",
         "transfer-restart",
         "invoke-new",
         "invoke-result-transfer",
+        "invoke-inline-result",
         "invoke-indeterminate",
         "finalize-provider-quiesce",
         "cancel-output-loss",

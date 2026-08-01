@@ -10,7 +10,7 @@ Generated component schemas and the checksum file are deterministic review artif
 the YAML remains the source of truth. The committed
 [canonical compact JSON](../openapi/generated/kcs-v2-jobs.openapi.json) and
 [checksum](../openapi/generated/kcs-v2-jobs.openapi.sha256) currently have digest
-`ce0a66ef20ef6fb67f7cedde9a06a2763f975ee61b4968653c5c714af578a8a0`.
+`6c7cc850a81b578a7380b4938030536335b114f68f0a4ccefc9923d1167663d9`.
 
 ## Runtime boundary and topology
 
@@ -28,8 +28,10 @@ initiates Kubernetes `pods/exec` with the respective `rpc` subcommand. Neither
 container exposes a Pod-local TCP listener.
 
 Production uses `KCS_API_MODE=v2`. All V2 routes use fail-closed Bearer service
-authentication from `KCS_V2_SERVICE_TOKEN` over TLS. Credential upload is further
-restricted to private ingress. V2 and legacy use distinct Kubernetes identities.
+authentication from `KCS_V2_SERVICE_TOKEN` over TLS and are reachable only through
+private ingress. Credential upload adds the narrower private credential-writer role,
+forbidden request-body logging, sensitive-header redaction, and
+`Cache-Control: no-store`. V2 and legacy use distinct Kubernetes identities.
 
 ## Frozen routes
 
@@ -81,6 +83,17 @@ The constant empty-object digest used by discard and delete is
 `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`.
 An unconfirmed mutation is never guessed to have succeeded or failed; only its
 matching inspect route establishes retained reality.
+
+If a create response is lost, recover with
+`GET /api/v2/jobs?providerRequestId=<same>&includeDeleted=true`. During live and
+tombstone retention this filter returns exactly zero or one matching record across
+the live `items` and retained `tombstones` arrays, never one in each. Zero means no
+retained create identity is established, so the caller may retry the exact create.
+One means the caller must compare the returned `specDigest`: an exact match
+establishes the retained live or tombstoned result, while a different digest is an
+identity conflict and must not be retried as new. A live match is inspected by
+`jobRef`; a tombstone match is handled as retained deletion until its advertised
+expiry.
 
 ## Create request and physical provider spec
 
@@ -160,17 +173,18 @@ about the owning research outcome.
 
 `GET /api/v2/jobs` accepts `pageToken`, `pageSize`, `providerRequestId`, `subjectRef`,
 repeatable `state`, `createdAfter`, and `includeDeleted`. Results are ordered by
-`(createdAt, jobRef)`. Page tokens are opaque base64url, bounded to 4096 bytes, and
-bound to the namespace and complete filter set. Malformed and stale tokens return
-`INVALID_PAGE_TOKEN` and `STALE_PAGE_TOKEN` respectively.
+`(createdAt, jobRef)`. Page tokens are opaque, canonically encoded unpadded base64url,
+bounded to 4096 bytes, and bound to the namespace and complete filter set. Malformed,
+non-canonical, and stale tokens return `INVALID_PAGE_TOKEN` and `STALE_PAGE_TOKEN`
+respectively.
 
 Role logs are the actual combined Kubernetes container log, returned as bounded
 `content`; they are not modeled as fictitious stdout/stderr streams. A response
 includes the requested/input cursor, start cursor, next cursor, truncation and
 terminal flags, Job UID, immutable Pod UID, role/container identity, container ID,
-and observation time. Cursors are opaque base64url, bounded to 4096 bytes, and bound
-to namespace, job, immutable Pod, and role. Malformed or stale values return
-`INVALID_CURSOR` or `STALE_CURSOR`.
+and observation time. Cursors are opaque, canonically encoded unpadded base64url,
+bounded to 4096 bytes, and bound to namespace, job, immutable Pod, and role.
+Malformed, non-canonical, or stale values return `INVALID_CURSOR` or `STALE_CURSOR`.
 
 ### Finalize, cancel, and delete
 
@@ -266,7 +280,10 @@ drive cleanup, `destroy_failed` exposes a failed Secret deletion, and `indetermi
 means KCS cannot prove the side effect. These states do not claim issuer-side
 revocation, erasure from agent memory, or erasure of bytes a workload copied before
 ACK. The non-secret record remains inspectable until the returned
-`tombstoneExpiresAt`.
+`tombstoneExpiresAt`. In particular, retained `expired`, `destroy_failed`, and
+`indeterminate` grants remain successful `200` inspect snapshots; they are not
+converted to error envelopes merely because their lifecycle state is terminal or
+uncertain. After retention ends, inspection may return `404 NOT_FOUND`.
 
 `CredentialGrantSnapshot` never returns credential bytes. It echoes all identity,
 byte digest, metadata digest, launch/generation/audience, Job/Pod binding, TTL and
@@ -309,8 +326,9 @@ generation N's child has a known terminal runner state (`exited` or `failed`). A
 must already have been staged and verified under retained transfer/provider reality;
 the start route neither uploads nor replaces it. Runtime code must resolve the
 already-staged content before dispatch and must not treat an in-flight or
-`indeterminate` transfer as ready. The public request shape intentionally adds no
-transfer refs or material bytes.
+`indeterminate` transfer as ready. Paths preserve the caller's case, but the list is
+case-fold unique so differently cased aliases cannot name one material twice. The
+public request shape intentionally adds no transfer refs or material bytes.
 
 The generation snapshot includes generation, AgentRun/envelope identity and digests,
 launch path/digest/size, material paths, grant ref, internal metadata digest, runner
@@ -334,8 +352,9 @@ Registration is exactly `{transferRef, requestDigest, spec}` with the digest ove
 - `overwritePolicy: forbid | replace_authorized`.
 
 KCS rejects an empty or absolute path, `.`, `..`, empty/repeated segments, NUL/control
-bytes, symlink traversal, case/Unicode normalization ambiguity, and unauthorized
-replacement.
+bytes, symlink traversal, Unicode normalization ambiguity, and unauthorized
+replacement. It preserves path case but rejects registration when the requested path
+case-folds to an existing workspace path.
 
 V2.0.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
 It exposes no signed URL or transfer token and implements no `Range` request mode.
@@ -347,7 +366,10 @@ JSON control and content bytes are separate. Stage PUT supplies
 counts and hashes bytes, validates the authorized path/size/digest, fsyncs as
 applicable, and atomically renames. Interrupted or uncertain installs remain
 inspectable and are never exposed as success. A byte-identical replay is idempotent;
-mismatched content cannot replace the final file.
+mismatched replay bytes cannot replace the final file and return
+`409 TRANSFER_BYTES_MISMATCH`. A semantically invalid first upload, such as bytes
+that do not satisfy the registered declared size or digest, is a distinct validation
+failure and may return `422`; it is not mislabeled as a changed replay.
 
 The transfer registration operation and content PUT have distinct route/action-kind
 identity domains even though each is scoped by the same `(jobRef, transferRef)`; their
@@ -372,6 +394,11 @@ stable replay; after restart, inspect alone determines whether retry is safe. Ca
 or discard never implies that content disappeared unless the returned snapshot's
 availability and action observations establish it.
 
+Retained transfer states, including `indeterminate`, remain `200` inspect snapshots
+until their retention ends. An uncertain state is provider reality to reconcile, not
+an inspect-route error response; after retention ends the resource may become
+`404 NOT_FOUND`.
+
 ## Opaque workspace invocation
 
 The workspace invoke body is the complete existing `cosmos.workspace/1` frame object
@@ -381,6 +408,9 @@ KCS command schema. KCS constrains only that it is a JSON object with
 properties stay opaque. "Forwarded unchanged" means the parsed JSON object and its
 member values are not translated, normalized into a KCS command schema, or mutated;
 original HTTP whitespace and member order are not separate semantic identity.
+Any owner-named or owner-identity fields inside the frame remain uninterpreted opaque
+members. KCS neither treats them as authorization/binding inputs nor compares them
+with KCS headers or path parameters.
 
 The platform supplies typed metadata in headers:
 
@@ -403,16 +433,24 @@ The supplied `KCS-Job-UID` and `KCS-Pod-UID` must match both current immutable r
 and the retained operation binding. A mismatch returns `STALE_BINDING` or
 `REPLACEMENT_POD`; it is not hidden by a matching platform or stored-frame digest.
 
-`WorkspaceOperationSnapshot` exposes operation ref, platform request digest, stored
-full-frame digest, immutable binding, state, exit code, independently bounded
+`WorkspaceOperationSnapshot` binds and exposes both `jobRef` and `operationRef`, plus
+the platform request digest, stored full-frame digest, immutable binding, state, exit
+code, independently bounded
 stdout/stderr and truncation flags, inline-result size/digest and optional bounded
 inline object (at most 64 KiB canonical JSON), optional `resultTransferRef` for larger
 data, accepted/started/finished/observed timestamps, and sanitized failure reason.
+When an inline object is present, its size is the UTF-8 byte length of RFC 8785 JCS and
+its digest is SHA-256 of those exact bytes; the value, size, and digest are all null or
+all present. An inline result and `resultTransferRef` are mutually exclusive.
 Operation states are
 `accepted | running | succeeded | failed | indeterminate`; Job inspect lists active
 and terminal operation refs. A `resultTransferRef` is reported only when the provider
 sidecar/RPC result names an already-authorized collect transfer; KCS does not derive
 one by interpreting opaque frame fields.
+
+Retained operation states, including `indeterminate`, remain `200` inspect snapshots
+until their retention ends. Inspection reports uncertain reality rather than
+converting it to an error; after retention ends the operation may be `404 NOT_FOUND`.
 
 ## Frozen states, limits, and defaults
 
@@ -449,11 +487,15 @@ Separate state domains prevent guessed success:
 | Create/delete tombstone | 604800 s | namespace scoped |
 
 All other live metadata is Job-owned until explicit delete.
+Requested CPU, memory, and storage snapshot values have a minimum of one; only GPU
+requests may be zero where the role permits them.
 
 ## Authentication, authorization, and disclosure
 
-Bearer service authentication and TLS are required globally. Raw credential upload
-is further restricted to private ingress. mTLS may be deployed as an infrastructure
+Bearer service authentication, TLS, and private ingress are required globally for
+all V2 routes. Raw credential upload additionally requires the private
+credential-writer role, forbidden body logging, sensitive-header redaction, and
+`Cache-Control: no-store`. mTLS may be deployed as an infrastructure
 control but is not a V2.0.0 wire requirement. Routes additionally require the
 declared service authorization role: `v2-reader`, `v2-mutator`, or, for raw
 credential upload, `v2-private-credential-writer`.

@@ -44,12 +44,16 @@ REQUIRED_SCENARIOS = {
     "start-next-generation",
     "start-pod-loss",
     "transfer-stage",
+    "transfer-stage-content",
     "transfer-collect",
+    "transfer-collect-content",
+    "transfer-collect-completed",
     "transfer-cancel",
     "transfer-discard",
     "transfer-restart",
     "invoke-new",
     "invoke-result-transfer",
+    "invoke-inline-result",
     "invoke-indeterminate",
     "finalize-provider-quiesce",
     "cancel-output-loss",
@@ -59,9 +63,9 @@ REQUIRED_SCENARIOS = {
 SECRET_VALUE = re.compile(
     r"(?ix)("
     r"(?:authorization|bearer|cookie|api[_-]?key|token|secret|credential)(?:\s+|\s*[:=])"
-    r"|-----BEGIN[ -][A-Z0-9 ]+(?:PRIVATE KEY|CERTIFICATE)-----"
+    r"|-----BEGIN\x20(?:[A-Z0-9]+\x20)*(?:PRIVATE\x20KEY|CERTIFICATE)-----"
     r"|(?:ssh-(?:rsa|ed25519)|kubeconfig|serviceaccount)"
-    r"|[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@"
+    r"|[a-z][a-z0-9+.-]*://[^/@\s]+@"
     r")"
 )
 
@@ -211,9 +215,21 @@ def _is_non_secret_runtime_value(value: object) -> bool:
     return isinstance(value, str) and SECRET_VALUE.search(value) is None
 
 
+def _is_canonical_base64url(value: object) -> bool:
+    if not isinstance(value, str) or not BASE64URL.fullmatch(value) or len(value) % 4 == 1:
+        return False
+    padding = "=" * (-len(value) % 4)
+    try:
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return base64.urlsafe_b64encode(decoded).rstrip(b"=").decode() == value
+
+
 FORMAT_CHECKER = FormatChecker()
 FORMAT_CHECKER.checks("kcs-relative-posix-path")(_is_safe_relative_posix_path)
 FORMAT_CHECKER.checks("kcs-non-secret-runtime-value")(_is_non_secret_runtime_value)
+FORMAT_CHECKER.checks("kcs-base64url")(_is_canonical_base64url)
 
 
 def _check_extended_limits(instance: Any, schema: Any, document: dict[str, Any]) -> None:
@@ -281,22 +297,12 @@ def _check_extended_limits(instance: Any, schema: Any, document: dict[str, Any])
             child_schema = properties.get(key, additional if isinstance(additional, dict) else {})
             _check_extended_limits(value, child_schema, document)
     if isinstance(instance, list) and isinstance(schema.get("items"), dict):
+        if schema.get("x-kcs-casefoldUnique") is True:
+            folded = [value.casefold() for value in instance if isinstance(value, str)]
+            if len(folded) != len(set(folded)):
+                raise ValueError("array contains a casefold collision")
         for value in instance:
             _check_extended_limits(value, schema["items"], document)
-
-
-def _check_secret_runtime_env(instance: Any) -> None:
-    if isinstance(instance, dict):
-        runtime_env = instance.get("runtimeEnv")
-        if isinstance(runtime_env, dict):
-            for value in runtime_env.values():
-                if not _is_non_secret_runtime_value(value):
-                    raise ValueError("secret-shaped runtimeEnv value is forbidden")
-        for child in instance.values():
-            _check_secret_runtime_env(child)
-    elif isinstance(instance, list):
-        for child in instance:
-            _check_secret_runtime_env(child)
 
 
 def _validate_instance(
@@ -308,19 +314,22 @@ def _validate_instance(
         "components": document["components"],
     }
     try:
-        _check_secret_runtime_env(instance)
         Draft202012Validator(root_schema, format_checker=FORMAT_CHECKER).validate(instance)
         _check_extended_limits(instance, schema, document)
-    except (ValidationError, ValueError) as exc:
+    except ValidationError as exc:
+        if exc.validator == "format" and exc.validator_value == "kcs-non-secret-runtime-value":
+            raise ValueError(f"{label}: secret-shaped runtimeEnv value is forbidden") from exc
+        raise ValueError(f"{label}: {exc}") from exc
+    except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
 
 
 def _fixture_path(examples_dir: Path, value: str, label: str) -> Path:
     candidate = (examples_dir / value).resolve()
     try:
-        candidate.relative_to(examples_dir.resolve())
+        candidate.relative_to((examples_dir / "fixtures").resolve())
     except ValueError as exc:
-        raise ValueError(f"{label}: fixture escapes examples directory") from exc
+        raise ValueError(f"{label}: fixture must be under examples/fixtures") from exc
     if not candidate.is_file():
         raise ValueError(f"{label}: fixture does not exist: {value}")
     return candidate
@@ -365,15 +374,36 @@ def _binary_body(section: dict[str, Any], examples_dir: Path, label: str) -> byt
 
 def _operation_index(document: dict[str, Any]) -> dict[str, tuple[str, str, dict[str, Any]]]:
     result: dict[str, tuple[str, str, dict[str, Any]]] = {}
-    for path, path_item in document["paths"].items():
+    paths = document.get("paths")
+    if not isinstance(paths, Mapping):
+        raise ValueError("OpenAPI document paths must be an object")
+    for path, path_item in paths.items():
+        if not isinstance(path_item, Mapping):
+            raise ValueError(f"OpenAPI document path item {path!r} must be an object")
         for method, operation in path_item.items():
             if method not in HTTP_METHODS:
                 continue
+            if not isinstance(operation, Mapping):
+                raise ValueError(
+                    f"OpenAPI document operation {method.upper()} {path} must be an object"
+                )
             operation_id = operation.get("operationId")
             if not operation_id or operation_id in result:
                 raise ValueError(f"OpenAPI document has invalid operationId {operation_id!r}")
             result[operation_id] = (method, path, operation)
     return result
+
+
+def _validate_contract_extensions(document: dict[str, Any]) -> None:
+    for operation_id, (_method, _path, operation) in _operation_index(document).items():
+        replay = operation.get("x-kcs-replay")
+        if replay is None:
+            continue
+        mapping = operation.get("x-kcs-error-codes", {})
+        conflict_code = replay.get("conflictCode")
+        rule = mapping.get(conflict_code)
+        if not isinstance(rule, dict) or rule.get("status") != replay.get("conflictStatus"):
+            raise ValueError(f"{operation_id}: replay conflict mapping disagrees with error map")
 
 
 def _parameters(
@@ -458,9 +488,7 @@ def _normalized_wire_name(value: str) -> str:
 def _find_semantic_header(headers: Mapping[str, Any], field: str, label: str) -> Any:
     expected = _normalized_wire_name(field)
     matches = [
-        value
-        for name, value in headers.items()
-        if _normalized_wire_name(name).endswith(expected)
+        value for name, value in headers.items() if _normalized_wire_name(name).endswith(expected)
     ]
     if len(matches) != 1:
         raise ValueError(f"{label}: missing header carrying {field}")
@@ -635,7 +663,50 @@ def _validate_declared_digest_projection(
             _assert_digest(actual, supplied, label)
 
 
+def _requested_resource_echo(
+    document: Mapping[str, Any], spec: Mapping[str, Any], role: str
+) -> dict[str, int]:
+    schema_name = "AgentResources" if role == "agent" else "WorkspaceResources"
+    resource_schema = document["components"]["schemas"][schema_name]["properties"]
+    supplied = spec[role].get("resources", {})
+    values = {
+        name: supplied.get(name, definition.get("default"))
+        for name, definition in resource_schema.items()
+    }
+    if role == "agent":
+        values["gpu"] = 0
+    values["storageGiB"] = spec["sharedWorkspace"]["sizeLimitGiB"]
+    return values
+
+
+def _validate_workspace_result(
+    response_body: Mapping[str, Any], relation: Mapping[str, Any], label: str
+) -> None:
+    expected_relation = {
+        "canonicalization": "rfc8785-jcs",
+        "value": "inlineResult",
+        "size": "inlineResultSize",
+        "digest": "inlineResultDigest",
+        "exclusiveWith": "resultTransferRef",
+    }
+    if relation != expected_relation:
+        raise ValueError(f"{label}: inline result relation extension is invalid")
+    inline = response_body.get(relation["value"])
+    size = response_body.get(relation["size"])
+    digest = response_body.get(relation["digest"])
+    transfer_ref = response_body.get(relation["exclusiveWith"])
+    if inline is None:
+        if size is not None or digest is not None:
+            raise ValueError(f"{label}: inline result fields are inconsistent")
+        return
+    canonical = rfc8785.dumps(inline)
+    expected_digest = hashlib.sha256(canonical).hexdigest()
+    if size != len(canonical) or digest != expected_digest or transfer_ref is not None:
+        raise ValueError(f"{label}: inline result fields are inconsistent")
+
+
 def _validate_digest_semantics(
+    document: Mapping[str, Any],
     operation: Mapping[str, Any],
     operation_id: str,
     request: dict[str, Any],
@@ -661,6 +732,23 @@ def _validate_digest_semantics(
             _assert_digest(request_body["specDigest"], response_body["specDigest"], label)
             if response_body.get("providerRequestId") != request_body["providerRequestId"]:
                 raise ValueError(f"{label}: response does not echo providerRequestId")
+            spec = request_body["spec"]
+            expected = {
+                "subjectRef": spec["subjectRef"],
+                "runtimePlanDigest": spec["runtimePlanDigest"],
+            }
+            physical_echo_matches = all(
+                response_body.get(field) == value for field, value in expected.items()
+            )
+            for role in ("agent", "workspace"):
+                role_snapshot = response_body.get(role)
+                physical_echo_matches = physical_echo_matches and isinstance(role_snapshot, dict)
+                if isinstance(role_snapshot, dict):
+                    physical_echo_matches = physical_echo_matches and role_snapshot.get(
+                        "requested"
+                    ) == _requested_resource_echo(document, spec, role)
+            if not physical_echo_matches:
+                raise ValueError(f"{label}: create response does not echo accepted physical spec")
     elif operation_id == "grantCredential":
         raw_digest = hashlib.sha256(request_bytes or b"").hexdigest()
         metadata, metadata_digest = _metadata_projection(
@@ -716,9 +804,22 @@ def _validate_digest_semantics(
                 raise ValueError(f"{label}: response does not echo requestDigest")
     elif operation_id == "putTransferContent":
         digest = hashlib.sha256(request_bytes or b"").hexdigest()
-        if _header_value(headers, "Content-Length", label) != len(request_bytes or b""):
+        byte_count = len(request_bytes or b"")
+        if _header_value(headers, "Content-Length", label) != byte_count:
             raise ValueError(f"{label}: Content-Length does not match body bytes")
         if isinstance(response_body, dict):
+            if (
+                response_body.get("state") != "completed"
+                or response_body.get("verified") is not True
+                or response_body.get("contentAvailable") is not True
+                or response_body.get("completedAt") is None
+            ):
+                raise ValueError(f"{label}: uploaded transfer must be completed and verified")
+            if (
+                response_body.get("actualSizeBytes") != byte_count
+                or response_body.get("spec", {}).get("declaredSizeBytes") != byte_count
+            ):
+                raise ValueError(f"{label}: uploaded transfer size does not match body bytes")
             if response_body.get("spec", {}).get("contentSha256") != digest:
                 raise ValueError(f"{label}: transfer spec does not bind the uploaded bytes")
             if response_body.get("actualSha256") != digest:
@@ -737,6 +838,11 @@ def _validate_digest_semantics(
             elif response_body.get("deleteRequestDigest") != digest:
                 raise ValueError(f"{label}: response does not echo requestDigest")
     elif operation_id == "getTransferContent":
+        if (
+            "X-KCS-Snapshot-Ref" not in response_headers
+            or response_headers.get("Cache-Control") != "no-store"
+        ):
+            raise ValueError(f"{label}: collect response must carry snapshot identity and no-store")
         digest = hashlib.sha256(response_bytes or b"").hexdigest()
         _assert_digest(
             digest,
@@ -760,6 +866,15 @@ def _validate_digest_semantics(
         }
         if response_body.get("binding") != expected_binding:
             raise ValueError(f"{label}: response does not echo immutable binding")
+    if (
+        operation_id in {"invokeWorkspace", "inspectWorkspaceOperation"}
+        and isinstance(response_body, dict)
+        and _error_code(response_body) is None
+    ):
+        relation = document["components"]["schemas"]["WorkspaceOperationSnapshot"].get(
+            "x-kcs-inline-result-relation", {}
+        )
+        _validate_workspace_result(response_body, relation, label)
 
 
 def _error_code(response_body: Any) -> Any:
@@ -770,9 +885,7 @@ def _error_code(response_body: Any) -> Any:
     return None
 
 
-def _validate_response_identity(
-    request: Mapping[str, Any], response_body: Any, label: str
-) -> None:
+def _validate_response_identity(request: Mapping[str, Any], response_body: Any, label: str) -> None:
     if not isinstance(response_body, dict) or _error_code(response_body) is not None:
         return
     for name, expected in request.get("path", {}).items():
@@ -783,6 +896,7 @@ def _validate_response_identity(
 def _validate_scenario_semantics(
     scenario: str,
     status: str,
+    request: Mapping[str, Any],
     request_body: Any,
     response_body: Any,
     label: str,
@@ -792,22 +906,40 @@ def _validate_scenario_semantics(
         "create-replay": "200",
         "create-conflict": "409",
         "create-tombstone": "410",
+        "binding-inspect": "200",
+        "list-page": "200",
+        "logs-continuation": "200",
         "grant-new": "201",
         "grant-replay": "200",
+        "grant-acknowledged": "200",
+        "grant-destroyed": "200",
         "start-new": "202",
         "start-replay": "200",
         "start-next-generation": "202",
         "start-pod-loss": "409",
         "transfer-stage": "201",
+        "transfer-stage-content": "200",
         "transfer-collect": "201",
+        "transfer-collect-content": "200",
+        "transfer-collect-completed": "200",
         "transfer-cancel": "202",
+        "transfer-discard": "200",
+        "transfer-restart": "200",
         "invoke-new": "202",
+        "invoke-result-transfer": "200",
+        "invoke-inline-result": "200",
+        "invoke-indeterminate": "200",
         "finalize-provider-quiesce": "202",
         "cancel-output-loss": "202",
+        "delete-tombstone": "200",
         "typed-error": "404",
-    }.get(scenario)
-    if expected_status is not None and status != expected_status:
-        raise ValueError(f"{label}: scenario requires status {expected_status}")
+    }
+    if set(expected_status) != REQUIRED_SCENARIOS:
+        raise ValueError("generator scenario status table does not cover required scenarios")
+    if scenario not in expected_status:
+        raise ValueError(f"{label}: unknown scenario {scenario!r}")
+    if status != expected_status[scenario]:
+        raise ValueError(f"{label}: scenario requires status {expected_status[scenario]}")
 
     if scenario == "create-conflict" and _error_code(response_body) != "IDENTITY_CONFLICT":
         raise ValueError(f"{label}: create conflict must use IDENTITY_CONFLICT")
@@ -816,8 +948,19 @@ def _validate_scenario_semantics(
         context = error.get("context", {}) if isinstance(error, dict) else {}
         if error.get("code") != "TOMBSTONED" or not isinstance(context.get("tombstone"), dict):
             raise ValueError(f"{label}: tombstone scenario must carry sanitized tombstone context")
+        tombstone = context["tombstone"]
+        if (
+            tombstone.get("providerRequestId") != request_body.get("providerRequestId")
+            or tombstone.get("specDigest") != request_body.get("specDigest")
+            or context.get("jobRef") != tombstone.get("jobRef")
+        ):
+            raise ValueError(f"{label}: tombstone does not match create identity or digest")
     if scenario == "typed-error" and _error_code(response_body) != "NOT_FOUND":
         raise ValueError(f"{label}: typed 404 example must use NOT_FOUND")
+    if scenario == "logs-continuation" and response_body.get("container") != request.get(
+        "query", {}
+    ).get("container"):
+        raise ValueError(f"{label}: logs response container does not match request")
     if scenario == "grant-acknowledged" and response_body.get("state") != "acknowledged":
         raise ValueError(f"{label}: grant must be acknowledged")
     if scenario == "grant-destroyed":
@@ -864,11 +1007,26 @@ def _validate_scenario_semantics(
             raise ValueError(f"{label}: discard scenario must show its terminal action")
     if scenario == "transfer-restart" and response_body.get("state") != "indeterminate":
         raise ValueError(f"{label}: restart example must expose indeterminate reality")
+    if scenario == "transfer-collect-completed" and (
+        response_body.get("state") != "completed"
+        or response_body.get("verified") is not True
+        or response_body.get("contentAvailable") is not True
+        or response_body.get("snapshotRef") is None
+        or response_body.get("completedAt") is None
+        or response_body.get("actualSizeBytes")
+        != response_body.get("spec", {}).get("declaredSizeBytes")
+        or response_body.get("actualSha256") != response_body.get("spec", {}).get("contentSha256")
+    ):
+        raise ValueError(f"{label}: collect inspect must expose a completed snapshot")
     if scenario == "invoke-new" and response_body.get("state") != "accepted":
         raise ValueError(f"{label}: new invocation must be accepted")
     if scenario == "invoke-result-transfer":
         if response_body.get("state") != "succeeded" or not response_body.get("resultTransferRef"):
             raise ValueError(f"{label}: large result must name its collect transfer")
+    if scenario == "invoke-inline-result" and (
+        response_body.get("state") != "succeeded" or response_body.get("inlineResult") is None
+    ):
+        raise ValueError(f"{label}: inline result scenario must expose a succeeded result")
     if scenario == "invoke-indeterminate" and response_body.get("state") != "indeterminate":
         raise ValueError(f"{label}: unknown invocation outcome must remain indeterminate")
     if scenario == "finalize-provider-quiesce":
@@ -964,15 +1122,51 @@ def _validate_example_links(exchanges: Mapping[str, Mapping[str, Any]]) -> None:
             if _request_digest(target) == _request_digest(record):
                 raise ValueError(f"{scenario}: conflictsWith does not change the request digest")
 
+    collect_content = exchanges.get("transfer-collect-content")
+    collect_snapshot = exchanges.get("transfer-collect-completed")
+    if collect_content is not None and collect_snapshot is not None:
+        content_path = collect_content["request"]["path"]
+        snapshot_path = collect_snapshot["request"]["path"]
+        header_ref = collect_content["responseHeaders"].get("X-KCS-Snapshot-Ref")
+        header_size = collect_content["responseHeaders"].get("Content-Length")
+        header_digest = collect_content["responseHeaders"].get("X-Content-SHA256")
+        snapshot_ref = collect_snapshot["responseBody"].get("snapshotRef")
+        snapshot_size = collect_snapshot["responseBody"].get("actualSizeBytes")
+        snapshot_digest = collect_snapshot["responseBody"].get("actualSha256")
+        if (
+            content_path != snapshot_path
+            or header_ref != snapshot_ref
+            or header_size != snapshot_size
+            or header_digest != snapshot_digest
+        ):
+            raise ValueError("transfer collect content does not match its completed snapshot")
+
 
 def _validate_examples(source: Path, document: dict[str, Any]) -> int:
     examples_dir = source.parent / "examples"
+    fixtures_dir = examples_dir / "fixtures"
     example_paths = sorted(examples_dir.glob("*.json"))
     if not example_paths:
         raise ValueError(f"no sanitized route examples found in {examples_dir}")
+    fixture_files = {path.resolve() for path in fixtures_dir.rglob("*") if path.is_file()}
+    expected_layout_files = {
+        *(path.resolve() for path in example_paths),
+        *fixture_files,
+    }
+    unexpected_layout = sorted(
+        str(path.relative_to(examples_dir))
+        for path in examples_dir.rglob("*")
+        if path.is_file() and path.resolve() not in expected_layout_files
+    )
+    if unexpected_layout:
+        raise ValueError(
+            "invalid example tree layout; files must be top-level JSON route bundles "
+            f"or fixtures: {unexpected_layout}"
+        )
     operations = _operation_index(document)
     scenarios: set[str] = set()
     exchanges: dict[str, dict[str, Any]] = {}
+    referenced_fixtures: set[Path] = set()
     validated = 0
     for example_path in example_paths:
         try:
@@ -997,6 +1191,13 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
             response_example = exchange.get("response")
             if not isinstance(request, dict) or not isinstance(response_example, dict):
                 raise ValueError(f"{label}: request and response must be objects")
+            for section in (request, response_example):
+                for fixture_key in ("bodyFixture", "bodyFile"):
+                    fixture_name = section.get(fixture_key)
+                    if fixture_name is not None:
+                        referenced_fixtures.add(
+                            _fixture_path(examples_dir, fixture_name, label).resolve()
+                        )
             _validate_parameter_examples(document, path, operation, request, label)
 
             request_body: Any | None = None
@@ -1039,6 +1240,7 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
             elif set(response_example) & {"contentType", "body", "bodyFixture", "bodyFile"}:
                 raise ValueError(f"{label}: response has no body")
             _validate_digest_semantics(
+                document,
                 operation,
                 operation_id,
                 request,
@@ -1050,7 +1252,9 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
                 label,
             )
             _validate_response_identity(request, response_body, label)
-            _validate_scenario_semantics(scenario, status, request_body, response_body, label)
+            _validate_scenario_semantics(
+                scenario, status, request, request_body, response_body, label
+            )
             exchanges[scenario] = {
                 "operationId": operation_id,
                 "operation": operation,
@@ -1064,6 +1268,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
                 },
                 "requestBody": request_body,
                 "status": status,
+                "responseBody": response_body,
+                "responseHeaders": response_example.get("headers", {}),
                 "replayOf": exchange.get("replayOf"),
                 "conflictsWith": exchange.get("conflictsWith"),
             }
@@ -1072,6 +1278,9 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
     if missing:
         raise ValueError(f"route examples are missing required scenarios: {sorted(missing)}")
     _validate_example_links(exchanges)
+    unreferenced = sorted(path.name for path in fixture_files - referenced_fixtures)
+    if unreferenced:
+        raise ValueError(f"unreferenced fixture files: {unreferenced}")
     return validated
 
 
@@ -1084,6 +1293,7 @@ def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     if not schemas:
         raise ValueError("source must define component schemas")
     _validate_references(document)
+    _validate_contract_extensions(document)
     try:
         validate(document)
     except Exception as exc:  # validator versions expose several concrete exceptions

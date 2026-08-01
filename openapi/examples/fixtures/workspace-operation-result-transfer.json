@@ -1,4 +1,5 @@
 {
+  "jobRef": "job-synthetic-001",
   "operationRef": "operation-synthetic-001",
   "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "storedFrameDigest": "ce956f7bf2949f9bb17582941762a9e68370294dc9f4d6aaf56747f9c6717038",
