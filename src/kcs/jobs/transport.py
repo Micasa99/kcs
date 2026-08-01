@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from .errors import DependencyUnavailableError
+
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,9 +79,9 @@ def _response(output: bytes) -> AgentRpcResponse:
     try:
         value: Any = json.loads(output)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("supervisor returned invalid RPC JSON") from exc
+        raise DependencyUnavailableError("supervisor returned invalid RPC JSON") from exc
     if not isinstance(value, dict):
-        raise ValueError("supervisor returned an invalid RPC response")
+        raise DependencyUnavailableError("supervisor returned an invalid RPC response")
     required = (
         "protocolVersion",
         "generation",
@@ -86,23 +91,51 @@ def _response(output: bytes) -> AgentRpcResponse:
         "supervisorAlive",
     )
     if any(key not in value for key in required):
-        raise ValueError("supervisor RPC response is missing required fields")
+        raise DependencyUnavailableError("supervisor RPC response is missing required fields")
+    protocol = value["protocolVersion"]
+    generation = value["generation"]
+    supervisor_alive = value["supervisorAlive"]
+    if type(protocol) is not int or protocol != 1:
+        raise DependencyUnavailableError("supervisor RPC protocol is invalid")
+    if type(generation) is not int or generation < 0:
+        raise DependencyUnavailableError("supervisor RPC generation is invalid")
+    if type(supervisor_alive) is not bool:
+        raise DependencyUnavailableError("supervisor RPC liveness is invalid")
+    for field in ("agentRunRef", "launchBundleDigest", "state"):
+        if not isinstance(value[field], str):
+            raise DependencyUnavailableError("supervisor RPC field type is invalid")
+    if generation > 0 and (
+        not value["agentRunRef"] or not _DIGEST.fullmatch(value["launchBundleDigest"])
+    ):
+        raise DependencyUnavailableError("supervisor RPC start identity is invalid")
+    for field in ("pid", "exitCode"):
+        if value.get(field) is not None and type(value[field]) is not int:
+            raise DependencyUnavailableError("supervisor RPC process observation is invalid")
+    if "credentialConsumed" in value and type(value["credentialConsumed"]) is not bool:
+        raise DependencyUnavailableError("supervisor RPC consumption proof is invalid")
+    for field in ("credentialGrantRef", "audience", "credentialSha256", "error"):
+        if value.get(field) is not None and not isinstance(value[field], str):
+            raise DependencyUnavailableError("supervisor RPC optional field type is invalid")
+    if value.get("credentialSha256") is not None and not _DIGEST.fullmatch(
+        value["credentialSha256"]
+    ):
+        raise DependencyUnavailableError("supervisor RPC credential digest is invalid")
     return AgentRpcResponse(
-        protocol_version=int(value["protocolVersion"]),
-        generation=int(value["generation"]),
-        agent_run_ref=str(value["agentRunRef"]),
-        launch_bundle_digest=str(value["launchBundleDigest"]),
-        state=str(value["state"]),
-        supervisor_alive=bool(value["supervisorAlive"]),
-        credential_grant_ref=str(value["credentialGrantRef"])
+        protocol_version=protocol,
+        generation=generation,
+        agent_run_ref=value["agentRunRef"],
+        launch_bundle_digest=value["launchBundleDigest"],
+        state=value["state"],
+        supervisor_alive=supervisor_alive,
+        credential_grant_ref=value["credentialGrantRef"]
         if value.get("credentialGrantRef") is not None
         else None,
-        audience=str(value["audience"]) if value.get("audience") is not None else None,
-        credential_sha256=str(value["credentialSha256"])
+        audience=value["audience"] if value.get("audience") is not None else None,
+        credential_sha256=value["credentialSha256"]
         if value.get("credentialSha256") is not None
         else None,
-        credential_consumed=bool(value.get("credentialConsumed", False)),
-        pid=int(value["pid"]) if value.get("pid") is not None else None,
-        exit_code=int(value["exitCode"]) if value.get("exitCode") is not None else None,
-        error=str(value["error"]) if value.get("error") is not None else None,
+        credential_consumed=value.get("credentialConsumed", False),
+        pid=value["pid"] if value.get("pid") is not None else None,
+        exit_code=value["exitCode"] if value.get("exitCode") is not None else None,
+        error=value["error"] if value.get("error") is not None else None,
     )

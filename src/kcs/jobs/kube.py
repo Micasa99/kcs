@@ -17,7 +17,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 
-from .errors import InvalidCursorError, StaleCursorError
+from .errors import (
+    DependencyTimeoutError,
+    DependencyUnavailableError,
+    InvalidCursorError,
+    StaleCursorError,
+)
 
 Role = Literal["agent", "workspace"]
 
@@ -326,10 +331,20 @@ class V2KubeAdapter:
                 while websocket.peek_stderr():
                     errors.append(str(websocket.read_stderr()))
             if websocket.is_open():
-                raise TimeoutError("supervisor exec did not complete")
+                raise DependencyTimeoutError("supervisor exec did not complete")
             if errors:
-                raise RuntimeError("supervisor exec returned stderr")
-            return "".join(output).encode("utf-8")
+                raise DependencyUnavailableError("supervisor exec returned an error stream")
+            status = _exec_status(websocket.read_channel(3))
+            if status != 0:
+                raise DependencyUnavailableError("supervisor exec did not succeed")
+            encoded = "".join(output).encode("utf-8")
+            if len(encoded) > 65536:
+                raise DependencyUnavailableError("supervisor exec response exceeded its bound")
+            return encoded
+        except (DependencyTimeoutError, DependencyUnavailableError):
+            raise
+        except Exception as error:
+            raise DependencyUnavailableError("supervisor exec dependency failed") from error
         finally:
             websocket.close()
 
@@ -400,6 +415,43 @@ def _status(exc: Exception) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _exec_status(raw: object) -> int:
+    """Parse Kubernetes' remote-command status channel without exposing its body."""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise DependencyUnavailableError("supervisor exec status was invalid") from error
+    if not isinstance(raw, str) or not raw:
+        raise DependencyUnavailableError("supervisor exec status was absent")
+    try:
+        status = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise DependencyUnavailableError("supervisor exec status was invalid") from error
+    if not isinstance(status, dict):
+        raise DependencyUnavailableError("supervisor exec status was invalid")
+    if status.get("status") == "Success":
+        return 0
+    details = status.get("details")
+    causes = details.get("causes") if isinstance(details, dict) else None
+    if not isinstance(causes, list):
+        raise DependencyUnavailableError("supervisor exec status was indeterminate")
+    exit_codes = [
+        cause.get("message")
+        for cause in causes
+        if isinstance(cause, dict) and cause.get("reason") == "ExitCode"
+    ]
+    if len(exit_codes) != 1 or not isinstance(exit_codes[0], str):
+        raise DependencyUnavailableError("supervisor exec status was indeterminate")
+    try:
+        code = int(exit_codes[0])
+    except ValueError as error:
+        raise DependencyUnavailableError("supervisor exec status was invalid") from error
+    if str(code) != exit_codes[0] or code <= 0:
+        raise DependencyUnavailableError("supervisor exec status was invalid")
+    return code
 
 
 def _value(value: Any, name: str) -> Any:

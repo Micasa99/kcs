@@ -342,13 +342,13 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/agent/credential-grants",
         operation_id="grantCredential",
         tags=["Credentials"],
+        dependencies=[Depends(require_role("v2-private-credential-writer"))],
         status_code=201,
         response_model=CredentialGrantSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503),
     )
     async def grant_credential(
         request: Request,
-        _caller: Annotated[V2Caller, Depends(require_role("v2-private-credential-writer"))],
         job_ref: Annotated[
             str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
         ],
@@ -461,9 +461,8 @@ def create_jobs_router(
         ],
         payload: FinalizeJobRequest,
     ) -> Response:
-        before = provider.inspect(job_ref).finalize_action
-        replay = before.action_ref == payload.finalize_ref
-        return _json_model(provider.finalize(job_ref, payload), status_code=200 if replay else 202)
+        result = provider.finalize(job_ref, payload)
+        return _json_model(result.snapshot, status_code=202 if result.created else 200)
 
     @router.delete(
         "/api/v2/jobs/{jobRef}",

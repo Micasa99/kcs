@@ -127,6 +127,7 @@ class RuntimeRecord:
     job_ref: str
     values: Mapping[str, str]
     resource_version: str | None = None
+    storage_name: str | None = None
 
 
 class V2JobStore:
@@ -414,11 +415,17 @@ class V2JobStore:
                 job_ref=current.job_ref,
                 values=dict(values),
                 resource_version=current.resource_version,
+                storage_name=current.storage_name,
             )
+            storage_name = current.storage_name or _runtime_record_name(kind, job_ref, identity)
             try:
                 written = self._kube.replace_config_map(
-                    _runtime_record_name(kind, job_ref, identity),
-                    _runtime_config_map_body(desired, resource_version=current.resource_version),
+                    storage_name,
+                    _runtime_config_map_body(
+                        desired,
+                        resource_version=current.resource_version,
+                        storage_name=storage_name,
+                    ),
                 )
             except Exception as exc:
                 if _status(exc) == 409:
@@ -610,10 +617,15 @@ def _record_from_config_map(config_map: Any) -> CreateRecord:
 
 
 def _runtime_config_map_body(
-    record: RuntimeRecord, *, resource_version: str | None = None
+    record: RuntimeRecord,
+    *,
+    resource_version: str | None = None,
+    storage_name: str | None = None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
-        "name": _runtime_record_name(record.kind, record.job_ref, record.identity),
+        "name": storage_name
+        or record.storage_name
+        or _runtime_record_name(record.kind, record.job_ref, record.identity),
         "labels": {
             MANAGED_BY_LABEL: MANAGED_BY_VALUE,
             RECORD_KIND_LABEL: f"runtime-{record.kind}",
@@ -666,6 +678,7 @@ def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:
         values=MappingProxyType(values),
         resource_version=_value(metadata, "resource_version")
         or _value(metadata, "resourceVersion"),
+        storage_name=_value(metadata, "name"),
     )
 
 

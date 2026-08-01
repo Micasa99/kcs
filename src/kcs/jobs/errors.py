@@ -114,6 +114,18 @@ class StateConflictError(KcsV2Error):
     default_message = "The job is not in a state that permits this operation"
 
 
+class OperationIndeterminateError(StateConflictError):
+    code = "OPERATION_INDETERMINATE"
+    recovery_action = "inspect_operation"
+    default_message = "A requested operation has indeterminate retained state"
+
+
+class TransferIndeterminateError(StateConflictError):
+    code = "TRANSFER_INDETERMINATE"
+    recovery_action = "inspect_transfer"
+    default_message = "A requested transfer has indeterminate retained state"
+
+
 class IllegalGenerationError(KcsV2Error):
     code = "ILLEGAL_GENERATION"
     status_code = 409

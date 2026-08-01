@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .contracts import (
     CredentialObservation,
     CredentialState,
     FinalizeJobRequest,
+    FinalizeSpec,
     GenerationSnapshot,
     JobBindingSnapshot,
     JobBindingSnapshotList,
@@ -45,6 +47,8 @@ from .contracts import (
     RoleLogs,
     RoleState,
     RunnerState,
+    TransferObservation,
+    TransferState,
     WorkspaceObservedResources,
     WorkspaceRequestedResources,
     WorkspaceRoleSnapshot,
@@ -64,12 +68,14 @@ from .errors import (
     InvalidRequestError,
     JobNotFoundError,
     KcsV2Error,
+    OperationIndeterminateError,
     PayloadTooLargeError,
     ReplacementPodError,
     StaleCursorError,
     StalePageTokenError,
     StateConflictError,
     TombstonedError,
+    TransferIndeterminateError,
 )
 from .renderer import credential_secret_name
 from .transport import AgentRpcResponse, AgentRpcTransportProtocol
@@ -83,6 +89,15 @@ DEFAULT_TOMBSTONE_TTL_SECONDS = 604800
 DEFAULT_DELETE_POLL_ATTEMPTS = 20
 DEFAULT_DELETE_POLL_INTERVAL_SECONDS = 0.25
 _MISSING = object()
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CLEANUP_TARGETS = frozenset(
+    {CredentialState.DESTROYED, CredentialState.REVOKED, CredentialState.EXPIRED}
+)
+_OPERATION_ACTIVE_STATES = frozenset({"accepted", "running"})
+_OPERATION_TERMINAL_STATES = frozenset({"succeeded", "failed", "indeterminate"})
+_TRANSFER_TERMINAL_STATES = frozenset(
+    {"completed", "canceled", "discarded", "failed", "indeterminate"}
+)
 
 
 class V2JobRendererProtocol(Protocol):
@@ -159,6 +174,18 @@ class V2JobStoreProtocol(Protocol):
 @dataclass(frozen=True, slots=True)
 class CreateResult:
     """A create snapshot plus the status distinction needed by the HTTP route."""
+
+    snapshot: JobBindingSnapshot
+    created: bool
+
+    @property
+    def replayed(self) -> bool:
+        return not self.created
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizeResult:
+    """A finalize snapshot plus the atomic slot reservation outcome."""
 
     snapshot: JobBindingSnapshot
     created: bool
@@ -514,7 +541,6 @@ class V2JobProvider:
 
     def start_agent(self, job_ref: str, request: AgentStartRequest) -> GenerationSnapshot:
         """Dispatch exactly one legal generation to the bound live supervisor."""
-        self.reconcile_credentials()
         binding = self._live_binding(job_ref)
         self._assert_not_finalizing(job_ref)
         digest = canonical_digest(request.digest_payload())
@@ -522,13 +548,11 @@ class V2JobProvider:
         if existing is not None:
             if _runtime_values(existing).get("identityDigest") != digest:
                 raise IdentityDigestConflict()
-            if (
-                self._generation_snapshot(existing, replayed=False).runner_state
-                is not RunnerState.ACCEPTED
-            ):
-                return self._generation_snapshot(existing, replayed=True)
-            values = _runtime_values(existing)
-            grant = None
+            retained = self._generation_snapshot(existing, replayed=False)
+            self._validate_retained_generation(retained, request, binding)
+            if retained.runner_state is not RunnerState.ACCEPTED:
+                return retained.model_copy(update={"replayed": True})
+            record = existing
         else:
             previous = self._latest_generation(job_ref)
             expected = 1 if previous is None else previous.generation + 1
@@ -539,53 +563,47 @@ class V2JobProvider:
                 )
             ):
                 raise IllegalGenerationError()
-        if existing is None:
             grant = self.inspect_credential_grant(job_ref, request.credential_grant_ref)
             if grant.state is not CredentialState.AVAILABLE or self._now() >= grant.expires_at:
                 self._expire_grant_if_needed(grant)
                 raise CredentialExpiredError()
-            if (
-                grant.agent_run_ref != request.agent_run_ref
-                or grant.generation != request.generation
-                or grant.launch_bundle_digest != request.launch_bundle_digest
-                or str(grant.job_uid) != str(binding.job_uid)
-                or str(grant.pod_uid) != str(binding.pod_uid)
-            ):
-                raise StateConflictError("The credential grant is not bound to this start request")
+            self._validate_generation_grant(grant, request, binding)
             values = self._generation_values(job_ref, request, digest, binding, grant)
-        if existing is None:
-            record, created = self._store.reserve_runtime(
+            record, _ = self._store.reserve_runtime(
                 "generation", str(request.generation), job_ref, values
             )
-            if not created:
-                return self._generation_snapshot(record, replayed=True)
-        else:
-            record = existing
+            if _runtime_values(record).get("identityDigest") != digest:
+                raise IdentityDigestConflict()
+            retained = self._generation_snapshot(record, replayed=False)
+            self._validate_retained_generation(retained, request, binding)
+            if retained.runner_state is not RunnerState.ACCEPTED:
+                return retained.model_copy(update={"replayed": True})
         if self._transport is None:
             raise DependencyUnavailableError("agent RPC transport is not configured")
-        audience = grant.audience if grant is not None else values["grantAudience"]
-        credential_sha = (
-            grant.credential_sha256 if grant is not None else values["credentialSha256"]
+        grant_record = self._store.read_runtime(
+            "credential", job_ref, retained.credential_grant_ref
         )
-        rpc = self._agent_rpc(binding, request, audience, credential_sha)
-        if (
-            rpc.protocol_version != 1
-            or rpc.generation != request.generation
-            or rpc.agent_run_ref != request.agent_run_ref
-            or rpc.launch_bundle_digest != request.launch_bundle_digest
-            or rpc.credential_grant_ref != request.credential_grant_ref
-            or rpc.audience != audience
-            or rpc.credential_sha256 != credential_sha
-            or not rpc.credential_consumed
-        ):
-            raise StateConflictError(
-                "The supervisor acknowledgement does not match the start request"
-            )
+        if grant_record is None:
+            raise DependencyUnavailableError("retained generation grant is unavailable")
+        grant = self._grant_snapshot(grant_record)
+        self._validate_generation_grant(grant, request, binding)
+        record_values = _runtime_values(record)
+        audience = record_values.get("grantAudience", grant.audience)
+        credential_sha = record_values.get("credentialSha256", grant.credential_sha256)
+        if audience != grant.audience or credential_sha != grant.credential_sha256:
+            raise DependencyUnavailableError("retained generation grant metadata is inconsistent")
+        retained_request = self._request_from_generation(retained)
+        try:
+            rpc = self._agent_rpc(binding, retained_request, audience, credential_sha)
+        except KcsV2Error:
+            raise
+        except Exception as error:
+            raise DependencyUnavailableError("agent supervisor RPC did not complete") from error
+        self._validate_agent_ack(rpc, retained_request, audience, credential_sha)
         now = self._now()
-        if grant is not None:
-            self._acknowledge_grant(grant, request, now)
+        grant = self._acknowledge_grant(grant_record, retained_request, now)
         state = RunnerState.EXITED if rpc.state == "exited" else RunnerState.RUNNING
-        generation = self._generation_snapshot(record, replayed=False).model_copy(
+        generation = retained.model_copy(
             update={
                 "runner_state": state,
                 "supervisor_alive": rpc.supervisor_alive,
@@ -595,11 +613,7 @@ class V2JobProvider:
                 "finished_at": now if state is RunnerState.EXITED else None,
                 "observed_at": now,
                 "credential_acknowledged_at": now,
-                "credential_destroyed_at": self.inspect_credential_grant(
-                    job_ref, request.credential_grant_ref
-                ).destroyed_at
-                if grant is not None
-                else now,
+                "credential_destroyed_at": grant.destroyed_at,
             }
         )
         self._store.update_runtime(
@@ -610,30 +624,21 @@ class V2JobProvider:
         )
         return generation
 
-    def finalize(self, job_ref: str, request: FinalizeJobRequest) -> JobBindingSnapshot:
+    def finalize(self, job_ref: str, request: FinalizeJobRequest) -> FinalizeResult:
         """Quiesce supervisors and revoke credentials without deleting Job/Pod/log reality."""
         self.reconcile_credentials()
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
         binding = self._live_binding(job_ref)
-        current = self.inspect(job_ref)
-        active_refs = set(current.active_operation_refs)
-        registered_transfers = {
-            observation.transfer_ref for observation in current.transfer_observations
-        }
-        requested_refs = set(request.spec.operation_refs) | set(request.spec.transfer_refs)
-        if not requested_refs.issubset(active_refs | registered_transfers):
-            raise StateConflictError(
-                "finalize references an operation or transfer that is not registered"
-            )
         values = {
             "identityDigest": request.request_digest,
             "finalizeRef": request.finalize_ref,
             "jobUid": str(binding.job_uid),
             "podUid": str(binding.pod_uid),
+            "requestSpec": request.spec.model_dump_json(by_alias=True),
             "payload": json.dumps({"state": "accepted", "observedAt": self._now().isoformat()}),
         }
-        record, created = self._store.reserve_runtime("finalize", "slot", job_ref, values)
+        record, created = self._reserve_finalize(job_ref, request, binding, values)
         if not created and (
             _runtime_values(record).get("identityDigest") != request.request_digest
             or _runtime_values(record).get("finalizeRef") != request.finalize_ref
@@ -641,19 +646,13 @@ class V2JobProvider:
             raise IdentityDigestConflict()
         phase = _finalize_phase(record)
         if phase == "accepted":
-            deadline = self._now() + timedelta(seconds=request.spec.drain_timeout_seconds)
-            while self._now() < deadline and self.inspect(job_ref).active_operation_refs:
-                self._sleeper(0.01)
-            if self.inspect(job_ref).active_operation_refs:
-                raise DependencyTimeoutError("registered operations did not drain before finalize")
+            self._drain_finalize_records(job_ref, request.spec, binding)
             for grant_record in self._store.list_runtime("credential", job_ref):
                 grant = self._grant_snapshot(grant_record)
                 if grant.secret_present is not False:
                     self._revoke_grant(grant)
             record = self._set_finalize_phase(record, "credentials_revoked")
             phase = "credentials_revoked"
-        if self._transport is None:
-            raise DependencyUnavailableError("supervisor RPC transport is not configured")
         identity = {
             "jobRef": job_ref,
             "jobUid": str(binding.job_uid),
@@ -661,17 +660,20 @@ class V2JobProvider:
         }
         try:
             if phase == "credentials_revoked":
-                self._validate_stop_ack(self._transport.stop_supervisor(identity, "agent"))
+                self._stop_or_recover(job_ref, identity, "agent")
                 record = self._set_finalize_phase(record, "agent_stopped")
                 phase = "agent_stopped"
             if phase == "agent_stopped":
-                self._validate_stop_ack(self._transport.stop_supervisor(identity, "workspace"))
+                self._stop_or_recover(job_ref, identity, "workspace")
                 record = self._set_finalize_phase(record, "succeeded")
+                phase = "succeeded"
         except KcsV2Error:
             raise
         except Exception as error:
             raise DependencyUnavailableError("supervisor quiesce did not complete") from error
-        return self.inspect(job_ref)
+        if phase != "succeeded":
+            raise DependencyUnavailableError("retained finalize phase is indeterminate")
+        return FinalizeResult(snapshot=self.inspect(job_ref), created=created)
 
     def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
         """Persist deletion identity before removing workload reality."""
@@ -749,6 +751,99 @@ class V2JobProvider:
         if self._runtime_records("finalize", job_ref):
             raise StateConflictError("The provider is already quiescing this Job")
 
+    def _reserve_finalize(
+        self,
+        job_ref: str,
+        request: FinalizeJobRequest,
+        binding: JobBindingSnapshot,
+        values: Mapping[str, str],
+    ) -> tuple[object, bool]:
+        slot = self._store.read_runtime("finalize", job_ref, "slot")
+        if slot is not None:
+            return slot, False
+        legacy = [
+            record
+            for record in self._store.list_runtime("finalize", job_ref)
+            if str(_field(record, "identity")) != "slot"
+        ]
+        if len(legacy) > 1:
+            raise DependencyUnavailableError("multiple legacy finalize identities are retained")
+        if legacy:
+            retained = legacy[0]
+            retained_values = _runtime_values(retained)
+            legacy_ref = retained_values.get("finalizeRef") or str(_field(retained, "identity"))
+            if (
+                legacy_ref != request.finalize_ref
+                or retained_values.get("identityDigest") != request.request_digest
+            ):
+                raise IdentityDigestConflict()
+            migrated = dict(retained_values)
+            migrated.update(
+                {
+                    "finalizeRef": legacy_ref,
+                    "jobUid": str(binding.job_uid),
+                    "podUid": str(binding.pod_uid),
+                    "requestSpec": request.spec.model_dump_json(by_alias=True),
+                }
+            )
+            record, _ = self._store.reserve_runtime("finalize", "slot", job_ref, migrated)
+            return record, False
+        return self._store.reserve_runtime("finalize", "slot", job_ref, values)
+
+    def _drain_finalize_records(
+        self, job_ref: str, spec: FinalizeSpec, binding: JobBindingSnapshot
+    ) -> None:
+        deadline = self._now() + timedelta(seconds=spec.drain_timeout_seconds)
+        monotonic_deadline = time.monotonic() + spec.drain_timeout_seconds
+        while True:
+            pending = False
+            for ref in spec.operation_refs:
+                state = self._requested_runtime_state("operation", job_ref, ref, binding)
+                if state == "indeterminate":
+                    raise OperationIndeterminateError()
+                if state == "failed":
+                    raise StateConflictError(f"requested operation {state} before finalize")
+                pending = pending or state not in _OPERATION_TERMINAL_STATES
+            for ref in spec.transfer_refs:
+                state = self._requested_runtime_state("transfer", job_ref, ref, binding)
+                if state == "indeterminate":
+                    raise TransferIndeterminateError()
+                if state == "failed":
+                    raise StateConflictError(f"requested transfer {state} before finalize")
+                pending = pending or state not in _TRANSFER_TERMINAL_STATES
+            if not pending:
+                return
+            if self._now() >= deadline or time.monotonic() >= monotonic_deadline:
+                raise DependencyTimeoutError(
+                    "requested operations or transfers did not drain before finalize"
+                )
+            self._sleeper(0.01)
+
+    def _requested_runtime_state(
+        self,
+        kind: str,
+        job_ref: str,
+        identity: str,
+        binding: JobBindingSnapshot,
+    ) -> str:
+        record = self._store.read_runtime(kind, job_ref, identity)
+        if record is None:
+            raise StateConflictError(f"finalize {kind} reference is not registered")
+        _validate_runtime_binding(record, str(binding.job_uid), str(binding.pod_uid))
+        state, _ = _validated_runtime_state(record, kind)
+        return state
+
+    def _stop_or_recover(
+        self, job_ref: str, identity: Mapping[str, str], role: Literal["agent", "workspace"]
+    ) -> None:
+        snapshot = self.inspect(job_ref)
+        role_snapshot = snapshot.agent if role == "agent" else snapshot.workspace
+        if role_snapshot is not None and role_snapshot.state is RoleState.TERMINATED:
+            return
+        if self._transport is None:
+            raise DependencyUnavailableError("supervisor RPC transport is not configured")
+        self._validate_stop_ack(self._transport.stop_supervisor(identity, role))
+
     def _set_finalize_phase(self, record: object, phase: str) -> object:
         return self._store.update_runtime(
             "finalize",
@@ -763,8 +858,10 @@ class V2JobProvider:
     @staticmethod
     def _validate_stop_ack(response: AgentRpcResponse) -> None:
         if (
-            response.protocol_version != 1
+            type(response.protocol_version) is not int
+            or response.protocol_version != 1
             or response.state != "stopped"
+            or type(response.supervisor_alive) is not bool
             or response.supervisor_alive
         ):
             raise StateConflictError("supervisor shutdown acknowledgement is invalid")
@@ -859,23 +956,43 @@ class V2JobProvider:
         return self._grant_snapshot(written)
 
     def _expire_grant_if_needed(self, grant: CredentialGrantSnapshot) -> None:
-        retryable = grant.state in {
-            CredentialState.DESTROY_FAILED,
-            CredentialState.INDETERMINATE,
-            CredentialState.EXPIRED,
-        }
-        expired_live = self._now() >= grant.expires_at and grant.secret_present is not False
-        if not retryable and not expired_live:
+        if grant.secret_present is False and grant.state in _CLEANUP_TARGETS:
             return
         record = self._store.read_runtime("credential", grant.job_ref, grant.credential_grant_ref)
         if record is None:
             return
-        self._destroy_grant(record, CredentialState.EXPIRED)
+        target = self._cleanup_target(record)
+        if target is None:
+            return
+        self._destroy_grant(record, target)
 
     def _destroy_grant(self, record: object, state: CredentialState) -> CredentialGrantSnapshot:
+        if state not in _CLEANUP_TARGETS:
+            raise DependencyUnavailableError("credential cleanup target is invalid")
+        retained_values = _runtime_values(record)
+        retained_target = self._cleanup_target(record)
+        target = retained_target or state
+        if "cleanupTarget" not in retained_values:
+            record = self._store.update_runtime(
+                "credential",
+                str(_field(record, "job_ref")),
+                str(_field(record, "identity")),
+                _runtime_values_with(record, {"cleanupTarget": target.value}),
+            )
         grant = self._grant_snapshot(record)
+        if grant.secret_present is False:
+            if grant.state is target:
+                return grant
+            return self._update_grant(
+                record,
+                state=target,
+                secret_present=False,
+                destroyed_at=grant.destroyed_at or self._now(),
+            )
         try:
-            self._kube.delete_secret(credential_secret_name(grant.job_ref))
+            deletion = self._kube.delete_secret(credential_secret_name(grant.job_ref))
+            if type(deletion) is not bool:
+                raise DependencyUnavailableError("Kubernetes Secret absence was not confirmed")
         except Exception:
             return self._update_grant(
                 record,
@@ -885,33 +1002,47 @@ class V2JobProvider:
             )
         return self._update_grant(
             record,
-            state=state,
+            state=target,
             secret_present=False,
             destroyed_at=self._now(),
         )
 
     def _acknowledge_grant(
-        self, grant: CredentialGrantSnapshot, request: AgentStartRequest, now: datetime
-    ) -> None:
-        record = self._store.read_runtime("credential", grant.job_ref, grant.credential_grant_ref)
-        if record is None:
-            raise DependencyUnavailableError()
-        acknowledged = self._update_grant(
+        self, record: object, request: AgentStartRequest, now: datetime
+    ) -> CredentialGrantSnapshot:
+        grant = self._grant_snapshot(record)
+        if (
+            grant.ack_agent_run_ref is not None and grant.ack_agent_run_ref != request.agent_run_ref
+        ) or (grant.ack_generation is not None and grant.ack_generation != request.generation):
+            raise StateConflictError("retained credential acknowledgement is inconsistent")
+        target = self._cleanup_target(record) or CredentialState.DESTROYED
+        if (
+            grant.secret_present is False
+            and grant.state is target
+            and grant.ack_agent_run_ref == request.agent_run_ref
+            and grant.ack_generation == request.generation
+            and grant.consumed_at is not None
+        ):
+            return grant
+        next_state = grant.state if grant.secret_present is False else CredentialState.CONSUMED
+        consumed = self._update_grant(
             record,
-            state=CredentialState.ACKNOWLEDGED,
-            secret_present=True,
+            state=next_state,
+            secret_present=grant.secret_present,
             acknowledged_at=now,
             ack_agent_run_ref=request.agent_run_ref,
             ack_generation=request.generation,
+            consumed_at=grant.consumed_at or now,
         )
         record = self._store.read_runtime(
-            "credential", acknowledged.job_ref, acknowledged.credential_grant_ref
+            "credential", consumed.job_ref, consumed.credential_grant_ref
         )
         if record is None:
             raise DependencyUnavailableError()
-        destroyed = self._destroy_grant(record, CredentialState.DESTROYED)
+        destroyed = self._destroy_grant(record, target)
         if destroyed.state is CredentialState.DESTROY_FAILED:
             raise CredentialDestroyFailedError()
+        return destroyed
 
     def _revoke_grant(self, grant: CredentialGrantSnapshot) -> None:
         record = self._store.read_runtime("credential", grant.job_ref, grant.credential_grant_ref)
@@ -920,6 +1051,28 @@ class V2JobProvider:
         destroyed = self._destroy_grant(record, CredentialState.REVOKED)
         if destroyed.state is CredentialState.DESTROY_FAILED:
             raise CredentialDestroyFailedError()
+
+    def _cleanup_target(self, record: object) -> CredentialState | None:
+        values = _runtime_values(record)
+        retained = values.get("cleanupTarget")
+        if retained is not None:
+            try:
+                target = CredentialState(retained)
+            except ValueError as error:
+                raise DependencyUnavailableError("credential cleanup target is invalid") from error
+            if target not in _CLEANUP_TARGETS:
+                raise DependencyUnavailableError("credential cleanup target is invalid")
+            return target
+        grant = self._grant_snapshot(record)
+        if grant.state is CredentialState.EXPIRED:
+            return CredentialState.EXPIRED
+        if grant.ack_agent_run_ref is not None or grant.consumed_at is not None:
+            return CredentialState.DESTROYED
+        if self._now() >= grant.expires_at:
+            return CredentialState.EXPIRED
+        if grant.state in {CredentialState.DESTROY_FAILED, CredentialState.INDETERMINATE}:
+            return CredentialState.REVOKED
+        return None
 
     def _credential_secret(
         self, job_ref: str, metadata: CredentialGrantMetadata, raw_bytes: bytes
@@ -996,6 +1149,88 @@ class V2JobProvider:
         result = GenerationSnapshot.model_validate_json(_runtime_values(record)["payload"])
         return result.model_copy(update={"replayed": replayed})
 
+    @staticmethod
+    def _request_from_generation(generation: GenerationSnapshot) -> AgentStartRequest:
+        return AgentStartRequest(
+            execution_envelope_ref=generation.execution_envelope_ref,
+            execution_envelope_digest=generation.execution_envelope_digest,
+            agent_run_ref=generation.agent_run_ref,
+            generation=generation.generation,
+            launch_bundle_path=generation.launch_bundle_path,
+            launch_bundle_digest=generation.launch_bundle_digest,
+            launch_bundle_size_bytes=generation.launch_bundle_size_bytes,
+            material_paths=generation.material_paths,
+            credential_grant_ref=generation.credential_grant_ref,
+        )
+
+    @staticmethod
+    def _validate_retained_generation(
+        retained: GenerationSnapshot,
+        request: AgentStartRequest,
+        binding: JobBindingSnapshot,
+    ) -> None:
+        if (
+            retained.job_ref != binding.job_ref
+            or V2JobProvider._request_from_generation(retained) != request
+        ):
+            raise IdentityDigestConflict()
+        if not hmac.compare_digest(
+            retained.start_metadata_digest, canonical_digest(request.digest_payload())
+        ):
+            raise DependencyUnavailableError("retained generation metadata is inconsistent")
+
+    @staticmethod
+    def _validate_generation_grant(
+        grant: CredentialGrantSnapshot,
+        request: AgentStartRequest,
+        binding: JobBindingSnapshot,
+    ) -> None:
+        if (
+            grant.credential_grant_ref != request.credential_grant_ref
+            or grant.agent_run_ref != request.agent_run_ref
+            or grant.generation != request.generation
+            or grant.launch_bundle_digest != request.launch_bundle_digest
+            or str(grant.job_uid) != str(binding.job_uid)
+            or str(grant.pod_uid) != str(binding.pod_uid)
+            or grant.job_ref != binding.job_ref
+        ):
+            raise StateConflictError("The credential grant is not bound to this start request")
+
+    @staticmethod
+    def _validate_agent_ack(
+        rpc: AgentRpcResponse,
+        request: AgentStartRequest,
+        audience: str,
+        credential_sha: str,
+    ) -> None:
+        if (
+            type(rpc.protocol_version) is not int
+            or rpc.protocol_version != 1
+            or type(rpc.generation) is not int
+            or rpc.generation != request.generation
+            or rpc.agent_run_ref != request.agent_run_ref
+            or rpc.launch_bundle_digest != request.launch_bundle_digest
+            or not _SHA256.fullmatch(rpc.launch_bundle_digest)
+            or rpc.credential_grant_ref != request.credential_grant_ref
+            or rpc.audience != audience
+            or rpc.credential_sha256 != credential_sha
+            or not _SHA256.fullmatch(credential_sha)
+            or type(rpc.credential_consumed) is not bool
+            or not rpc.credential_consumed
+            or type(rpc.supervisor_alive) is not bool
+            or not rpc.supervisor_alive
+            or not isinstance(rpc.state, str)
+            or rpc.state not in {"running", "exited"}
+            or rpc.error is not None
+            or (rpc.exit_code is not None and type(rpc.exit_code) is not int)
+            or (rpc.pid is not None and type(rpc.pid) is not int)
+            or (rpc.pid is not None and rpc.pid < 1)
+            or (rpc.state == "exited" and type(rpc.exit_code) is not int)
+        ):
+            raise StateConflictError(
+                "The supervisor acknowledgement does not match the start request"
+            )
+
     def _latest_generation(self, job_ref: str) -> GenerationSnapshot | None:
         generations = [
             self._generation_snapshot(item, replayed=False)
@@ -1036,7 +1271,11 @@ class V2JobProvider:
 
     def _runtime_records(self, kind: str, job_ref: str) -> Sequence[object]:
         method = getattr(self._store, "list_runtime", None)
-        return tuple(method(kind, job_ref)) if callable(method) else ()
+        records = tuple(method(kind, job_ref)) if callable(method) else ()
+        if kind == "finalize":
+            slot = tuple(record for record in records if str(_field(record, "identity")) == "slot")
+            return slot or records
+        return records
 
     def _create_or_reconcile_job(self, rendered_job: object, job_ref: str) -> object:
         try:
@@ -1143,7 +1382,26 @@ class V2JobProvider:
             self._generation_snapshot(item, replayed=False)
             for item in self._runtime_records("generation", str(_field(record, "job_ref")))
         ]
-        finalizations = self._runtime_records("finalize", str(_field(record, "job_ref")))
+        runtime_job_ref = str(_field(record, "job_ref"))
+        operations = [
+            (
+                str(_field(item, "identity")),
+                _validated_runtime_state(
+                    _validate_runtime_binding(item, job_uid, str(pod_uid)), "operation"
+                )[0],
+            )
+            for item in self._runtime_records("operation", runtime_job_ref)
+        ]
+        transfers = [
+            (
+                str(_field(item, "identity")),
+                *_validated_runtime_state(
+                    _validate_runtime_binding(item, job_uid, str(pod_uid)), "transfer"
+                ),
+            )
+            for item in self._runtime_records("transfer", runtime_job_ref)
+        ]
+        finalizations = self._runtime_records("finalize", runtime_job_ref)
         latest = max(generations, key=lambda item: item.generation) if generations else None
         finalize_action = _finalize_action(finalizations)
         if finalizations and binding_state not in {
@@ -1173,8 +1431,12 @@ class V2JobProvider:
             agent=agent,
             workspace=workspace,
             latest_agent_generation=latest,
-            active_operation_refs=[],
-            terminal_operation_refs=[],
+            active_operation_refs=sorted(
+                ref for ref, state in operations if state in _OPERATION_ACTIVE_STATES
+            ),
+            terminal_operation_refs=sorted(
+                ref for ref, state in operations if state in _OPERATION_TERMINAL_STATES
+            ),
             credential_observations=[
                 CredentialObservation(
                     credential_grant_ref=item.credential_grant_ref,
@@ -1184,7 +1446,14 @@ class V2JobProvider:
                 )
                 for item in grants
             ],
-            transfer_observations=[],
+            transfer_observations=[
+                TransferObservation(
+                    transfer_ref=ref,
+                    state=TransferState(state),
+                    observed_at=observed,
+                )
+                for ref, state, observed in sorted(transfers)
+            ],
             finalize_action=finalize_action,
             cancel_action=_not_requested_action(),
             delete_action=_not_requested_action(),
@@ -1366,6 +1635,46 @@ def _runtime_values_with(record: object, changes: Mapping[str, str]) -> dict[str
     values = dict(_runtime_values(record))
     values.update(changes)
     return values
+
+
+def _runtime_state_observation(record: object) -> tuple[str, datetime]:
+    values = _runtime_values(record)
+    try:
+        payload: object = json.loads(values["payload"])
+    except (KeyError, json.JSONDecodeError) as error:
+        raise DependencyUnavailableError("runtime observation payload is invalid") from error
+    if not isinstance(payload, Mapping):
+        raise DependencyUnavailableError("runtime observation payload is invalid")
+    state = payload.get("state")
+    if not isinstance(state, str) or not state:
+        raise DependencyUnavailableError("runtime observation state is invalid")
+    observed_value = payload.get("observedAt")
+    if observed_value is None:
+        raise DependencyUnavailableError("runtime observation timestamp is absent")
+    try:
+        observed = _as_datetime(observed_value, datetime.now(UTC))
+    except (TypeError, ValueError) as error:
+        raise DependencyUnavailableError("runtime observation timestamp is invalid") from error
+    return state, observed
+
+
+def _validated_runtime_state(record: object, kind: str) -> tuple[str, datetime]:
+    state, observed = _runtime_state_observation(record)
+    allowed = (
+        _OPERATION_ACTIVE_STATES | _OPERATION_TERMINAL_STATES
+        if kind == "operation"
+        else {item.value for item in TransferState}
+    )
+    if state not in allowed:
+        raise DependencyUnavailableError(f"retained {kind} state is invalid")
+    return state, observed
+
+
+def _validate_runtime_binding(record: object, job_uid: str, pod_uid: str) -> object:
+    values = _runtime_values(record)
+    if values.get("jobUid") != job_uid or values.get("podUid") != pod_uid:
+        raise DependencyUnavailableError("runtime observation binding is inconsistent")
+    return record
 
 
 def _finalize_action(records: Sequence[object]) -> ActionSnapshot:
