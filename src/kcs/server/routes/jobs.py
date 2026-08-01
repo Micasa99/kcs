@@ -35,7 +35,12 @@ from kcs.jobs.contracts import (
     LogContainer,
     RoleLogs,
 )
-from kcs.jobs.errors import DigestMismatchError, InvalidRequestError, KcsV2Error
+from kcs.jobs.errors import (
+    DigestMismatchError,
+    InvalidRequestError,
+    KcsV2Error,
+    PayloadTooLargeError,
+)
 from kcs.jobs.provider import (
     DEFAULT_LOG_LIMIT_BYTES,
     DEFAULT_PAGE_SIZE,
@@ -60,6 +65,7 @@ class V2Caller:
     """Non-secret authenticated identity passed beyond the HTTP boundary."""
 
     principal: Literal["v2-service"] = "v2-service"
+    roles: frozenset[str] = frozenset({"v2-reader", "v2-mutator", "v2-private-credential-writer"})
 
 
 class _UnauthenticatedError(KcsV2Error):
@@ -68,10 +74,20 @@ class _UnauthenticatedError(KcsV2Error):
     default_message = "Missing or invalid V2 service authentication"
 
 
+class _ForbiddenError(KcsV2Error):
+    code = "FORBIDDEN"
+    status_code = 403
+    default_message = "The caller is not authorized for this KCS V2 operation"
+
+
 class _UnsupportedMediaTypeError(KcsV2Error):
     code = "UNSUPPORTED_MEDIA_TYPE"
     status_code = 415
     default_message = "Content-Type must be application/json"
+
+
+class _CredentialMediaTypeError(_UnsupportedMediaTypeError):
+    default_message = "Content-Type must be application/octet-stream"
 
 
 class _InternalRouteError(KcsV2Error):
@@ -150,7 +166,7 @@ def _require_json_media_type(request: Request) -> None:
     media_type = request.headers.get("content-type", "").partition(";")[0].strip()
     if request.url.path.endswith("/agent/credential-grants"):
         if media_type.lower() != "application/octet-stream":
-            raise _UnsupportedMediaTypeError
+            raise _CredentialMediaTypeError
         return
     if media_type.lower() != "application/json":
         raise _UnsupportedMediaTypeError
@@ -161,6 +177,15 @@ def _json_model(model: BaseModel, *, status_code: int = 200) -> JSONResponse:
         status_code=status_code,
         content=model.model_dump(mode="json", by_alias=True),
     )
+
+
+async def _credential_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 65536:
+            raise PayloadTooLargeError()
+    return bytes(body)
 
 
 def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
@@ -181,6 +206,16 @@ def create_jobs_router(
     openapi_bytes = (canonical_openapi_path or _DEFAULT_OPENAPI_PATH).read_bytes()
     openapi_sha256 = hashlib.sha256(openapi_bytes).hexdigest()
     require_v2_caller = _auth_dependency(service_token)
+
+    def require_role(role: str) -> Callable[[Request], V2Caller]:
+        def enforce(request: Request) -> V2Caller:
+            caller = require_v2_caller(request)
+            if role not in caller.roles:
+                raise _ForbiddenError()
+            return caller
+
+        return enforce
+
     router = APIRouter(
         route_class=_V2Route,
         dependencies=[Depends(require_v2_caller), Depends(_require_json_media_type)],
@@ -310,6 +345,7 @@ def create_jobs_router(
     )
     async def grant_credential(
         request: Request,
+        _caller: Annotated[V2Caller, Depends(require_role("v2-private-credential-writer"))],
         job_ref: Annotated[
             str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
         ],
@@ -364,7 +400,7 @@ def create_jobs_router(
             pod_uid=pod_uid,
         )
         return _json_model(
-            provider.grant_credential(job_ref, metadata, await request.body()),
+            provider.grant_credential(job_ref, metadata, await _credential_body(request)),
             status_code=200 if replay else 201,
         )
 
@@ -422,7 +458,9 @@ def create_jobs_router(
         ],
         payload: FinalizeJobRequest,
     ) -> Response:
-        return _json_model(provider.finalize(job_ref, payload), status_code=202)
+        before = provider.inspect(job_ref).finalize_action
+        replay = before.action_ref == payload.finalize_ref
+        return _json_model(provider.finalize(job_ref, payload), status_code=200 if replay else 202)
 
     @router.delete(
         "/api/v2/jobs/{jobRef}",

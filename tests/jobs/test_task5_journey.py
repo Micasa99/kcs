@@ -124,10 +124,15 @@ class _Transport:
             True,
             7,
             0,
+            credential_grant_ref=value["credentialGrantRef"],
+            audience=value["audience"],
+            credential_sha256=value["credentialSha256"],
+            credential_consumed=True,
         )
 
-    def stop_supervisor(self, binding: object, container: str) -> None:
+    def stop_supervisor(self, binding: object, container: str) -> AgentRpcResponse:
         self.stops.append(container)
+        return AgentRpcResponse(1, 0, "", "", "stopped", False)
 
 
 def test_grant_start_replay_and_finalize_preserve_job_reality() -> None:

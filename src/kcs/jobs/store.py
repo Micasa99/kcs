@@ -362,7 +362,7 @@ class V2JobStore:
         except Exception as exc:
             if _status(exc) != 409:
                 raise
-            existing = self.read_runtime(kind, identity)
+            existing = self.read_runtime(kind, job_ref, identity)
             if existing is None:
                 raise DependencyUnavailableError(
                     "runtime record conflict was not readable"
@@ -374,26 +374,31 @@ class V2JobStore:
             return existing, False
         return _runtime_record_from_config_map(created), True
 
-    def read_runtime(self, kind: str, identity: str) -> RuntimeRecord | None:
-        config_map = self._kube.read_config_map(_runtime_record_name(kind, identity))
+    def read_runtime(self, kind: str, job_ref: str, identity: str) -> RuntimeRecord | None:
+        config_map = self._kube.read_config_map(_runtime_record_name(kind, job_ref, identity))
         if config_map is None:
             return None
         record = _runtime_record_from_config_map(config_map)
-        if record.kind != kind or record.identity != identity:
+        if record.kind != kind or record.job_ref != job_ref or record.identity != identity:
             raise DependencyUnavailableError("runtime record hash collision")
         return record
 
-    def list_runtime(self, kind: str, job_ref: str) -> list[RuntimeRecord]:
-        selector = f"{RECORD_KIND_LABEL}=runtime-{kind},{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
+    def list_runtime(self, kind: str, job_ref: str | None = None) -> list[RuntimeRecord]:
+        selector = f"{RECORD_KIND_LABEL}=runtime-{kind}"
+        if job_ref is not None:
+            selector = f"{selector},{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
         return [
             record
             for item in self._kube.list_config_maps(selector)
             if (record := _runtime_record_from_config_map(item)).job_ref == job_ref
+            or job_ref is None
         ]
 
-    def update_runtime(self, kind: str, identity: str, values: Mapping[str, str]) -> RuntimeRecord:
+    def update_runtime(
+        self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
+    ) -> RuntimeRecord:
         for _ in range(_UPDATE_ATTEMPTS):
-            current = self.read_runtime(kind, identity)
+            current = self.read_runtime(kind, job_ref, identity)
             if current is None:
                 raise JobNotFoundError()
             desired = RuntimeRecord(
@@ -405,7 +410,7 @@ class V2JobStore:
             )
             try:
                 written = self._kube.replace_config_map(
-                    _runtime_record_name(kind, identity),
+                    _runtime_record_name(kind, job_ref, identity),
                     _runtime_config_map_body(desired, resource_version=current.resource_version),
                 )
             except Exception as exc:
@@ -494,8 +499,8 @@ def _record_name(provider_request_id: str) -> str:
     return f"kcs-v2-create-{_short_hash(provider_request_id, 32)}"
 
 
-def _runtime_record_name(kind: str, identity: str) -> str:
-    return f"kcs-v2-{kind}-{_short_hash(identity, 32)}"
+def _runtime_record_name(kind: str, job_ref: str, identity: str) -> str:
+    return f"kcs-v2-{kind}-{_short_hash(f'{job_ref}:{identity}', 32)}"
 
 
 def _short_hash(value: str, length: int = 40) -> str:
@@ -597,13 +602,13 @@ def _runtime_config_map_body(
     record: RuntimeRecord, *, resource_version: str | None = None
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
-        "name": _runtime_record_name(record.kind, record.identity),
+        "name": _runtime_record_name(record.kind, record.job_ref, record.identity),
         "labels": {
             MANAGED_BY_LABEL: MANAGED_BY_VALUE,
             RECORD_KIND_LABEL: f"runtime-{record.kind}",
             JOB_REF_HASH_LABEL: _short_hash(record.job_ref),
         },
-        "ownerReferences": [],
+        "ownerReferences": _runtime_owner_references(record),
     }
     if resource_version is not None:
         metadata["resourceVersion"] = resource_version
@@ -615,6 +620,22 @@ def _runtime_config_map_body(
     }
     data.update(dict(record.values))
     return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata, "data": data}
+
+
+def _runtime_owner_references(record: RuntimeRecord) -> list[dict[str, object]]:
+    job_uid = record.values.get("jobUid")
+    if not job_uid:
+        raise ValueError("runtime records require the bound Job UID")
+    return [
+        {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "name": record.job_ref,
+            "uid": job_uid,
+            "controller": False,
+            "blockOwnerDeletion": False,
+        }
+    ]
 
 
 def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:

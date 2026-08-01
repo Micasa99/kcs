@@ -70,6 +70,8 @@ class CoreV1Api(Protocol):
 
     def delete_namespaced_secret(self, *, name: str, namespace: str) -> Any: ...
 
+    def connect_get_namespaced_pod_exec(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
+
 
 @dataclass(frozen=True, slots=True)
 class LogRead:
@@ -290,6 +292,32 @@ class V2KubeAdapter:
                 return False
             raise
         return True
+
+    def exec_supervisor_rpc(
+        self, binding: Mapping[str, str], container: str, command: list[str], frame: bytes
+    ) -> bytes:
+        """Exec a fixed supervisor command in the immutable bound Pod."""
+        from kubernetes.stream import stream  # type: ignore[import-untyped]
+
+        pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        pod_name = str(_value(_value(pod, "metadata"), "name"))
+        websocket: Any = stream(
+            self._core.connect_get_namespaced_pod_exec,
+            pod_name,
+            self.namespace,
+            container=container,
+            command=command,
+            stderr=True,
+            stdin=True,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
+        )
+        websocket.write_stdin(frame.decode("utf-8"))
+        websocket.update(timeout=10)
+        output = websocket.read_stdout()
+        websocket.close()
+        return str(output).encode("utf-8")
 
     def _pod_with_uid(self, job_ref: str, pod_uid: str) -> Any:
         matches = [

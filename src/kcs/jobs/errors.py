@@ -103,6 +103,10 @@ class IdentityDigestConflictError(KcsV2Error):
 IdentityDigestConflict = IdentityDigestConflictError
 
 
+class GrantIdentityConflictError(IdentityDigestConflictError):
+    recovery_action = "inspect_grant"
+
+
 class StateConflictError(KcsV2Error):
     code = "STATE_CONFLICT"
     status_code = 409

@@ -22,6 +22,10 @@ class AgentRpcResponse:
     pid: int | None = None
     exit_code: int | None = None
     error: str | None = None
+    credential_grant_ref: str | None = None
+    audience: str | None = None
+    credential_sha256: str | None = None
+    credential_consumed: bool = False
 
 
 class AgentRpcTransportProtocol(Protocol):
@@ -29,7 +33,7 @@ class AgentRpcTransportProtocol(Protocol):
         self, binding: Mapping[str, str], request: Mapping[str, object]
     ) -> AgentRpcResponse: ...
 
-    def stop_supervisor(self, binding: Mapping[str, str], container: str) -> None: ...
+    def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse: ...
 
 
 class ExecRpcTransport:
@@ -51,13 +55,19 @@ class ExecRpcTransport:
         )
         return _response(output)
 
-    def stop_supervisor(self, binding: Mapping[str, str], container: str) -> None:
+    def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse:
         command = (
-            ["/opt/kcs/agent-supervisor", "rpc", "--shutdown"]
+            ["/opt/kcs/agent-supervisor", "rpc"]
             if container == "agent"
-            else ["/opt/kcs/workspace-sidecar", "rpc", "--shutdown"]
+            else ["/opt/kcs/workspace-sidecar", "rpc"]
         )
-        self._execute(binding, container, command, b"{}")
+        output = self._execute(
+            binding,
+            container,
+            command,
+            b'{"protocolVersion":1,"action":"shutdown"}',
+        )
+        return _response(output)
 
 
 def _response(output: bytes) -> AgentRpcResponse:
@@ -84,6 +94,14 @@ def _response(output: bytes) -> AgentRpcResponse:
         launch_bundle_digest=str(value["launchBundleDigest"]),
         state=str(value["state"]),
         supervisor_alive=bool(value["supervisorAlive"]),
+        credential_grant_ref=str(value["credentialGrantRef"])
+        if value.get("credentialGrantRef") is not None
+        else None,
+        audience=str(value["audience"]) if value.get("audience") is not None else None,
+        credential_sha256=str(value["credentialSha256"])
+        if value.get("credentialSha256") is not None
+        else None,
+        credential_consumed=bool(value.get("credentialConsumed", False)),
         pid=int(value["pid"]) if value.get("pid") is not None else None,
         exit_code=int(value["exitCode"]) if value.get("exitCode") is not None else None,
         error=str(value["error"]) if value.get("error") is not None else None,

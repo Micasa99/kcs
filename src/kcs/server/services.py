@@ -56,6 +56,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         from kcs.jobs.renderer import V2JobRenderer
         from kcs.jobs.settings import V2RuntimeSettings
         from kcs.jobs.store import V2JobStore
+        from kcs.jobs.transport import ExecRpcTransport
 
         settings = settings or V2RuntimeSettings.from_env(os.environ)
         config.load_incluster_config()
@@ -67,6 +68,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             V2JobStore(kube),
             V2JobRenderer(settings),
             namespace=settings.namespace,
+            transport=ExecRpcTransport(kube.exec_supervisor_rpc),
         )
     return _v2_provider
 
@@ -120,17 +122,23 @@ def _run_ssh(
         os.write(w_fd, (password + "\n").encode())
         os.close(w_fd)
         cmd = [
-            "sshpass", "-d", str(r_fd),
+            "sshpass",
+            "-d",
+            str(r_fd),
             "ssh",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
         ]
     else:
         r_fd = None
         cmd = [
             "ssh",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
         ]
         if need_sudo:
             cmd.append("-t")
@@ -153,8 +161,6 @@ def _run_ssh(
                 os.close(r_fd)
             except OSError:
                 pass
-
-
 
 
 def get_server_ip_from_kubeconfig() -> str | None:
@@ -276,9 +282,7 @@ class ClusterService:
             with open(path) as f:
                 raw = yaml.safe_load(f)
         else:
-            raise ValueError(
-                f"Unsupported config format: {suffix} (use .toml or .yaml)"
-            )
+            raise ValueError(f"Unsupported config format: {suffix} (use .toml or .yaml)")
 
         workers = [WorkerNode(**w) for w in raw.get("workers", [])]
         return ClusterConfig(
@@ -449,9 +453,7 @@ spec:
                 break
         try:
             subprocess.run(["docker", "tag", tag, host_tag], capture_output=True)
-            subprocess.run(
-                ["docker", "push", host_tag], capture_output=True, timeout=60
-            )
+            subprocess.run(["docker", "push", host_tag], capture_output=True, timeout=60)
         finally:
             pf.terminate()
 
@@ -584,24 +586,28 @@ spec:
                 log.info("Node %s already in cluster", remote_hostname)
                 if registry_cfg:
                     sync_cmd = (
-                        f"sudo -S -p '' sh -c '{registry_cfg}'"
-                        if need_sudo
-                        else registry_cfg
+                        f"sudo -S -p '' sh -c '{registry_cfg}'" if need_sudo else registry_cfg
                     )
                     sudo_pw = (pw + "\n") if need_sudo else None
-                    _run_ssh(target, sync_cmd, password=pw,
-                             need_sudo=need_sudo, stdin_text=sudo_pw, timeout=30)
+                    _run_ssh(
+                        target,
+                        sync_cmd,
+                        password=pw,
+                        need_sudo=need_sudo,
+                        stdin_text=sudo_pw,
+                        timeout=30,
+                    )
                     log.info("  registry config synced")
 
                 restart_cmd = (
-                    "systemctl restart k3s-agent 2>/dev/null || "
-                    "systemctl restart k3s 2>/dev/null"
+                    "systemctl restart k3s-agent 2>/dev/null || systemctl restart k3s 2>/dev/null"
                 )
                 if need_sudo:
                     restart_cmd = f"sudo -S -p '' sh -c '{restart_cmd}'"
                 ri = (pw + "\n") if need_sudo else None
-                _run_ssh(target, restart_cmd, password=pw,
-                         need_sudo=need_sudo, stdin_text=ri, timeout=30)
+                _run_ssh(
+                    target, restart_cmd, password=pw, need_sudo=need_sudo, stdin_text=ri, timeout=30
+                )
                 log.info("  k3s-agent restarted")
 
                 results.append(f"Worker {target} ({remote_hostname}): ok")
@@ -612,8 +618,7 @@ spec:
             # fresh join
             k3s_url = f"https://{server_ip}:6443"
             install_cmd = (
-                f"curl -sfL https://get.k3s.io | K3S_URL={k3s_url} "
-                f"K3S_TOKEN={k3s_token} sh -"
+                f"curl -sfL https://get.k3s.io | K3S_URL={k3s_url} K3S_TOKEN={k3s_token} sh -"
             )
             cleanup = (
                 "sudo systemctl stop k3s-agent 2>/dev/null; "
@@ -631,9 +636,15 @@ spec:
 
             log.info("Joining %s via SSH ...", target)
             try:
-                result = _run_ssh(target, install_cmd, password=pw,
-                                  need_sudo=need_sudo, stdin_text=stdin_input,
-                                  timeout=120, capture=True)
+                result = _run_ssh(
+                    target,
+                    install_cmd,
+                    password=pw,
+                    need_sudo=need_sudo,
+                    stdin_text=stdin_input,
+                    timeout=120,
+                    capture=True,
+                )
             except subprocess.TimeoutExpired:
                 log.error("SSH timeout for %s", target)
                 results.append(f"Worker {target}: SSH timeout")
@@ -694,9 +705,7 @@ spec:
                 text=True,
             )
             if ready_check.stdout.strip() not in ("1",):
-                log.warning(
-                    "Registry not ready (readyReplicas=%s)", ready_check.stdout.strip()
-                )
+                log.warning("Registry not ready (readyReplicas=%s)", ready_check.stdout.strip())
                 need_repair = True
 
         if need_repair:
@@ -825,9 +834,7 @@ spec:
             capture_output=True,
             timeout=60,
         )
-        results.append(
-            "nfs-kernel-server: " + ("installed" if step1.returncode == 0 else "FAILED")
-        )
+        results.append("nfs-kernel-server: " + ("installed" if step1.returncode == 0 else "FAILED"))
 
         nfs_path = cfg.nfs_path or "/srv/nfs/k3s"
 
@@ -848,9 +855,7 @@ spec:
             capture_output=True,
             timeout=30,
         )
-        results.append(
-            f"NFS export {nfs_path}: " + ("ok" if step2.returncode == 0 else "FAILED")
-        )
+        results.append(f"NFS export {nfs_path}: " + ("ok" if step2.returncode == 0 else "FAILED"))
 
         # 3. Install nfs-common on each worker
         for w in cfg.workers:
@@ -865,8 +870,14 @@ spec:
 
             sudo_pw = (pw + "\n") if need_sudo else None
             try:
-                r = _run_ssh(target, install_cmd, password=pw,
-                             need_sudo=need_sudo, stdin_text=sudo_pw, timeout=60)
+                r = _run_ssh(
+                    target,
+                    install_cmd,
+                    password=pw,
+                    need_sudo=need_sudo,
+                    stdin_text=sudo_pw,
+                    timeout=60,
+                )
                 ok = r.returncode == 0
             except subprocess.TimeoutExpired:
                 ok = False
