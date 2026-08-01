@@ -36,6 +36,12 @@ def _to_camel(value: str) -> str:
     return alias.replace("Mib", "MiB").replace("Gib", "GiB")
 
 
+def _validate_unique_refs(values: list[str]) -> list[str]:
+    if len(values) != len(set(values)):
+        raise ValueError("references must be unique")
+    return values
+
+
 class ContractModel(BaseModel):
     """Immutable JSON contract with camelCase wire aliases and no extension fields."""
 
@@ -614,8 +620,8 @@ class AgentStartRequest(ContractModel):
 
 
 class FinalizeSpec(ContractModel):
-    operation_refs: list[OpaqueRef]
-    transfer_refs: list[OpaqueRef]
+    operation_refs: Annotated[list[OpaqueRef], AfterValidator(_validate_unique_refs)]
+    transfer_refs: Annotated[list[OpaqueRef], AfterValidator(_validate_unique_refs)]
     drain_timeout_seconds: Annotated[StrictInt, Field(ge=1, le=86400)]
 
 
@@ -626,7 +632,7 @@ class FinalizeJobRequest(ContractModel):
 
 
 class CancelSpec(ContractModel):
-    finish_collect_transfer_refs: list[OpaqueRef]
+    finish_collect_transfer_refs: Annotated[list[OpaqueRef], AfterValidator(_validate_unique_refs)]
     reason: OpaqueRef | None = None
 
 

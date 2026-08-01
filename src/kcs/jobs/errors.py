@@ -193,6 +193,13 @@ class ReplacementPodError(KcsV2Error):
     default_message = "The Job has multiple or replacement Pod identities"
 
 
+class StaleBindingError(KcsV2Error):
+    code = "STALE_BINDING"
+    status_code = 409
+    recovery_action = "new_attempt"
+    default_message = "The supplied immutable Job or Pod binding is stale"
+
+
 class TombstonedError(KcsV2Error):
     code = "TOMBSTONED"
     status_code = 410

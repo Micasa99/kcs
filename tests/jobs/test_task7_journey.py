@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 from uuid import UUID
 
@@ -23,6 +25,7 @@ from kcs.jobs.contracts import (
     CancelSpec,
     CreateJobRequest,
     CredentialGrantMetadata,
+    FinalizeSpec,
     TransferDirection,
     TransferRegisterRequest,
     TransferSpec,
@@ -32,7 +35,9 @@ from kcs.jobs.contracts import (
 from kcs.jobs.errors import (
     CredentialDestroyFailedError,
     DependencyUnavailableError,
+    StateConflictError,
 )
+from kcs.jobs.lifecycle import LifecycleGate
 from kcs.jobs.provider import EMPTY_OBJECT_DIGEST, V2JobProvider
 from kcs.jobs.store import V2JobStore
 from kcs.jobs.transport import AgentRpcResponse, LocalWorkspaceRpcTransport, WorkspaceRpcReply
@@ -62,7 +67,11 @@ class _FakeKube:
         self.created_jobs = 0
         self.fail_cancel_phase_once = False
         self.fail_job_delete_once = False
+        self.fail_owner_cleanup_phase_once = False
         self.linger_secret_once = False
+        self.pause_secret_create = False
+        self.secret_create_claimed = Event()
+        self.release_secret_create = Event()
 
     def create_config_map(self, body: object) -> object:
         value = deepcopy(body)
@@ -94,6 +103,13 @@ class _FakeKube:
         ):
             self.fail_cancel_phase_once = False
             raise RuntimeError("simulated crash after agent stop")
+        if (
+            self.fail_owner_cleanup_phase_once
+            and value.get("data", {}).get("state") == "deleting"
+            and value.get("data", {}).get("cleanupPhase") == "owner_records_deleted"
+        ):
+            self.fail_owner_cleanup_phase_once = False
+            raise RuntimeError("simulated crash after owner runtime cleanup")
         value["metadata"]["resourceVersion"] = str(
             int(self.maps[name]["metadata"]["resourceVersion"]) + 1
         )
@@ -104,6 +120,10 @@ class _FakeKube:
                 "verb": "replace",
                 "name": name,
                 "state": value.get("data", {}).get("state") or payload.get("state"),
+                "gate": payload.get("gate"),
+                "activeClaims": len(payload.get("activeClaims", [])),
+                "closePhase": (payload.get("close") or {}).get("phase"),
+                "closeKind": (payload.get("close") or {}).get("kind"),
             }
         )
         return deepcopy(value)
@@ -168,7 +188,10 @@ class _FakeKube:
         self.events.append({"kind": "Job", "verb": "delete", "propagation": "Foreground"})
         if self.fail_job_delete_once:
             self.fail_job_delete_once = False
-            raise RuntimeError("simulated response loss before foreground deletion")
+            self.job = None
+            self.pods = []
+            shutil.rmtree(self.workspace, ignore_errors=True)
+            raise RuntimeError("simulated response loss after foreground deletion acceptance")
         self.job = None
         self.pods = []
         shutil.rmtree(self.workspace, ignore_errors=True)
@@ -177,6 +200,9 @@ class _FakeKube:
         value = deepcopy(body)
         assert isinstance(value, dict)
         name = value["metadata"]["name"]
+        if self.pause_secret_create:
+            self.secret_create_claimed.set()
+            assert self.release_secret_create.wait(timeout=2)
         self.secrets[name] = value
         self.events.append({"kind": "Secret", "verb": "create", "name": name})
         return deepcopy(value)
@@ -387,7 +413,8 @@ def _collect(ref: str, path: str, content: bytes) -> TransferRegisterRequest:
 
 def _cancel(ref: str = "cancel-task-7", *, finish: list[str] | None = None) -> CancelJobRequest:
     spec = CancelSpec(
-        finish_collect_transfer_refs=finish or ["collect-authorized"], reason="caller-interrupt"
+        finish_collect_transfer_refs=["collect-authorized"] if finish is None else finish,
+        reason="caller-interrupt",
     )
     return CancelJobRequest(cancel_ref=ref, request_digest=canonical_digest(spec), spec=spec)
 
@@ -441,6 +468,46 @@ def _seed_runtime(tmp_path: Path, store: V2JobStore, provider: V2JobProvider) ->
 
 def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
     kube, store, agent, workspace, provider = _setup(tmp_path)
+    raw, metadata = _credential()
+    kube.pause_secret_create = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        grant = pool.submit(provider.grant_credential_result, "job-1", metadata, raw)
+        assert kube.secret_create_claimed.wait(timeout=2)
+        try:
+            replay = provider.grant_credential_result("job-1", metadata, raw)
+            assert replay.created is False and replay.snapshot.state == "accepted"
+            with pytest.raises(StateConflictError):
+                provider.cancel("job-1", _cancel("cancel-during-grant", finish=[]))
+            assert not store.list_runtime("cancel", "job-1")
+            lifecycle = store.read_runtime("lifecycle", "job-1", "slot")
+            assert lifecycle is not None
+            lifecycle_payload = json.loads(lifecycle.values["payload"])
+            assert lifecycle_payload["gate"] == "open"
+            assert len(lifecycle_payload["activeClaims"]) == 1
+            with pytest.raises(StateConflictError):
+                LifecycleGate(store).claim(
+                    "job-1",
+                    str(JOB_UID),
+                    str(POD_UID),
+                    "credential-grant",
+                    "grant-task-7",
+                )
+        finally:
+            kube.release_secret_create.set()
+        created_grant = grant.result()
+        assert created_grant.created is True and created_grant.snapshot.state == "available"
+    LifecycleGate(store).claim(
+        "job-1",
+        str(JOB_UID),
+        str(POD_UID),
+        "credential-grant",
+        "grant-task-7",
+    )
+    assert provider.reconcile_all().indeterminate == 0
+    reconciled_lifecycle = store.read_runtime("lifecycle", "job-1", "slot")
+    assert reconciled_lifecycle is not None
+    assert json.loads(reconciled_lifecycle.values["payload"])["activeClaims"] == []
+    kube.pause_secret_create = False
     _seed_runtime(tmp_path, store, provider)
     app = FastAPI()
     app.include_router(create_jobs_router(provider, "task-7-token"))
@@ -467,6 +534,17 @@ def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
     assert not kube.secrets and kube.job is not None and len(kube.pods) == 1
     assert provider.logs("job-1", "workspace").content == "retained-terminal-log\n"
     counts = (agent.stops, workspace.stops, workspace.local.last_request_frame)
+    lifecycle = store.read_runtime("lifecycle", "job-1", "slot")
+    assert lifecycle is not None
+    interrupted_close = json.loads(lifecycle.values["payload"])
+    interrupted_close["gate"] = "closing"
+    interrupted_close["close"]["phase"] = "workspace_stopped"
+    store.update_runtime(
+        "lifecycle",
+        "job-1",
+        "slot",
+        {**lifecycle.values, "payload": json.dumps(interrupted_close, sort_keys=True)},
+    )
     assert (
         client.post(
             "/api/v2/jobs/job-1/cancel", headers=auth, content=cancel.model_dump_json(by_alias=True)
@@ -474,6 +552,11 @@ def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
         == 200
     )
     assert (agent.stops, workspace.stops, workspace.local.last_request_frame) == counts
+    repaired_close = store.read_runtime("lifecycle", "job-1", "slot")
+    assert repaired_close is not None
+    repaired_payload = json.loads(repaired_close.values["payload"])
+    assert repaired_payload["gate"] == "closed"
+    assert repaired_payload["close"]["phase"] == "succeeded"
     changed = _cancel(finish=["collect-authorized", "collect-unrequested"])
     assert (
         client.post(
@@ -523,7 +606,38 @@ def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
         for index, event in enumerate(kube.events)
         if event["kind"] == "Job" and event["verb"] == "delete"
     )
-    assert first_tombstone_event < first_workload_delete
+    delete_intent_event = next(
+        index
+        for index, event in enumerate(kube.events)
+        if event["kind"] == "ConfigMap" and event.get("state") == "deleting"
+    )
+    assert delete_intent_event < first_workload_delete < first_tombstone_event
+    claim_event = next(
+        index
+        for index, event in enumerate(kube.events)
+        if event.get("gate") == "open" and event.get("activeClaims") == 1
+    )
+    secret_effect = next(
+        index
+        for index, event in enumerate(kube.events)
+        if event["kind"] == "Secret" and event["verb"] == "create"
+    )
+    release_event = next(
+        index
+        for index, event in enumerate(kube.events[secret_effect + 1 :], secret_effect + 1)
+        if event.get("gate") == "open" and event.get("activeClaims") == 0
+    )
+    cancel_close = next(
+        index
+        for index, event in enumerate(kube.events[release_event + 1 :], release_event + 1)
+        if event.get("closeKind") == "cancel" and event.get("closePhase") == "accepted"
+    )
+    delete_close = next(
+        index
+        for index, event in enumerate(kube.events[cancel_close + 1 :], cancel_close + 1)
+        if event.get("closeKind") == "delete" and event.get("closePhase") == "accepted"
+    )
+    assert claim_event < secret_effect < release_event < cancel_close < delete_close
 
     assert client.delete("/api/v2/jobs/job-1", headers=delete_headers).json() == tombstone
     assert (
@@ -559,11 +673,60 @@ def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
 
 
 def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        CancelSpec(finish_collect_transfer_refs=["duplicate", "duplicate"])
+    with pytest.raises(ValueError):
+        FinalizeSpec(
+            operation_refs=["duplicate", "duplicate"],
+            transfer_refs=[],
+            drain_timeout_seconds=1,
+        )
+    reserved_workspace = tmp_path / "reserved-workspace"
+    reserved_workspace.mkdir()
+    reserved_kube = _FakeKube(reserved_workspace)
+    reserved_store = V2JobStore(reserved_kube, clock=lambda: NOW)  # type: ignore[arg-type]
+    reserved_request = _create_request()
+    reserved_store.reserve_create(
+        reserved_request.provider_request_id,
+        reserved_request.spec_digest,
+        "job-1",
+        reserved_request.spec.digest_payload(),
+    )
+    reserved_agent = _AgentTransport(reserved_kube)
+    reserved_workspace_transport = _WorkspaceTransport(
+        reserved_kube, WorkspaceSidecar(reserved_workspace)
+    )
+    reserved_provider = _provider(
+        reserved_kube,
+        reserved_store,
+        reserved_agent,
+        reserved_workspace_transport,
+    )
+    reserved_report = reserved_provider.reconcile_all()
+    assert reserved_report.reconciled == 1
+    assert reserved_kube.created_jobs == 1 and reserved_kube.job is not None
+    retained_finalize = FinalizeSpec(operation_refs=[], transfer_refs=[], drain_timeout_seconds=1)
+    LifecycleGate(reserved_store).begin_close(
+        "job-1",
+        str(JOB_UID),
+        str(POD_UID),
+        "finalize",
+        "finalize-close-gap",
+        canonical_digest(retained_finalize),
+        retained_finalize.model_dump_json(by_alias=True),
+    )
+    close_gap_report = _provider(
+        reserved_kube,
+        reserved_store,
+        reserved_agent,
+        reserved_workspace_transport,
+    ).reconcile_all()
+    assert close_gap_report.reconciled == 1
+    recovered_finalize = reserved_store.read_runtime("finalize", "job-1", "slot")
+    assert recovered_finalize is not None
+    assert json.loads(recovered_finalize.values["payload"])["state"] == "succeeded"
     kube, store, agent, workspace, provider = _setup(tmp_path)
     _seed_runtime(tmp_path, store, provider)
-    delivered = provider.open_collected_content("job-1", "collect-authorized")
-    delivered.confirm()
-    delivered.cleanup()
     kube.linger_secret_once = True
     with pytest.raises(CredentialDestroyFailedError):
         provider.cancel("job-1", _cancel())
@@ -591,7 +754,34 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     with pytest.raises(DependencyUnavailableError):
         recovered.delete("job-1", "delete-after-crash", EMPTY_OBJECT_DIGEST)
     pending = store.read_create("request-task-7")
-    assert pending is not None and pending.is_tombstone and pending.cleanup_state == "pending"
+    assert pending is not None and pending.is_deleting and pending.cleanup_state == "pending"
+    assert pending.deleted_at is None and pending.expires_at is None
+    replayed_create = recovered.create(_create_request())
+    assert replayed_create.created is False
+    assert replayed_create.snapshot.binding_state == "deleting"
+    retained_delete = store.read_create("request-task-7")
+    assert retained_delete is not None and retained_delete.is_deleting
+    assert retained_delete.delete_ref == "delete-after-crash"
+    live_mutations: tuple[Callable[[], object], ...] = (
+        lambda: store.mark_created("request-task-7", str(JOB_UID)),
+        lambda: store.bind_first_pod("request-task-7", str(POD_UID)),
+        lambda: store.mark_indeterminate("request-task-7", "must not replace delete intent"),
+    )
+    for mutate in live_mutations:
+        with pytest.raises(StateConflictError):
+            mutate()
+    deleting = recovered.inspect("job-1")
+    assert deleting.binding_state == "deleting"
+    assert deleting.delete_action.action_ref == "delete-after-crash"
+    kube.fail_owner_cleanup_phase_once = True
+    deletion_gap = _provider(kube, store, agent, workspace)
+    interrupted_delete = deletion_gap.reconcile_all()
+    assert interrupted_delete.indeterminate == 1
+    assert store.read_runtime("lifecycle", "job-1", "slot") is None
+    raw, metadata = _credential()
+    with pytest.raises(StateConflictError):
+        deletion_gap.grant_credential_result("job-1", metadata, raw)
+    assert not kube.secrets
     final = _provider(kube, store, agent, workspace).reconcile_all()
     assert final.deleted == 1 and kube.job is None and kube.pods == []
     tombstone = store.read_create("request-task-7")

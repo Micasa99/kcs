@@ -8,13 +8,14 @@ import hmac
 import os
 import re
 import tempfile
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
+import yaml  # type: ignore[import-untyped]
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi import Path as ApiPath
 from fastapi.exceptions import RequestValidationError
@@ -159,7 +160,11 @@ class _V2Route(APIRoute):
         return route_handler
 
 
-def _auth_dependency(service_token: str, roles: frozenset[str]) -> Callable[[Request], V2Caller]:
+def _auth_dependency(
+    service_token: str,
+    roles: frozenset[str],
+    operation_roles: Mapping[str, str],
+) -> Callable[[Request], V2Caller]:
     if not service_token or any(character.isspace() for character in service_token):
         raise ValueError("KCS V2 service token must be configured")
     expected_digest = hashlib.sha256(service_token.encode("utf-8")).digest()
@@ -171,6 +176,11 @@ def _auth_dependency(service_token: str, roles: frozenset[str]) -> Callable[[Req
         token_matches = hmac.compare_digest(supplied_digest, expected_digest)
         if separator != " " or scheme.casefold() != "bearer" or not token_matches:
             raise _UnauthenticatedError
+        route = request.scope.get("route")
+        operation_id = getattr(route, "operation_id", None)
+        required_role = operation_roles.get(str(operation_id))
+        if required_role is None or required_role not in roles:
+            raise _ForbiddenError()
         return V2Caller(roles=roles)
 
     return require_v2_caller
@@ -238,7 +248,6 @@ def _content_chunks(content: VerifiedContent) -> Iterator[bytes]:
     with content.path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             yield chunk
-    content.confirm()
 
 
 def _error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
@@ -261,16 +270,25 @@ def create_jobs_router(
 
     openapi_bytes = (canonical_openapi_path or _DEFAULT_OPENAPI_PATH).read_bytes()
     openapi_sha256 = hashlib.sha256(openapi_bytes).hexdigest()
-    require_v2_caller = _auth_dependency(service_token, caller_roles)
-
-    def require_role(role: str) -> Callable[[Request], V2Caller]:
-        def enforce(request: Request) -> V2Caller:
-            caller = require_v2_caller(request)
-            if role not in caller.roles:
-                raise _ForbiddenError()
-            return caller
-
-        return enforce
+    canonical = yaml.safe_load(openapi_bytes)
+    paths = canonical.get("paths") if isinstance(canonical, Mapping) else None
+    if not isinstance(paths, Mapping):
+        raise ValueError("canonical OpenAPI paths are invalid")
+    operation_roles: dict[str, str] = {}
+    for path_item in paths.values():
+        if not isinstance(path_item, Mapping):
+            raise ValueError("canonical OpenAPI path item is invalid")
+        for method, operation in path_item.items():
+            if str(method).lower() not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            if not isinstance(operation, Mapping):
+                raise ValueError("canonical OpenAPI operation is invalid")
+            operation_id = operation.get("operationId")
+            role = operation.get("x-kcs-service-authorization")
+            if not isinstance(operation_id, str) or not isinstance(role, str):
+                raise ValueError("canonical OpenAPI authorization is incomplete")
+            operation_roles[operation_id] = role
+    require_v2_caller = _auth_dependency(service_token, caller_roles, operation_roles)
 
     router = APIRouter(
         route_class=_V2Route,
@@ -395,7 +413,6 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/agent/credential-grants",
         operation_id="grantCredential",
         tags=["Credentials"],
-        dependencies=[Depends(require_role("v2-private-credential-writer"))],
         status_code=201,
         response_model=CredentialGrantSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503),
@@ -438,11 +455,6 @@ def create_jobs_router(
         job_uid: Annotated[UUID, Header(alias="KCS-Job-UID")],
         pod_uid: Annotated[UUID, Header(alias="KCS-Pod-UID")],
     ) -> Response:
-        try:
-            provider.inspect_credential_grant(job_ref, credential_grant_ref)
-            replay = True
-        except KcsV2Error:
-            replay = False
         metadata = CredentialGrantMetadata(
             credential_grant_ref=credential_grant_ref,
             credential_sha256=credential_sha256,
@@ -455,10 +467,10 @@ def create_jobs_router(
             job_uid=job_uid,
             pod_uid=pod_uid,
         )
-        return _json_model(
-            provider.grant_credential(job_ref, metadata, await _credential_body(request)),
-            status_code=200 if replay else 201,
+        result = provider.grant_credential_result(
+            job_ref, metadata, await _credential_body(request)
         )
+        return _json_model(result.snapshot, status_code=201 if result.created else 200)
 
     @router.get(
         "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",

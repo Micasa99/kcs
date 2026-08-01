@@ -75,6 +75,10 @@ class CreateRecord:
     def is_tombstone(self) -> bool:
         return self.state == "deleted"
 
+    @property
+    def is_deleting(self) -> bool:
+        return self.state == "deleting"
+
     def tombstone_payload(self) -> dict[str, object]:
         """Return the frozen public tombstone shape for a deleted record."""
         required = {
@@ -157,6 +161,7 @@ class V2JobStore:
     ) -> None:
         self._kube = kube
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._scan_errors = 0
 
     def reserve_create(
         self,
@@ -323,20 +328,20 @@ class V2JobStore:
         expires = _timestamp(expires_at)
 
         def mutate(current: CreateRecord) -> CreateRecord:
-            if current.is_tombstone:
+            if current.is_tombstone or current.is_deleting:
                 if (
                     current.delete_ref != delete_ref
                     or current.delete_request_digest != delete_request_digest
                 ):
                     raise IdentityDigestConflict()
-                if (
-                    current.final_state != final_state
-                    or current.deleted_at != deleted
-                    or current.expires_at != expires
-                ):
+                if current.final_state != final_state:
                     raise StateConflictError(
-                        "A retained tombstone cannot change terminal state or retention times"
+                        "A retained delete intent cannot change terminal state"
                     )
+                if current.is_tombstone and (
+                    current.deleted_at != deleted or current.expires_at != expires
+                ):
+                    raise StateConflictError("A retained tombstone cannot change retention times")
                 retained_phase = cleanup_phase or current.cleanup_phase
                 retained_credentials = (
                     credential_observations_json or current.credential_observations_json
@@ -366,6 +371,7 @@ class V2JobStore:
                     return current
                 return replace(
                     current,
+                    state="deleted" if cleanup_state == "complete" else "deleting",
                     cleanup_state=cleanup_state,
                     cleanup_reason=cleanup_reason,
                     cleanup_phase=retained_phase,
@@ -373,13 +379,15 @@ class V2JobStore:
                     gpu_release_reason=gpu_release_reason,
                     credential_observations_json=retained_credentials,
                     transfer_observations_json=retained_transfers,
+                    deleted_at=deleted if cleanup_state == "complete" else None,
+                    expires_at=expires if cleanup_state == "complete" else None,
                     updated_at=_timestamp(self._clock()),
                 )
             if current.job_uid is None:
                 raise StateConflictError("A reservation without a Job UID cannot be deleted")
             return replace(
                 current,
-                state="deleted",
+                state="deleted" if cleanup_state == "complete" else "deleting",
                 final_state=final_state,
                 delete_ref=delete_ref,
                 delete_request_digest=delete_request_digest,
@@ -390,16 +398,21 @@ class V2JobStore:
                 gpu_release_reason=gpu_release_reason,
                 credential_observations_json=credential_observations_json or "[]",
                 transfer_observations_json=transfer_observations_json or "[]",
-                deleted_at=deleted,
-                expires_at=expires,
-                updated_at=deleted,
+                deleted_at=deleted if cleanup_state == "complete" else None,
+                expires_at=expires if cleanup_state == "complete" else None,
+                updated_at=_timestamp(self._clock()),
             )
 
         return self._update(provider_request_id, mutate)
 
     def list_create(self) -> list[CreateRecord]:
         selector = f"{RECORD_KIND_LABEL}={RECORD_KIND_VALUE}"
-        records = [_record_from_config_map(item) for item in self._kube.list_config_maps(selector)]
+        records: list[CreateRecord] = []
+        for item in self._kube.list_config_maps(selector):
+            try:
+                records.append(_record_from_config_map(item))
+            except (DependencyUnavailableError, ValueError, TypeError):
+                self._scan_errors += 1
         return sorted(records, key=lambda item: (item.created_at, item.job_ref))
 
     def reserve_runtime(
@@ -444,12 +457,21 @@ class V2JobStore:
         selector = f"{RECORD_KIND_LABEL}=runtime-{kind}"
         if job_ref is not None:
             selector = f"{selector},{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
-        return [
-            record
-            for item in self._kube.list_config_maps(selector)
-            if (record := _runtime_record_from_config_map(item)).job_ref == job_ref
-            or job_ref is None
-        ]
+        records: list[RuntimeRecord] = []
+        for item in self._kube.list_config_maps(selector):
+            try:
+                record = _runtime_record_from_config_map(item)
+            except (DependencyUnavailableError, ValueError, TypeError):
+                self._scan_errors += 1
+                continue
+            if record.job_ref == job_ref or job_ref is None:
+                records.append(record)
+        return records
+
+    def consume_scan_errors(self) -> int:
+        errors = self._scan_errors
+        self._scan_errors = 0
+        return errors
 
     def delete_runtime_records(self, job_ref: str) -> int:
         """Remove owner-scoped runtime records left after foreground Job deletion."""
@@ -595,6 +617,8 @@ class V2JobStore:
 def _require_live(record: CreateRecord) -> None:
     if record.is_tombstone:
         raise TombstonedError(record.tombstone_payload())
+    if record.is_deleting:
+        raise StateConflictError("A retained deletion intent cannot be changed by a live mutation")
 
 
 def _normalize_spec(

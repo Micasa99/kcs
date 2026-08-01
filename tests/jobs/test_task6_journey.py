@@ -69,6 +69,7 @@ class _Kube:
 
     def __init__(self) -> None:
         self.maps: dict[str, dict[str, Any]] = {}
+        self.terminated: set[str] = set()
 
     def create_config_map(self, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -105,18 +106,26 @@ class _Kube:
         ]
 
     def read_job(self, job_ref: str) -> object:
-        return {"metadata": {"uid": str(JOB_UID), "resourceVersion": "9"}, "status": {}}
+        status = {"succeeded": 1} if self.terminated == {"agent", "workspace"} else {}
+        return {
+            "metadata": {"uid": str(JOB_UID), "resourceVersion": "9"},
+            "status": status,
+        }
 
     def list_job_pods(self, job_ref: str, job_uid: str | None = None) -> list[object]:
-        statuses = [
-            {
-                "name": role,
-                "ready": True,
-                "restart_count": 0,
-                "state": {"running": {"started_at": NOW}},
-            }
-            for role in ("agent", "workspace")
-        ]
+        statuses = []
+        for role in ("agent", "workspace"):
+            terminated = role in self.terminated
+            statuses.append(
+                {
+                    "name": role,
+                    "ready": not terminated,
+                    "restart_count": 0,
+                    "state": {"terminated": {"exit_code": 0, "reason": "Completed"}}
+                    if terminated
+                    else {"running": {"started_at": NOW}},
+                }
+            )
         return [
             {
                 "metadata": {"uid": str(POD_UID)},
@@ -690,6 +699,9 @@ class _InvalidOperationResult:
 
 
 class _StopTransport:
+    def __init__(self, kube: _Kube) -> None:
+        self.kube = kube
+
     def agent_rpc(
         self, binding: Mapping[str, str], request: Mapping[str, object]
     ) -> AgentRpcResponse:
@@ -697,6 +709,7 @@ class _StopTransport:
 
     def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse:
         del binding, container
+        self.kube.terminated.update({"agent", "workspace"})
         return AgentRpcResponse(
             protocol_version=1,
             generation=0,
@@ -850,7 +863,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
         finalize_store,
         finalize_local,
         sleeper=lambda _: None,
-        transport=_StopTransport(),
+        transport=_StopTransport(finalize_kube),
     )
     finalize_spec = FinalizeSpec(
         operation_refs=["operation-finalize"],
@@ -890,7 +903,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
         unknown_store,
         LocalWorkspaceRpcTransport(unknown_sidecar.dispatch),
         sleeper=lambda _: None,
-        transport=_StopTransport(),
+        transport=_StopTransport(unknown_kube),
     )
     unknown_spec = FinalizeSpec(
         operation_refs=[], transfer_refs=["unknown-action"], drain_timeout_seconds=1

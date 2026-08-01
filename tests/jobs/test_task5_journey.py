@@ -110,7 +110,11 @@ class _Kube:
         return existed
 
     def read_job(self, job_ref: str) -> object:
-        return {"metadata": {"uid": str(JOB_UID), "resourceVersion": "9"}, "status": {}}
+        status = {"succeeded": 1} if self.terminated == {"agent", "workspace"} else {}
+        return {
+            "metadata": {"uid": str(JOB_UID), "resourceVersion": "9"},
+            "status": status,
+        }
 
     def list_job_pods(self, job_ref: str, job_uid: str | None = None) -> list[object]:
         statuses = []

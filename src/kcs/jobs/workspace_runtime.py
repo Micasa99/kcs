@@ -41,6 +41,7 @@ from .errors import (
     OperationIndeterminateError,
     OverwriteForbiddenError,
     PayloadTooLargeError,
+    StaleBindingError,
     StateConflictError,
     TransferBytesMismatchError,
     TransferIdentityConflictError,
@@ -106,13 +107,18 @@ class VerifiedContent:
     sha256: str
     snapshot_ref: str
     confirm_delivery: Callable[[], None] | None = None
+    release_claim: Callable[[], None] | None = None
 
     def confirm(self) -> None:
         if self.confirm_delivery is not None:
             self.confirm_delivery()
 
     def cleanup(self) -> None:
-        self.path.unlink(missing_ok=True)
+        try:
+            self.path.unlink(missing_ok=True)
+        finally:
+            if self.release_claim is not None:
+                self.release_claim()
 
 
 class WorkspaceRuntime:
@@ -240,9 +246,14 @@ class WorkspaceRuntime:
             path.unlink(missing_ok=True)
 
     def open_collected_content(self, job_ref: str, transfer_ref: str) -> VerifiedContent:
+        return self._open_collected_content(job_ref, transfer_ref, accepting=True)
+
+    def _open_collected_content(
+        self, job_ref: str, transfer_ref: str, *, accepting: bool
+    ) -> VerifiedContent:
         record = self._transfer_record(job_ref, transfer_ref)
         snapshot = self._transfer_snapshot(record)
-        binding = self._binding_for_existing(snapshot, accepting=True)
+        binding = self._binding_for_existing(snapshot, accepting=accepting)
         if snapshot.spec.direction is not TransferDirection.COLLECT_OUTPUT:
             raise StateConflictError("Only collect_output transfers expose content")
         if snapshot.state in {
@@ -304,7 +315,7 @@ class WorkspaceRuntime:
     def confirm_collect_delivery(
         self, job_ref: str, transfer_ref: str, snapshot_ref: str
     ) -> TransferSnapshot:
-        """Record that the verified direct response body finished leaving KCS."""
+        """Record a legacy server-side stream completion marker, never a client ACK."""
         record = self._transfer_record(job_ref, transfer_ref)
         snapshot = self._transfer_snapshot(record)
         if (
@@ -332,42 +343,24 @@ class WorkspaceRuntime:
         return snapshot
 
     def drain_pre_authorized_collect(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
-        """Prove a named collect was delivered before cancel closed normal admission."""
+        """Best-effort materialize and verify a collect named by cancel."""
         record = self._transfer_record(job_ref, transfer_ref)
         snapshot = self._transfer_snapshot(record)
         if snapshot.spec.direction is not TransferDirection.COLLECT_OUTPUT:
             raise StateConflictError("cancel may drain only pre-authorized collect transfers")
-        if snapshot.state not in {
-            TransferState.COMPLETED,
-            TransferState.INDETERMINATE,
-        }:
+        if snapshot.state is not TransferState.COMPLETED:
             snapshot = self.reconcile_transfer(job_ref, transfer_ref)
+            if snapshot.state is not TransferState.COMPLETED:
+                # This is retained, pre-authorized collect work during lifecycle close, not a
+                # newly admitted transfer. Identity binding is still checked above.
+                content = self._open_collected_content(job_ref, transfer_ref, accepting=False)
+                try:
+                    snapshot = self.inspect_transfer(job_ref, transfer_ref)
+                finally:
+                    content.cleanup()
             record = self._transfer_record(job_ref, transfer_ref)
-        values = _values(record)
-        delivered = values.get("deliveryConfirmedSnapshotRef")
-        if (
-            snapshot.state is TransferState.COMPLETED
-            and snapshot.snapshot_ref is not None
-            and delivered == snapshot.snapshot_ref
-        ):
+        if snapshot.state is TransferState.COMPLETED and snapshot.snapshot_ref is not None:
             return snapshot
-        now = self._clock()
-        indeterminate = snapshot.model_copy(
-            update={
-                "state": TransferState.INDETERMINATE,
-                "content_available": False,
-                "updated_at": now,
-                "completed_at": snapshot.completed_at or now,
-                "observed_at": now,
-                "failure_reason": "cancel could not prove collect delivery before supervisor stop",
-            }
-        )
-        self._store.update_runtime(
-            "transfer",
-            job_ref,
-            transfer_ref,
-            {**values, "payload": indeterminate.model_dump_json(by_alias=True)},
-        )
         raise TransferIndeterminateError()
 
     def cancel_transfer(
@@ -588,7 +581,7 @@ class WorkspaceRuntime:
         if str(binding.job_uid) != str(request.job_uid) or str(_pod_uid(binding)) != str(
             request.pod_uid
         ):
-            raise StateConflictError("Workspace operation binding headers are stale")
+            raise StaleBindingError()
         frame_digest = canonical_digest(request.frame.root)
         existing = self._store.read_runtime("operation", job_ref, request.operation_ref)
         if existing is not None:
