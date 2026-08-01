@@ -8,6 +8,17 @@
 
 **Tech Stack:** Python 3.12, FastAPI, Pydantic v2, Kubernetes Python client, RFC 8785 JCS, PyYAML, pytest/httpx, Ruff, Mypy, OCI images, k3s/containerd, NVIDIA device plugin.
 
+## Execution adjustment: runtime evidence first
+
+Per the owner direction on 2026-08-01, execute the remaining tasks as working vertical
+slices rather than expanding defensive test matrices. Keep only narrow contract checks
+that fail for a real runtime invariant. The primary sequence is `create -> Job/Pod ->
+inspect/log -> transfer/invoke -> start/cancel/delete`, followed by the dedicated-server
+standalone Journey. Completion evidence comes from raw API responses, Kubernetes
+Job/Pod/events, both role logs, file digests, restart behavior, and resource cleanup;
+test counts are supporting evidence only. The development Mac remains a source, build,
+and deployment client and must not run the formal KCS/k3s runtime.
+
 ## Global Constraints
 
 - Actual implementation base: `origin/main@8ca9be59028522e35d39ecae131b6e9ffd5f4c74`; design-review baseline: `6f3d85102616bd4ab35a690f31179ed06c7a23e5`.

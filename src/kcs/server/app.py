@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -14,13 +17,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from kcs import __version__
-from kcs.server.routes import (
-    clusters_router,
-    containers_router,
-    shell_proxy_router,
-    shell_sessions_router,
-    system_router,
-)
+
+if TYPE_CHECKING:
+    from kcs.jobs.provider import V2JobProvider
+    from kcs.jobs.settings import V2RuntimeSettings
 
 log = logging.getLogger("kcs")
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
@@ -36,7 +36,41 @@ def _get_api_key() -> str | None:
     return None
 
 
-def create_app() -> FastAPI:
+def create_app(
+    *,
+    api_mode: str | None = None,
+    v2_provider: V2JobProvider | None = None,
+    v2_settings: V2RuntimeSettings | None = None,
+    v2_service_token: str | None = None,
+) -> FastAPI:
+    """Create the legacy app or the isolated V2 attempt runtime."""
+    has_v2_injection = any(
+        value is not None for value in (v2_provider, v2_settings, v2_service_token)
+    )
+    selected_mode = (
+        api_mode
+        if api_mode is not None
+        else ("v2" if has_v2_injection else os.environ.get("KCS_API_MODE", "v1"))
+    )
+    if selected_mode not in {"v1", "v2"}:
+        raise ValueError("KCS_API_MODE must be 'v1' or 'v2'")
+    if selected_mode == "v2":
+        return _create_v2_app(
+            provider=v2_provider,
+            settings=v2_settings,
+            service_token=v2_service_token,
+        )
+    if has_v2_injection:
+        raise ValueError("V2 dependencies cannot be injected into the V1 application")
+
+    from kcs.server.routes import (
+        clusters_router,
+        containers_router,
+        shell_proxy_router,
+        shell_sessions_router,
+        system_router,
+    )
+
     tags_metadata = [
         {
             "name": "Containers",
@@ -53,7 +87,8 @@ def create_app() -> FastAPI:
         },
         {
             "name": "Cluster",
-            "description": "Apply declarative cluster configuration — join workers, prune stale nodes.",
+            "description": "Apply declarative cluster configuration — join workers and prune "
+            "stale nodes.",
         },
         {
             "name": "Shell Proxy",
@@ -68,7 +103,10 @@ def create_app() -> FastAPI:
         openapi_tags=tags_metadata,
     )
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(
+        RateLimitExceeded,
+        _rate_limit_exceeded_handler,  # type: ignore[arg-type]
+    )
 
     # Static files
     static_dir = Path(__file__).resolve().parent.parent / "static"
@@ -76,11 +114,14 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     @app.get("/", include_in_schema=False)
-    def index():
+    def index() -> FileResponse:
         return FileResponse(str(static_dir / "index.html"))
 
     @app.middleware("http")
-    async def log_requests(request: Request, call_next):
+    async def log_requests(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = (time.time() - start) * 1000
@@ -94,7 +135,10 @@ def create_app() -> FastAPI:
         return response
 
     @app.middleware("http")
-    async def auth(request: Request, call_next):
+    async def auth(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         api_key = _get_api_key()
         # No auth configured — allow all
         if not api_key:
@@ -102,7 +146,11 @@ def create_app() -> FastAPI:
 
         # Allow static files and docs without auth
         path = request.url.path
-        if path == "/" or path.startswith("/static") or path in ("/docs", "/redoc", "/openapi.json"):
+        if (
+            path == "/"
+            or path.startswith("/static")
+            or path in ("/docs", "/redoc", "/openapi.json")
+        ):
             return await call_next(request)
 
         # Require Authorization header
@@ -122,6 +170,67 @@ def create_app() -> FastAPI:
     app.include_router(shell_proxy_router)
     app.include_router(shell_sessions_router)
 
+    return app
+
+
+def _create_v2_app(
+    *,
+    provider: V2JobProvider | None,
+    settings: V2RuntimeSettings | None,
+    service_token: str | None,
+) -> FastAPI:
+    """Create only the private health and authenticated V2 Job surfaces."""
+    from kcs.jobs.settings import V2RuntimeSettings
+    from kcs.server.routes import create_jobs_router
+
+    if settings is None:
+        settings_environ = dict(os.environ)
+        settings_environ["KCS_API_MODE"] = "v2"
+        if service_token is not None:
+            settings_environ["KCS_V2_SERVICE_TOKEN"] = service_token
+        settings = V2RuntimeSettings.from_env(settings_environ)
+    elif settings.api_mode != "v2":
+        raise ValueError("V2 settings must select api_mode='v2'")
+
+    resolved_token = service_token if service_token is not None else settings.service_token
+    if resolved_token is None:
+        raise ValueError("KCS_V2_SERVICE_TOKEN is required for the V2 application")
+    if provider is None:
+        from kcs.server.services import get_v2_provider
+
+        provider = get_v2_provider(settings)
+
+    app = FastAPI(
+        title="kcs V2 Attempt Runtime API",
+        description="Isolated physical attempt runtime for ResearchCosmos.",
+        version="2.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    @app.get("/api/v1/health", include_in_schema=False)
+    def health() -> dict[str, str]:
+        return {"status": "ok", "version": __version__}
+
+    @app.middleware("http")
+    async def log_v2_requests(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        start = time.time()
+        response = await call_next(request)
+        duration = (time.time() - start) * 1000
+        log.info(
+            "%s %s → %s (%.0fms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
+        return response
+
+    app.include_router(create_jobs_router(provider, resolved_token))
     return app
 
 

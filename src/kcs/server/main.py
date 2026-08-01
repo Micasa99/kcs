@@ -9,12 +9,10 @@ import sys
 
 import uvicorn
 
-from kcs.server.services import get_service, set_service_config
-
 log = logging.getLogger("kcs")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="kcs HTTP API server")
     parser.add_argument(
         "--host",
@@ -78,75 +76,86 @@ def main():
     if args.log_file:
         fh = logging.FileHandler(args.log_file)
         fh.setFormatter(
-            logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
-            )
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
         )
         logging.getLogger().addHandler(fh)
         log.info("Logging to %s", args.log_file)
 
-    if not args.config:
-        print("Error: --config <file> is required", file=sys.stderr)
-        print("  kcs serve --config cluster.toml", file=sys.stderr)
+    api_mode = os.environ.get("KCS_API_MODE", "v1")
+    if api_mode not in {"v1", "v2"}:
+        print("Error: KCS_API_MODE must be 'v1' or 'v2'", file=sys.stderr)
         sys.exit(1)
 
-    log.info("Loading config: %s", args.config)
-    try:
-        svc = get_service()
-        config = svc.load_config_file(args.config)
+    if api_mode == "v2":
+        from kcs.jobs.settings import V2RuntimeSettings
 
-        # CLI flag / env var overrides config file
-        if args.api_key:
-            config.api_key = args.api_key
+        try:
+            V2RuntimeSettings.from_env(os.environ)
+        except ValueError as error:
+            log.error("  %s", error)
+            sys.exit(1)
+    else:
+        from kcs.server.services import get_service, set_service_config
 
-        if not config.api_key:
-            print(
-                "Error: api_key is required. Set it in the config file or via --api-key / KCS_API_KEY.",
-                file=sys.stderr,
-            )
+        if not args.config:
+            print("Error: --config <file> is required", file=sys.stderr)
+            print("  kcs serve --config cluster.toml", file=sys.stderr)
             sys.exit(1)
 
-        if not config.sudo_password:
-            print()
-            print("  sudo access is needed on this machine to:")
-            print(
-                "    • read the k3s server token (/var/lib/rancher/k3s/server/token)"
-            )
-            print(
-                "    • configure the container registry (/etc/rancher/k3s/registries.yaml)"
-            )
-            print("    • manage NFS (if enabled)")
-            print()
-            import getpass
+        log.info("Loading config: %s", args.config)
+        try:
+            svc = get_service()
+            config = svc.load_config_file(args.config)
 
-            pw = getpass.getpass("  local sudo password: ")
-            if pw:
-                config.sudo_password = pw
-            print()
+            # CLI flag / env var overrides config file
+            if args.api_key:
+                config.api_key = args.api_key
 
-        set_service_config(config)
-        results = svc.apply_config()
-        for r in results:
-            log.info("  %s", r)
+            if not config.api_key:
+                print(
+                    "Error: api_key is required. Set it in the config file or via "
+                    "--api-key / KCS_API_KEY.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
-        if not args.no_nfs:
-            log.info("Setting up NFS...")
-            try:
-                nfs_result = svc.setup_nfs()
-                log.info("NFS: %s", nfs_result.get("message"))
-                for r in nfs_result.get("results", []):
-                    log.info("  %s", r)
-            except Exception as e:
-                log.warning("NFS setup skipped: %s", e)
+            if not config.sudo_password:
+                print()
+                print("  sudo access is needed on this machine to:")
+                print("    • read the k3s server token (/var/lib/rancher/k3s/server/token)")
+                print("    • configure the container registry (/etc/rancher/k3s/registries.yaml)")
+                print("    • manage NFS (if enabled)")
+                print()
+                import getpass
 
-        # Wipe sudo password from memory — no longer needed
-        config.sudo_password = None
-    except Exception as e:
-        log.error("  %s", e)
-        sys.exit(1)
+                pw = getpass.getpass("  local sudo password: ")
+                if pw:
+                    config.sudo_password = pw
+                print()
 
-    log.info("Checking cluster health...")
-    get_service().repair()
+            set_service_config(config)
+            results = svc.apply_config()
+            for result in results:
+                log.info("  %s", result)
+
+            if not args.no_nfs:
+                log.info("Setting up NFS...")
+                try:
+                    nfs_result = svc.setup_nfs()
+                    log.info("NFS: %s", nfs_result.get("message"))
+                    for result in nfs_result.get("results", []):
+                        log.info("  %s", result)
+                except Exception as error:
+                    log.warning("NFS setup skipped: %s", error)
+
+            # Wipe sudo password from memory — no longer needed
+            config.sudo_password = None
+        except Exception as error:
+            log.error("  %s", error)
+            sys.exit(1)
+
+        log.info("Checking cluster health...")
+        get_service().repair()
 
     uvicorn_kwargs = {"host": args.host, "port": args.port, "reload": False}
     if args.ssl_certfile and args.ssl_keyfile:

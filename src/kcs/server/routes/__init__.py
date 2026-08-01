@@ -1,10 +1,30 @@
-"""Route modules for kcs API."""
+"""Lazy route exports for the mutually isolated V1 and V2 applications."""
 
-from kcs.server.routes.clusters import router as clusters_router
-from kcs.server.routes.containers import router as containers_router
-from kcs.server.routes.shell_proxy_routes import router as shell_proxy_router
-from kcs.server.routes.shell_sessions import router as shell_sessions_router
-from kcs.server.routes.system import router as system_router
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
+
+_ROUTE_EXPORTS = {
+    "clusters_router": ("kcs.server.routes.clusters", "router"),
+    "containers_router": ("kcs.server.routes.containers", "router"),
+    "create_jobs_router": ("kcs.server.routes.jobs", "create_jobs_router"),
+    "shell_proxy_router": ("kcs.server.routes.shell_proxy_routes", "router"),
+    "shell_sessions_router": ("kcs.server.routes.shell_sessions", "router"),
+    "system_router": ("kcs.server.routes.system", "router"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Import only the route family selected by the application mode."""
+    try:
+        module_name, attribute = _ROUTE_EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(name) from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "containers_router",
@@ -12,4 +32,5 @@ __all__ = [
     "system_router",
     "shell_proxy_router",
     "shell_sessions_router",
+    "create_jobs_router",
 ]

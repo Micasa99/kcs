@@ -52,7 +52,7 @@ def _api(path: str, method: str = "GET", json_data=None, params=None, stream=Fal
     except requests.ConnectionError:
         raise click.ClickException(
             f"Cannot connect to http://localhost:{port} — server running? (kcs serve)"
-        )
+        ) from None
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text[:200])
@@ -87,7 +87,13 @@ def main(ctx: click.Context, port: int) -> None:
 @main.command()
 @click.option("--host", envvar="KCS_HOST", default="127.0.0.1")
 @click.option("--port", envvar="KCS_PORT", default=8000, type=int)
-@click.option("-c", "--config", required=True, help="Cluster config file (.toml/.yaml)")
+@click.option(
+    "-c",
+    "--config",
+    required=False,
+    default=None,
+    help="Cluster config file (.toml/.yaml); required for V1 mode",
+)
 @click.option("--log-file", default=None)
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG-level logging")
 @click.option("--no-nfs", is_flag=True, help="Skip NFS setup even when --config is provided")

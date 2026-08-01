@@ -11,12 +11,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from kcs.config import get_registry, is_built_image, load, save, set_cluster_registry
 from kcs.k8s import KCSClient
 from kcs.server.models import ClusterConfig, WorkerNode
+
+if TYPE_CHECKING:
+    from kcs.jobs.provider import V2JobProvider
+    from kcs.jobs.settings import V2RuntimeSettings
 
 log = logging.getLogger("kcs")
 
@@ -26,6 +31,7 @@ log = logging.getLogger("kcs")
 # ══════════════════════════════════════════════════════════════════════════════
 
 _service: ClusterService | None = None
+_v2_provider: V2JobProvider | None = None
 
 
 def get_service() -> ClusterService:
@@ -37,6 +43,32 @@ def get_service() -> ClusterService:
 
 def set_service_config(config: ClusterConfig) -> None:
     get_service().cluster_config = config
+
+
+def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
+    """Build the namespace-bound V2 provider only when V2 mode selects it."""
+    global _v2_provider
+    if _v2_provider is None:
+        from kubernetes import client, config  # type: ignore[import-untyped]
+
+        from kcs.jobs.kube import V2KubeAdapter
+        from kcs.jobs.provider import V2JobProvider
+        from kcs.jobs.renderer import V2JobRenderer
+        from kcs.jobs.settings import V2RuntimeSettings
+        from kcs.jobs.store import V2JobStore
+
+        settings = settings or V2RuntimeSettings.from_env(os.environ)
+        config.load_incluster_config()
+        batch_api = client.BatchV1Api(api_client=client.ApiClient())
+        core_api = client.CoreV1Api(api_client=client.ApiClient())
+        kube = V2KubeAdapter(settings.namespace, batch_api, core_api)
+        _v2_provider = V2JobProvider(
+            kube,
+            V2JobStore(kube),
+            V2JobRenderer(settings),
+            namespace=settings.namespace,
+        )
+    return _v2_provider
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -551,7 +583,6 @@ spec:
             if already_joined:
                 log.info("Node %s already in cluster", remote_hostname)
                 if registry_cfg:
-                    suf = "sh -c" if need_sudo else ""
                     sync_cmd = (
                         f"sudo -S -p '' sh -c '{registry_cfg}'"
                         if need_sudo
@@ -562,7 +593,10 @@ spec:
                              need_sudo=need_sudo, stdin_text=sudo_pw, timeout=30)
                     log.info("  registry config synced")
 
-                restart_cmd = "systemctl restart k3s-agent 2>/dev/null || systemctl restart k3s 2>/dev/null"
+                restart_cmd = (
+                    "systemctl restart k3s-agent 2>/dev/null || "
+                    "systemctl restart k3s 2>/dev/null"
+                )
                 if need_sudo:
                     restart_cmd = f"sudo -S -p '' sh -c '{restart_cmd}'"
                 ri = (pw + "\n") if need_sudo else None
@@ -577,7 +611,10 @@ spec:
 
             # fresh join
             k3s_url = f"https://{server_ip}:6443"
-            install_cmd = f"curl -sfL https://get.k3s.io | K3S_URL={k3s_url} K3S_TOKEN={k3s_token} sh -"
+            install_cmd = (
+                f"curl -sfL https://get.k3s.io | K3S_URL={k3s_url} "
+                f"K3S_TOKEN={k3s_token} sh -"
+            )
             cleanup = (
                 "sudo systemctl stop k3s-agent 2>/dev/null; "
                 "sudo systemctl disable k3s-agent 2>/dev/null; "
