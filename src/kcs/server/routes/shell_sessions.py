@@ -14,6 +14,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Query
 
+from kcs.legacy_guard import assert_legacy_target_allowed
 from kcs.server.models import ExecRequest
 from kcs.server.services import get_service
 
@@ -22,7 +23,7 @@ router = APIRouter(tags=["Shell Sessions"])
 
 # ── Session storage ─────────────────────────────────────────────────────────
 
-_sessions: dict[str, "ShellSession"] = {}
+_sessions: dict[str, ShellSession] = {}
 _sessions_lock = threading.Lock()
 _sessions_at: dict[str, float] = {}
 _SESSION_TTL = 1800  # 30 min idle timeout
@@ -44,10 +45,12 @@ def _purge_stale_sessions() -> None:
 
 # ── ShellSession ────────────────────────────────────────────────────────────
 
+
 class ShellSession:
     """A persistent /bin/sh process inside a container, accessed via HTTP."""
 
     def __init__(self, pod_name: str, namespace: str, kubeconfig: str | None):
+        assert_legacy_target_allowed({"namespace": namespace})
         self.pod_name = pod_name
         self.master_fd, slave_fd = pty.openpty()
         cmd = ["kubectl", "exec", "-it", pod_name, "-n", namespace, "--", "/bin/sh"]
@@ -55,8 +58,12 @@ class ShellSession:
         if kubeconfig:
             env["KUBECONFIG"] = kubeconfig
         self.proc = subprocess.Popen(
-            cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-            env=env, close_fds=True,
+            cmd,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
         )
         os.close(slave_fd)
         self._lock = threading.Lock()
@@ -150,8 +157,10 @@ class ShellSession:
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-@router.post("/api/v1/containers/{name}/shell/sessions",
-    summary="Create a persistent shell session")
+
+@router.post(
+    "/api/v1/containers/{name}/shell/sessions", summary="Create a persistent shell session"
+)
 def shell_session_create(name: str, pod: int | None = Query(default=None)):
     """Open a persistent /bin/sh process inside a container."""
     client = get_service().get_client()
@@ -170,8 +179,10 @@ def shell_session_create(name: str, pod: int | None = Query(default=None)):
     return {"session_id": sid, "pod": pod_name}
 
 
-@router.post("/api/v1/containers/{name}/shell/sessions/{sid}/exec",
-    summary="Run a command in a shell session")
+@router.post(
+    "/api/v1/containers/{name}/shell/sessions/{sid}/exec",
+    summary="Run a command in a shell session",
+)
 def shell_session_exec(name: str, sid: str, req: ExecRequest):
     """Execute a command inside an existing shell session."""
     with _sessions_lock:
@@ -184,12 +195,11 @@ def shell_session_exec(name: str, sid: str, req: ExecRequest):
             _sessions_at[sid] = time.time()
         result = session.exec(shlex.join(req.command))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
     return result
 
 
-@router.delete("/api/v1/containers/{name}/shell/sessions/{sid}",
-    summary="Close a shell session")
+@router.delete("/api/v1/containers/{name}/shell/sessions/{sid}", summary="Close a shell session")
 def shell_session_close(name: str, sid: str):
     """Terminate the shell process and release the session."""
     with _sessions_lock:
@@ -200,8 +210,7 @@ def shell_session_close(name: str, sid: str):
     return {"message": "Session closed"}
 
 
-@router.get("/api/v1/containers/{name}/shell/sessions",
-    summary="List active shell sessions")
+@router.get("/api/v1/containers/{name}/shell/sessions", summary="List active shell sessions")
 def shell_session_list(name: str):
     """Return all active shell session IDs for a container."""
     with _sessions_lock:

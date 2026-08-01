@@ -3,6 +3,10 @@
 Container controller made simpler than k3s — declarative cluster config,
 dashboard, REST API, and Claude Code shell integration.
 
+The dashboard, `/api/v1` exec/upload/shell routes, `kcs ssh`, and
+`CLAUDE_CODE_SHELL` proxy are **debug-only**. They reject V2 managed workloads;
+formal V2 diagnostics use `/api/v2/jobs/{jobRef}` inspect and role-scoped log APIs.
+
 ## Setup
 
 Requires **Python ≥ 3.12**, **k3s**, and **kubectl**.
@@ -45,7 +49,7 @@ kcs build -t myapp:v1 .           # build image → cluster registry
 kcs ssh web                       # interactive shell
 ```
 
-## Coding agent shell
+## Coding agent shell (debug-only)
 
 Start from the dashboard (container detail → Start). A wrapper script is created at `~/.local/bin/kcs-bash-<container>`. Point Claude Code at it:
 
@@ -54,6 +58,7 @@ CLAUDE_CODE_SHELL=~/.local/bin/kcs-bash-<container> claude
 ```
 
 Every Bash command now runs inside the container, with working directory and env preserved.
+This path is for V1 debugging only and cannot select or modify a formal V2 Attempt Pod.
 
 ## Security
 

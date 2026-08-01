@@ -79,17 +79,23 @@ def apply_cluster_config(req: ClusterConfig):
         skip = False
         try:
             client = get_service().get_client()
-            hn = _run_ssh(target, "hostname", password=pw, timeout=15)
-            remote_hostname = hn.stdout.strip() if hn.returncode == 0 else w.host
-            existing = client.core_v1.list_node(
-                field_selector=f"metadata.name={remote_hostname}"
+            hn = _run_ssh(
+                target,
+                "hostname",
+                password=pw,
+                identity_file=w.ssh_key,
+                timeout=15,
             )
+            remote_hostname = hn.stdout.strip() if hn.returncode == 0 else w.host
+            existing = client.core_v1.list_node(field_selector=f"metadata.name={remote_hostname}")
             if existing.items:
-                results.append({
-                    "node": target,
-                    "hostname": remote_hostname,
-                    "status": "already_joined",
-                })
+                results.append(
+                    {
+                        "node": target,
+                        "hostname": remote_hostname,
+                        "status": "already_joined",
+                    }
+                )
                 skip = True
         except Exception:
             remote_hostname = w.host
@@ -116,9 +122,16 @@ def apply_cluster_config(req: ClusterConfig):
         stdin_input = (pw + "\n") if need_sudo else None
 
         try:
-            result = _run_ssh(target, install_cmd, password=pw,
-                              need_sudo=need_sudo, stdin_text=stdin_input,
-                              timeout=120, capture=True)
+            result = _run_ssh(
+                target,
+                install_cmd,
+                password=pw,
+                identity_file=w.ssh_key,
+                need_sudo=need_sudo,
+                stdin_text=stdin_input,
+                timeout=120,
+                capture=True,
+            )
         except subprocess.TimeoutExpired:
             results.append({"node": target, "error": "SSH timeout"})
             pw = None
@@ -127,9 +140,7 @@ def apply_cluster_config(req: ClusterConfig):
         pw = None
 
         if result.returncode == 0:
-            results.append(
-                {"node": target, "hostname": remote_hostname, "status": "joined"}
-            )
+            results.append({"node": target, "hostname": remote_hostname, "status": "joined"})
         else:
             results.append({"node": target, "error": f"exit {result.returncode}"})
 

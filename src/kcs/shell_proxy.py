@@ -21,6 +21,12 @@ import threading
 import time
 import uuid
 
+from kcs.legacy_guard import (
+    V2_EXCLUSION_SELECTOR,
+    LegacyTargetForbiddenError,
+    assert_legacy_target_allowed,
+)
+
 log = logging.getLogger("kcs.shell_proxy")
 
 
@@ -35,6 +41,7 @@ class ShellSession:
     def __init__(self, pod_name: str, namespace: str, kubeconfig: str | None):
         import pty
 
+        assert_legacy_target_allowed({"namespace": namespace})
         self.pod_name = pod_name
         self.master_fd, slave_fd = pty.openpty()
         cmd = [
@@ -156,7 +163,11 @@ class ShellSession:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _get_target_pod(container_name: str, kubeconfig: str | None = None) -> str | None:
+def _get_target_pod(
+    container_name: str,
+    kubeconfig: str | None = None,
+    namespace: str | None = None,
+) -> str | None:
     """Find the first running pod for a container using kubectl.
 
     Waits up to 30 s for a pod to appear and enter Running phase.
@@ -164,6 +175,8 @@ def _get_target_pod(container_name: str, kubeconfig: str | None = None) -> str |
     env = {**os.environ}
     if kubeconfig:
         env["KUBECONFIG"] = kubeconfig
+    namespace = namespace or _get_namespace(kubeconfig)
+    assert_legacy_target_allowed({"namespace": namespace})
     deadline = time.time() + 30
     while time.time() < deadline:
         try:
@@ -172,10 +185,12 @@ def _get_target_pod(container_name: str, kubeconfig: str | None = None) -> str |
                     "kubectl",
                     "get",
                     "pods",
+                    "-n",
+                    namespace,
                     "-l",
-                    f"app={container_name}",
+                    f"app={container_name},{V2_EXCLUSION_SELECTOR}",
                     "-o",
-                    "jsonpath={.items[0].metadata.name}",
+                    "json",
                     "--field-selector=status.phase=Running",
                 ],
                 capture_output=True,
@@ -183,9 +198,15 @@ def _get_target_pod(container_name: str, kubeconfig: str | None = None) -> str |
                 timeout=10,
                 env=env,
             )
-            name = result.stdout.strip()
-            if name:
-                return name
+            payload = json.loads(result.stdout or "{}")
+            for pod in payload.get("items", []):
+                metadata = pod.get("metadata", {})
+                assert_legacy_target_allowed(metadata)
+                name = metadata.get("name")
+                if isinstance(name, str) and name:
+                    return name
+        except LegacyTargetForbiddenError:
+            raise
         except Exception:
             pass
         time.sleep(1)
@@ -223,7 +244,8 @@ case "$(basename "$0")" in
 bash|kcs-bash-*)
     ;;
 *)
-    echo "kcs-bash-__CONTAINER__: this script must be invoked as 'bash' or via a path containing 'bash'" >&2
+    echo "kcs-bash-__CONTAINER__: this script must be invoked as 'bash'" \
+      "or via a path containing 'bash'" >&2
     exit 1
     ;;
 esac
@@ -323,9 +345,7 @@ def _ensure_wrapper(container: str, sock_path: str, session: str = "") -> str:
     """Create (or refresh) the self-contained bash wrapper.  Returns its path."""
     bash_path = _wrapper_path(container, session)
     label = f"{container}/{session}" if session else container
-    content = _WRAPPER_TEMPLATE.replace("__CONTAINER__", label).replace(
-        "__SOCK__", sock_path
-    )
+    content = _WRAPPER_TEMPLATE.replace("__CONTAINER__", label).replace("__SOCK__", sock_path)
     try:
         with open(bash_path) as f:
             if f.read() == content:
@@ -343,12 +363,18 @@ def _ensure_wrapper(container: str, sock_path: str, session: str = "") -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _try_register_with_api(container: str, sock_path: str, session: str, api_port: int = 8000) -> None:
+def _try_register_with_api(
+    container: str,
+    sock_path: str,
+    session: str,
+    api_port: int = 8000,
+) -> None:
     """Notify the local kcs API server about this proxy (best-effort)."""
     api_port = int(os.environ.get("KCS_PORT", str(api_port)))
     api_base = os.environ.get("KCS_API", f"http://localhost:{api_port}/api/v1")
     try:
         import requests
+
         requests.post(
             f"{api_base}/shell-proxy/start",
             json={"container": container, "session": session},
@@ -364,6 +390,7 @@ def _try_unregister_with_api(container: str, session: str, api_port: int = 8000)
     api_base = os.environ.get("KCS_API", f"http://localhost:{api_port}/api/v1")
     try:
         import requests
+
         requests.post(
             f"{api_base}/shell-proxy/stop?container={container}&session={session}",
             timeout=2,
@@ -388,12 +415,13 @@ def run_server(
     if not os.path.exists(kubeconfig):
         kubeconfig = "/etc/rancher/k3s/k3s.yaml"
 
-    pod = _get_target_pod(container, kubeconfig)
+    namespace = _get_namespace(kubeconfig)
+    assert_legacy_target_allowed({"namespace": namespace})
+    pod = _get_target_pod(container, kubeconfig, namespace)
     if not pod:
         print(f"Error: no running pod for container '{container}'", file=sys.stderr)
         sys.exit(1)
 
-    namespace = _get_namespace(kubeconfig)
     print(f"Opening shell to {container}/{pod} (ns={namespace})...", file=sys.stderr)
 
     sock_path = _socket_path(container, session)
@@ -415,14 +443,14 @@ def run_server(
 
     print(f"Shell proxy listening on {sock_path}", file=sys.stderr)
     print(f"Wrapper: {wrapper}", file=sys.stderr)
-    print(f"", file=sys.stderr)
+    print("", file=sys.stderr)
     print(f"  CLAUDE_CODE_SHELL={wrapper} claude", file=sys.stderr)
 
     # Register with the local API server so the dashboard can discover this proxy
     _try_register_with_api(container, sock_path, session, api_port)
 
     if verbose:
-        print(f"  [verbose] logging every command to stderr", file=sys.stderr)
+        print("  [verbose] logging every command to stderr", file=sys.stderr)
 
     _cmd_count = 0
 
@@ -443,15 +471,19 @@ def run_server(
                 _cmd_count += 1
                 if verbose:
                     preview = command[:200].replace("\n", "\\n")
-                    print(f"\n[{_cmd_count}] CMD: {preview}"
-                          f"{'...' if len(command) > 200 else ''}",
-                          file=sys.stderr, flush=True)
+                    print(
+                        f"\n[{_cmd_count}] CMD: {preview}{'...' if len(command) > 200 else ''}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 result = session_obj.exec(command, timeout=120)
                 if verbose:
                     out_preview = result.get("stdout", "")[:120]
-                    print(f"[{_cmd_count}] EXIT={result['exit_code']}"
-                          f" OUT={out_preview!r}",
-                          file=sys.stderr, flush=True)
+                    print(
+                        f"[{_cmd_count}] EXIT={result['exit_code']} OUT={out_preview!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 resp = json.dumps(result) + "\n"
                 conn.sendall(resp.encode("utf-8"))
         except Exception as e:
@@ -500,11 +532,12 @@ def start(
     if not os.path.exists(kubeconfig):
         kubeconfig = "/etc/rancher/k3s/k3s.yaml"
 
-    pod = _get_target_pod(container, kubeconfig)
+    namespace = _get_namespace(kubeconfig)
+    assert_legacy_target_allowed({"namespace": namespace})
+    pod = _get_target_pod(container, kubeconfig, namespace)
     if not pod:
         raise RuntimeError(f"No running pod for container '{container}'")
 
-    namespace = _get_namespace(kubeconfig)
     sock_path = _socket_path(container, session)
     wrapper = _ensure_wrapper(container, sock_path, session)
 
@@ -516,7 +549,7 @@ def start(
     try:
         server.bind(sock_path)
     except OSError:
-        raise RuntimeError(f"Cannot bind to {sock_path}")
+        raise RuntimeError(f"Cannot bind to {sock_path}") from None
     os.chmod(sock_path, 0o600)
     server.listen(5)
     shell_sess = ShellSession(pod, namespace, kubeconfig)

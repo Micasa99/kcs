@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -105,6 +106,7 @@ def _run_ssh(
     remote_cmd: str,
     *,
     password: str | None = None,
+    identity_file: str | None = None,
     need_sudo: bool = False,
     capture: bool = True,
     stdin_text: str | None = None,
@@ -115,6 +117,21 @@ def _run_ssh(
     Password is passed through a pipe fd (sshpass -d) — never in environ.
     The pipe is closed before this function returns.
     """
+    identity_path: Path | None = None
+    if identity_file is not None:
+        identity_path = Path(identity_file).expanduser().absolute()
+        try:
+            identity_stat = identity_path.lstat()
+        except OSError:
+            raise ValueError("SSH identity file is not a secure regular file") from None
+        permissions = stat.S_IMODE(identity_stat.st_mode)
+        if (
+            not stat.S_ISREG(identity_stat.st_mode)
+            or identity_stat.st_uid != os.getuid()
+            or permissions & ~0o600
+        ):
+            raise ValueError("SSH identity file is not a secure regular file")
+
     sshpass_bin = shutil.which("sshpass")
     use_sshpass = sshpass_bin is not None and password is not None
 
@@ -144,6 +161,9 @@ def _run_ssh(
         if need_sudo:
             cmd.append("-t")
 
+    if identity_path is not None:
+        cmd.extend(["-i", str(identity_path), "-o", "IdentitiesOnly=yes"])
+
     cmd.extend([target, remote_cmd])
 
     kwargs: dict = dict(text=True, timeout=timeout)
@@ -155,7 +175,15 @@ def _run_ssh(
         kwargs["pass_fds"] = [r_fd]
 
     try:
-        return subprocess.run(cmd, **kwargs)
+        try:
+            return subprocess.run(cmd, **kwargs)
+        except subprocess.TimeoutExpired as error:
+            raise subprocess.TimeoutExpired(
+                cmd=["ssh"],
+                timeout=error.timeout,
+                output=error.output,
+                stderr=error.stderr,
+            ) from None
     finally:
         if r_fd is not None:
             try:
@@ -536,8 +564,6 @@ spec:
         if not k3s_token:
             log.warning("Cannot read k3s token")
             results.append("WARNING: Cannot read k3s token, worker join will fail")
-        else:
-            log.info("K3S_TOKEN: %s...", k3s_token[:8])
 
         if not server_ip or not k3s_token:
             return results
@@ -567,7 +593,13 @@ spec:
 
             log.info("Checking %s ...", target)
             try:
-                hn = _run_ssh(target, "hostname", password=pw, timeout=15)
+                hn = _run_ssh(
+                    target,
+                    "hostname",
+                    password=pw,
+                    identity_file=w.ssh_key,
+                    timeout=15,
+                )
                 remote_hostname = hn.stdout.strip() if hn.returncode == 0 else w.host
                 log.info("Remote hostname: %s", remote_hostname)
             except Exception as e:
@@ -594,6 +626,7 @@ spec:
                         target,
                         sync_cmd,
                         password=pw,
+                        identity_file=w.ssh_key,
                         need_sudo=need_sudo,
                         stdin_text=sudo_pw,
                         timeout=30,
@@ -607,7 +640,13 @@ spec:
                     restart_cmd = f"sudo -S -p '' sh -c '{restart_cmd}'"
                 ri = (pw + "\n") if need_sudo else None
                 _run_ssh(
-                    target, restart_cmd, password=pw, need_sudo=need_sudo, stdin_text=ri, timeout=30
+                    target,
+                    restart_cmd,
+                    password=pw,
+                    identity_file=w.ssh_key,
+                    need_sudo=need_sudo,
+                    stdin_text=ri,
+                    timeout=30,
                 )
                 log.info("  k3s-agent restarted")
 
@@ -641,6 +680,7 @@ spec:
                     target,
                     install_cmd,
                     password=pw,
+                    identity_file=w.ssh_key,
                     need_sudo=need_sudo,
                     stdin_text=stdin_input,
                     timeout=120,
@@ -875,6 +915,7 @@ spec:
                     target,
                     install_cmd,
                     password=pw,
+                    identity_file=w.ssh_key,
                     need_sudo=need_sudo,
                     stdin_text=sudo_pw,
                     timeout=60,

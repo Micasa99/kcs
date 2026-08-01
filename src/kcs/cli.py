@@ -10,6 +10,7 @@ import requests
 from rich.console import Console
 
 from kcs import __version__
+from kcs.legacy_guard import LegacyTargetForbiddenError, assert_legacy_target_allowed
 
 console = Console()
 
@@ -28,6 +29,7 @@ def _get_api_key() -> str | None:
         if os.path.exists(path):
             try:
                 import tomllib
+
                 with open(path, "rb") as f:
                     raw = tomllib.load(f)
                 return raw.get("api_key")
@@ -46,8 +48,7 @@ def _api(path: str, method: str = "GET", json_data=None, params=None, stream=Fal
         headers["Authorization"] = f"Bearer {api_key}"
     try:
         r = requests.request(
-            method, url, json=json_data, params=params, headers=headers,
-            stream=stream, timeout=120
+            method, url, json=json_data, params=params, headers=headers, stream=stream, timeout=120
         )
     except requests.ConnectionError:
         raise click.ClickException(
@@ -69,9 +70,7 @@ def _api(path: str, method: str = "GET", json_data=None, params=None, stream=Fal
 
 @click.group()
 @click.version_option(version=__version__, prog_name="kcs")
-@click.option(
-    "-P", "--port", envvar="KCS_PORT", default=8000, type=int, help="Server port"
-)
+@click.option("-P", "--port", envvar="KCS_PORT", default=8000, type=int, help="Server port")
 @click.pass_context
 def main(ctx: click.Context, port: int) -> None:
     """kcs — container controller made simpler than k3s."""
@@ -98,8 +97,15 @@ def main(ctx: click.Context, port: int) -> None:
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG-level logging")
 @click.option("--no-nfs", is_flag=True, help="Skip NFS setup even when --config is provided")
 @click.option("--api-key", envvar="KCS_API_KEY", default=None, help="API authentication key")
-def serve(host: str, port: int, config: str | None, log_file: str | None,
-          verbose: bool, no_nfs: bool, api_key: str | None) -> None:
+def serve(
+    host: str,
+    port: int,
+    config: str | None,
+    log_file: str | None,
+    verbose: bool,
+    no_nfs: bool,
+    api_key: str | None,
+) -> None:
     """Start API server + Dashboard."""
     from kcs.server.main import main as server_main
 
@@ -148,7 +154,7 @@ def build(path: str, tag: str, no_push: bool) -> None:
 @click.argument("name")
 @click.option("--pod", default=None, type=int, help="Pod ordinal")
 def ssh(name: str, pod: int | None) -> None:
-    """Open a shell inside a container.  kcs ssh web"""
+    """Open a debug-only shell inside a V1 container.  kcs ssh web"""
     pods_data = _api(f"/containers/{name}/pods")
     pods = pods_data.get("pods", [])
     if not pods:
@@ -158,6 +164,13 @@ def ssh(name: str, pod: int | None) -> None:
     if idx >= len(pods):
         raise click.ClickException(f"Pod {idx} out of range (0-{len(pods) - 1})")
 
+    target = pods[idx]
+    try:
+        assert_legacy_target_allowed(target)
+    except LegacyTargetForbiddenError as error:
+        raise click.ClickException(str(error)) from None
+    namespace = target.get("namespace", "default")
+
     kubeconfig = os.environ.get("KUBECONFIG") or os.path.expanduser("~/.kcs/k3s.yaml")
     if not os.path.exists(kubeconfig):
         kubeconfig = "/etc/rancher/k3s/k3s.yaml"
@@ -165,7 +178,18 @@ def ssh(name: str, pod: int | None) -> None:
     env = os.environ.copy()
     env["KUBECONFIG"] = kubeconfig
     os.execvpe(
-        "kubectl", ["kubectl", "exec", "-it", pods[idx]["name"], "--", "/bin/sh"], env
+        "kubectl",
+        [
+            "kubectl",
+            "exec",
+            "-it",
+            target["name"],
+            "-n",
+            namespace,
+            "--",
+            "/bin/sh",
+        ],
+        env,
     )
 
 

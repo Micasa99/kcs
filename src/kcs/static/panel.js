@@ -131,7 +131,8 @@ window.showContainer = async function (name) {
       ${hw}${ports}${vols}${envs}
       ${!hasHW && !c.volumes?.length && !Object.keys(c.env || {}).length && !c.ports?.length ? '<div class="empty">no hardware, volumes, ports, or env vars</div>' : ''}
       ${!c.ports?.length && (hasHW || c.volumes?.length || Object.keys(c.env || {}).length) ? '<div class="empty" style="padding:4px 0;font-size:10px">no exposed ports</div>' : ''}
-      <h4>shell proxy</h4>
+      <h4>shell proxy · debug-only</h4>
+      <div class="muted" style="margin-bottom:8px">V2 formal diagnostics use inspect/log.</div>
       ${(() => {
         const mine = window._proxies.filter(p => p.container === c.name);
         let h = '';

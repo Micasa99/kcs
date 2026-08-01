@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, field_validator
-
+from pydantic import BaseModel, Field, field_validator
 
 # RFC 1123: lowercase alphanumeric + '-' + '.', start/end alphanumeric, max 253 chars
 _CONTAINER_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
@@ -62,15 +61,13 @@ class ClusterJoin(BaseModel):
 class WorkerNode(BaseModel):
     host: str
     user: str = "root"
-    password: str | None = None  # optional — prefer ssh_key
-    ssh_key: str | None = None   # path to SSH private key (e.g. ~/.ssh/id_ed25519)
+    password: str | None = Field(default=None, repr=False)  # optional — prefer ssh_key
+    ssh_key: str | None = Field(default=None, repr=False)  # e.g. ~/.ssh/id_ed25519
 
 
 class ClusterConfig(BaseModel):
     backend: str = "k3s"  # k3s (host) or k3d
     api_key: str | None = None  # shared secret for API auth (env: KCS_API_KEY)
     sudo_password: str | None = None  # local sudo password (for reading token, etc.)
-    nfs_path: str = (
-        "/srv/nfs/k3s"  # NFS export path, use data disk if system disk is small
-    )
+    nfs_path: str = "/srv/nfs/k3s"  # NFS export path, use data disk if system disk is small
     workers: list[WorkerNode] = []

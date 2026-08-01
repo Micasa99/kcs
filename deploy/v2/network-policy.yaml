@@ -1,0 +1,12 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kcs-v2-workload-deny-ingress
+  namespace: researchcosmos-v2
+spec:
+  podSelector:
+    matchLabels:
+      researchcosmos.io/managed-by: v2-attempt-runtime
+  policyTypes:
+    - Ingress
+  ingress: []

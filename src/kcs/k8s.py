@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional
 
 from kubernetes import client, config
 from kubernetes.client import ApiException
+
+from kcs.legacy_guard import (
+    V2_EXCLUSION_SELECTOR,
+    LegacyTargetForbiddenError,
+    assert_legacy_target_allowed,
+)
 
 """Status constants."""
 STATUS_RUNNING = "running"
@@ -106,10 +111,10 @@ class KCSClient:
     def __init__(
         self,
         namespace: str = "default",
-        kubeconfig: Optional[str] = None,
-        context: Optional[str] = None,
+        kubeconfig: str | None = None,
+        context: str | None = None,
     ):
-        self.namespace = "default"
+        self.namespace = namespace
 
         # Load kubeconfig (in-cluster and out-of-cluster)
         try:
@@ -141,7 +146,8 @@ class KCSClient:
                         "  k3d cluster create kcs-dev    # create with k3d (recommended)\n"
                         "  curl -sfL https://get.k3s.io | sh -  # or install k3s directly\n\n"
                         "Install k3d:\n"
-                        "  curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash"
+                        "  curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/"
+                        "install.sh | bash"
                     ) from None
 
         self.apps_v1 = client.AppsV1Api()
@@ -168,13 +174,13 @@ class KCSClient:
         self,
         name: str,
         image: str,
-        ports: Optional[list[int]] = None,
-        env: Optional[dict[str, str]] = None,
-        volumes: Optional[list[dict[str, str]]] = None,
+        ports: list[int] | None = None,
+        env: dict[str, str] | None = None,
+        volumes: list[dict[str, str]] | None = None,
         replicas: int = 1,
-        command: Optional[list[str]] = None,
-        args: Optional[list[str]] = None,
-        node: Optional[str] = None,
+        command: list[str] | None = None,
+        args: list[str] | None = None,
+        node: str | None = None,
         gpus: int | None = None,
         cpu: str | None = None,
         memory: str | None = None,
@@ -186,6 +192,7 @@ class KCSClient:
         node pins the Pod to a specific node name.
         gpus/cpu/memory set requests=limits for exclusive allocation.
         """
+        self._assert_legacy_namespace()
         res_name = self.deployment_name(name)
         labels = self.labels(name)
 
@@ -193,7 +200,8 @@ class KCSClient:
         has_pvc = any("path" in v for v in (volumes or []))
 
         # Build container definition
-        # kcs-built images are imported locally under k3s — no pull needed; public images still need IfNotPresent
+        # kcs-built images are imported locally under k3s — no pull needed;
+        # public images still need IfNotPresent.
         from kcs.config import get_registry as _reg
         from kcs.config import is_built_image as _is_built
 
@@ -237,9 +245,7 @@ class KCSClient:
                     if has_pvc:
                         # StatefulSet: volumeClaimTemplate
                         volume_mounts.append(
-                            client.V1VolumeMount(
-                                name=f"data-{i}", mount_path=container_path
-                            )
+                            client.V1VolumeMount(name=f"data-{i}", mount_path=container_path)
                         )
                         pvc_templates.append(
                             client.V1PersistentVolumeClaim(
@@ -265,9 +271,7 @@ class KCSClient:
                             )
                         )
                         volume_mounts.append(
-                            client.V1VolumeMount(
-                                name=vol_name, mount_path=container_path
-                            )
+                            client.V1VolumeMount(name=vol_name, mount_path=container_path)
                         )
 
         container.volume_mounts = volume_mounts
@@ -294,9 +298,7 @@ class KCSClient:
                     volume_claim_templates=pvc_templates if pvc_templates else None,
                 ),
             )
-            self.apps_v1.create_namespaced_stateful_set(
-                namespace=self.namespace, body=statefulset
-            )
+            self.apps_v1.create_namespaced_stateful_set(namespace=self.namespace, body=statefulset)
         else:
             # Deployment
             deployment = client.V1Deployment(
@@ -309,31 +311,21 @@ class KCSClient:
                     template=pod_template,
                 ),
             )
-            self.apps_v1.create_namespaced_deployment(
-                namespace=self.namespace, body=deployment
-            )
+            self.apps_v1.create_namespaced_deployment(namespace=self.namespace, body=deployment)
 
         # Create Service (expose ports)
         if ports:
             svc_ports = [
-                client.V1ServicePort(
-                    name=f"port-{p}", port=p, target_port=p, protocol="TCP"
-                )
+                client.V1ServicePort(name=f"port-{p}", port=p, target_port=p, protocol="TCP")
                 for p in ports
             ]
             service = client.V1Service(
                 api_version="v1",
                 kind="Service",
-                metadata=client.V1ObjectMeta(
-                    name=self.service_name(name), labels=labels
-                ),
-                spec=client.V1ServiceSpec(
-                    selector=labels, ports=svc_ports, type="LoadBalancer"
-                ),
+                metadata=client.V1ObjectMeta(name=self.service_name(name), labels=labels),
+                spec=client.V1ServiceSpec(selector=labels, ports=svc_ports, type="LoadBalancer"),
             )
-            self.core_v1.create_namespaced_service(
-                namespace=self.namespace, body=service
-            )
+            self.core_v1.create_namespaced_service(namespace=self.namespace, body=service)
 
         return {
             "name": name,
@@ -345,7 +337,9 @@ class KCSClient:
 
     def list(self, all_namespaces: bool = False) -> list[dict]:
         """List all kcs-managed containers (Deployments + StatefulSets)."""
-        label_selector = f"{LABEL_MANAGED_BY}={MANAGED_BY}"
+        if not all_namespaces:
+            self._assert_legacy_namespace()
+        label_selector = f"{LABEL_MANAGED_BY}={MANAGED_BY},{V2_EXCLUSION_SELECTOR}"
         items = []
 
         # Collect Deployments
@@ -378,6 +372,12 @@ class KCSClient:
 
         result = []
         for d in items:
+            try:
+                assert_legacy_target_allowed(d.metadata)
+            except LegacyTargetForbiddenError:
+                if all_namespaces:
+                    continue
+                raise
             name = d.metadata.labels.get(LABEL_APP, d.metadata.name)
             container_spec = d.spec.template.spec.containers[0]
             image = container_spec.image
@@ -404,10 +404,7 @@ class KCSClient:
                 svc = self.core_v1.read_namespaced_service(
                     name=self.service_name(name), namespace=d.metadata.namespace
                 )
-                ports = [
-                    f"{p.port}:{p.target_port}/{p.protocol}"
-                    for p in (svc.spec.ports or [])
-                ]
+                ports = [f"{p.port}:{p.target_port}/{p.protocol}" for p in (svc.spec.ports or [])]
             except ApiException:
                 ports = []
 
@@ -442,6 +439,7 @@ class KCSClient:
 
     def get(self, name: str) -> dict | None:
         """Get detailed container info (like docker inspect)."""
+        self._assert_legacy_namespace()
         depl_name = self.deployment_name(name)
 
         d = None
@@ -449,9 +447,7 @@ class KCSClient:
 
         # Try Deployment first, then StatefulSet
         try:
-            d = self.apps_v1.read_namespaced_deployment(
-                name=depl_name, namespace=self.namespace
-            )
+            d = self.apps_v1.read_namespaced_deployment(name=depl_name, namespace=self.namespace)
         except ApiException as e:
             if e.status != 404:
                 raise
@@ -467,6 +463,7 @@ class KCSClient:
                     return None
                 raise
 
+        assert_legacy_target_allowed(d.metadata)
         container = d.spec.template.spec.containers[0]
         ready = d.status.ready_replicas or 0
 
@@ -497,6 +494,8 @@ class KCSClient:
                 pods = self.list_pods(name)
                 if pods:
                     pod_node_ip = pods[0].get("node", "")
+            except LegacyTargetForbiddenError:
+                raise
             except Exception:
                 pass
             ports = [
@@ -559,27 +558,32 @@ class KCSClient:
 
     def _scale(self, name: str, replicas: int) -> bool:
         """Set replica count (Deployment or StatefulSet)."""
+        self._assert_controller_allowed(name)
         res_name = self.deployment_name(name)
-        body = {"spec": {"replicas": replicas}}
-        # Try Deployment first
-        try:
-            self.apps_v1.patch_namespaced_deployment_scale(
-                name=res_name, namespace=self.namespace, body=body
-            )
-            return True
-        except ApiException as e:
-            if e.status != 404:
-                raise
-        # Then try StatefulSet
-        try:
-            self.apps_v1.patch_namespaced_stateful_set_scale(
-                name=res_name, namespace=self.namespace, body=body
-            )
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return False
-            raise
+        for read, patch in (
+            (
+                self.apps_v1.read_namespaced_deployment,
+                self.apps_v1.patch_namespaced_deployment_scale,
+            ),
+            (
+                self.apps_v1.read_namespaced_stateful_set,
+                self.apps_v1.patch_namespaced_stateful_set_scale,
+            ),
+        ):
+            resource = self._read_allowed_resource(read, res_name)
+            if resource is None:
+                continue
+            body = {
+                "metadata": {"resourceVersion": resource.metadata.resource_version},
+                "spec": {"replicas": replicas},
+            }
+            try:
+                patch(name=res_name, namespace=self.namespace, body=body)
+                return True
+            except ApiException as error:
+                if error.status != 404:
+                    raise
+        return False
 
     def scale(self, name: str, replicas: int) -> bool:
         """Scale up or down."""
@@ -587,42 +591,59 @@ class KCSClient:
 
     def remove(self, name: str, force: bool = False) -> bool:
         """Remove a container (Deployment/StatefulSet + Service)."""
+        self._assert_remove_allowed(name)
         res_name = self.deployment_name(name)
         svc_name = self.service_name(name)
         deleted = False
 
-        # Delete Deployment or StatefulSet
-        for delete_fn in [
-            lambda: self.apps_v1.delete_namespaced_deployment(
-                name=res_name, namespace=self.namespace
+        resources = (
+            (
+                self.apps_v1.read_namespaced_deployment,
+                self.apps_v1.delete_namespaced_deployment,
+                res_name,
             ),
-            lambda: self.apps_v1.delete_namespaced_stateful_set(
-                name=res_name, namespace=self.namespace
+            (
+                self.apps_v1.read_namespaced_stateful_set,
+                self.apps_v1.delete_namespaced_stateful_set,
+                res_name,
             ),
-        ]:
+            (
+                self.core_v1.read_namespaced_service,
+                self.core_v1.delete_namespaced_service,
+                svc_name,
+            ),
+            (
+                self.core_v1.read_namespaced_service,
+                self.core_v1.delete_namespaced_service,
+                f"{res_name}-headless",
+            ),
+        )
+        for read, delete, resource_name in resources:
+            resource = self._read_allowed_resource(read, resource_name)
+            if resource is None:
+                continue
+            uid = resource.metadata.uid
             try:
-                delete_fn()
-                deleted = True
-            except ApiException as e:
-                if e.status != 404:
-                    raise
-
-        # Delete Service
-        for svc in [svc_name, f"{res_name}-headless"]:
-            try:
-                self.core_v1.delete_namespaced_service(
-                    name=svc, namespace=self.namespace
+                delete(
+                    name=resource_name,
+                    namespace=self.namespace,
+                    body={
+                        "apiVersion": "v1",
+                        "kind": "DeleteOptions",
+                        "preconditions": {
+                            "uid": uid,
+                            "resourceVersion": resource.metadata.resource_version,
+                        },
+                    },
                 )
                 deleted = True
-            except ApiException as e:
-                if e.status != 404:
+            except ApiException as error:
+                if error.status != 404:
                     raise
 
         return deleted
 
-    def logs(
-        self, name: str, follow: bool = False, tail: int = 100, pod: int | None = None
-    ) -> str:
+    def logs(self, name: str, follow: bool = False, tail: int = 100, pod: int | None = None) -> str:
         """Get container logs. pod specifies the StatefulSet ordinal."""
         pod_name = self._get_target_pod(name, pod)
         if not pod_name:
@@ -655,9 +676,8 @@ class KCSClient:
         pod_name = self._get_target_pod(name, pod)
         if not pod_name:
             return f"Error: no Pod found for container '{name}'"
-        pod_obj = self.core_v1.read_namespaced_pod(
-            name=pod_name, namespace=self.namespace
-        )
+        pod_obj = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+        assert_legacy_target_allowed(pod_obj.metadata)
         container_name = pod_obj.spec.containers[0].name
 
         # Use kubectl
@@ -678,14 +698,15 @@ class KCSClient:
                 result = _sp.run(cmd, env=env, timeout=None)
                 return ""
             else:
-                result = _sp.run(
-                    cmd, capture_output=True, text=True, timeout=30, env=env
-                )
+                result = _sp.run(cmd, capture_output=True, text=True, timeout=30, env=env)
                 return (result.stdout + result.stderr).strip() or "(empty)"
         except _sp.TimeoutExpired:
             return "Error: command timed out"
         except FileNotFoundError:
-            return "Error: kubectl required (bundled with k3s: ln -s /usr/local/bin/k3s /usr/local/bin/kubectl)"
+            return (
+                "Error: kubectl required (bundled with k3s: "
+                "ln -s /usr/local/bin/k3s /usr/local/bin/kubectl)"
+            )
 
     def resolve_volume_path(self, name: str, mount_path: str) -> str | None:
         """Return the host (NFS) path backing a container's volume mount, or None."""
@@ -752,9 +773,7 @@ class KCSClient:
                         ports=[client.V1ServicePort(port=80, target_port=80)],
                     ),
                 )
-                self.core_v1.create_namespaced_service(
-                    namespace=self.namespace, body=svc
-                )
+                self.core_v1.create_namespaced_service(namespace=self.namespace, body=svc)
 
     def _ensure_pvc(self, name: str, size: str = "1Gi") -> None:
         """Auto-create a PVC if it does not exist."""
@@ -768,9 +787,7 @@ class KCSClient:
                     metadata=client.V1ObjectMeta(name=name),
                     spec=client.V1PersistentVolumeClaimSpec(
                         access_modes=["ReadWriteOnce"],
-                        resources=client.V1VolumeResourceRequirements(
-                            requests={"storage": size}
-                        ),
+                        resources=client.V1VolumeResourceRequirements(requests={"storage": size}),
                     ),
                 )
                 self.core_v1.create_namespaced_persistent_volume_claim(
@@ -778,13 +795,15 @@ class KCSClient:
                 )
 
     def _get_target_pod(self, name: str, pod: int | None = None) -> str | None:
-        """Get the target Pod name. Returns the StatefulSet pod for the given ordinal, or the first pod."""
+        """Return a requested StatefulSet Pod or the first allowed matching Pod."""
+        self._assert_legacy_namespace()
         if pod is not None:
             target_name = f"{self.deployment_name(name)}-{pod}"
             try:
-                self.core_v1.read_namespaced_pod(
+                target = self.core_v1.read_namespaced_pod(
                     name=target_name, namespace=self.namespace
                 )
+                assert_legacy_target_allowed(target.metadata)
                 return target_name
             except ApiException:
                 return None
@@ -793,11 +812,14 @@ class KCSClient:
 
     def _get_pods(self, name: str):
         """Get the list of Pods belonging to a container."""
+        self._assert_legacy_namespace()
         labels = self.labels(name)
-        label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
+        label_selector = ",".join([*(f"{k}={v}" for k, v in labels.items()), V2_EXCLUSION_SELECTOR])
         pods = self.core_v1.list_namespaced_pod(
             namespace=self.namespace, label_selector=label_selector
         )
+        for pod in pods.items:
+            assert_legacy_target_allowed(pod.metadata)
         return pods.items
 
     def list_pods(self, name: str) -> list[dict]:
@@ -842,13 +864,13 @@ class KCSClient:
             result.append(
                 {
                     "name": p.metadata.name,
+                    "namespace": p.metadata.namespace or self.namespace,
+                    "labels": dict(p.metadata.labels or {}),
                     "status": status,
                     "node": node_ips.get(p.spec.node_name, p.spec.node_name or "-"),
                     "ip": p.status.pod_ip or "-",
                     "age": age,
-                    "restarts": sum(
-                        c.restart_count for c in (p.status.container_statuses or [])
-                    ),
+                    "restarts": sum(c.restart_count for c in (p.status.container_statuses or [])),
                 }
             )
         return result
@@ -906,9 +928,7 @@ class KCSClient:
                 {
                     "name": n.metadata.name,
                     "roles": roles,
-                    "status": (
-                        "Ready" if conditions.get("Ready") == "True" else "NotReady"
-                    ),
+                    "status": ("Ready" if conditions.get("Ready") == "True" else "NotReady"),
                     "ip": internal_ip,
                     "capacity": {
                         "cpu": float(_cpu_cores(capacity.get("cpu", "0"))),
@@ -922,29 +942,19 @@ class KCSClient:
                         "gpu": int(allocatable.get("nvidia.com/gpu", 0)),
                         "storage": _mem_bytes(allocatable.get("ephemeral-storage", "0")),
                     },
-                    "used": usage.get(
-                        n.metadata.name, {"cpu": 0, "memory": 0, "gpu": 0}
-                    ),
+                    "used": usage.get(n.metadata.name, {"cpu": 0, "memory": 0, "gpu": 0}),
                     "disk_pressure": conditions.get("DiskPressure") == "True",
                     "memory_pressure": conditions.get("MemoryPressure") == "True",
                     "pid_pressure": conditions.get("PIDPressure") == "True",
                     "taints": (
                         [
-                            (
-                                f"{t.key}={t.value}:{t.effect}"
-                                if t.value
-                                else f"{t.key}:{t.effect}"
-                            )
+                            (f"{t.key}={t.value}:{t.effect}" if t.value else f"{t.key}:{t.effect}")
                             for t in (n.spec.taints or [])
                         ]
                         if n.spec.taints
                         else []
                     ),
-                    "version": (
-                        n.status.node_info.kubelet_version
-                        if n.status.node_info
-                        else "?"
-                    ),
+                    "version": (n.status.node_info.kubelet_version if n.status.node_info else "?"),
                 }
             )
 
@@ -958,12 +968,16 @@ class KCSClient:
         nodes: dict[str, dict] = {}
         try:
             pods = self.core_v1.list_pod_for_all_namespaces(
-                label_selector=f"{LABEL_MANAGED_BY}={MANAGED_BY}"
+                label_selector=f"{LABEL_MANAGED_BY}={MANAGED_BY},{V2_EXCLUSION_SELECTOR}"
             )
         except ApiException:
             return nodes
 
         for p in pods.items:
+            try:
+                assert_legacy_target_allowed(p.metadata)
+            except LegacyTargetForbiddenError:
+                continue
             if p.status.phase != "Running":
                 continue
             # Skip terminating pods (e.g. during 30s grace period after stop)
@@ -983,3 +997,33 @@ class KCSClient:
                 gpu = int(res.requests.get("nvidia.com/gpu", 0))
                 nodes[node]["gpu"] += gpu
         return nodes
+
+    def _assert_legacy_namespace(self) -> None:
+        assert_legacy_target_allowed({"namespace": self.namespace})
+
+    def _assert_controller_allowed(self, name: str) -> None:
+        """Read the V1 controller metadata before any scale/delete mutation."""
+        self._assert_legacy_namespace()
+        resource_name = self.deployment_name(name)
+        for read in (
+            self.apps_v1.read_namespaced_deployment,
+            self.apps_v1.read_namespaced_stateful_set,
+        ):
+            self._read_allowed_resource(read, resource_name)
+
+    def _assert_remove_allowed(self, name: str) -> None:
+        """Preflight every controller and Service that remove() can mutate."""
+        self._assert_controller_allowed(name)
+        for service_name in (self.service_name(name), f"{self.deployment_name(name)}-headless"):
+            self._read_allowed_resource(self.core_v1.read_namespaced_service, service_name)
+
+    def _read_allowed_resource(self, read, name: str):
+        """Read and guard the exact resource immediately before its mutation."""
+        try:
+            resource = read(name=name, namespace=self.namespace)
+        except ApiException as error:
+            if error.status == 404:
+                return None
+            raise
+        assert_legacy_target_allowed(resource.metadata)
+        return resource

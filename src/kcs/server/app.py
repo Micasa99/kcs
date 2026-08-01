@@ -64,6 +64,7 @@ def create_app(
     if has_v2_injection:
         raise ValueError("V2 dependencies cannot be injected into the V1 application")
 
+    from kcs.legacy_guard import LegacyTargetForbiddenError
     from kcs.server.routes import (
         clusters_router,
         containers_router,
@@ -109,6 +110,13 @@ def create_app(
         RateLimitExceeded,
         _rate_limit_exceeded_handler,  # type: ignore[arg-type]
     )
+
+    @app.exception_handler(LegacyTargetForbiddenError)
+    async def legacy_target_forbidden(
+        request: Request, error: LegacyTargetForbiddenError
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(status_code=403, content={"detail": str(error)})
 
     # Static files
     static_dir = Path(__file__).resolve().parent.parent / "static"
