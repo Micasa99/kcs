@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import rfc8785
 import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -87,6 +88,14 @@ def _check_extended_limits(instance: Any, schema: Any, root: dict[str, Any]) -> 
             if len(decoded) > max_decoded:
                 raise ValueError(f"decoded content exceeds {max_decoded} bytes")
     if isinstance(instance, dict):
+        combined_limit = schema.get("x-kcs-combinedUtf8Bytes")
+        combined_properties = schema.get("x-kcs-combinedUtf8Properties", [])
+        if combined_limit is not None:
+            combined_size = sum(
+                len(instance.get(name, "").encode()) for name in combined_properties
+            )
+            if combined_size > combined_limit:
+                raise ValueError(f"combined strings exceed {combined_limit} UTF-8 bytes")
         properties = schema.get("properties", {})
         additional = schema.get("additionalProperties")
         for key, value in instance.items():
@@ -95,6 +104,23 @@ def _check_extended_limits(instance: Any, schema: Any, root: dict[str, Any]) -> 
     if isinstance(instance, list) and isinstance(schema.get("items"), dict):
         for value in instance:
             _check_extended_limits(value, schema["items"], root)
+
+
+def _validate_digest_semantics(schema_name: str, instance: dict[str, Any]) -> None:
+    if schema_name == "CredentialGrantRequest":
+        payload = base64.b64decode(instance["credential"], validate=True)
+        digest_field = "credentialSha256"
+    elif schema_name == "AgentStartRequest":
+        payload = instance["launch"].encode()
+        digest_field = "launchSha256"
+    elif schema_name == "WorkspaceInvokeRequest":
+        payload = rfc8785.dumps(instance["spec"])
+        digest_field = "specDigest"
+    else:
+        return
+    actual = hashlib.sha256(payload).hexdigest()
+    if instance[digest_field] != actual:
+        raise ValueError(f"{digest_field} does not match payload bytes")
 
 
 def _validate_examples(source: Path, document: dict[str, Any]) -> int:
@@ -119,6 +145,7 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
                 }
             ).validate(instance)
             _check_extended_limits(instance, schemas[schema_name], schemas)
+            _validate_digest_semantics(schema_name, instance)
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
             raise ValueError(f"{example_path.name}: {exc}") from exc
         validated += 1
@@ -140,6 +167,8 @@ def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     output_dir.mkdir(parents=True, exist_ok=True)
     schema_dir = output_dir / "schemas"
     schema_dir.mkdir(exist_ok=True)
+    for stale_schema in schema_dir.glob("*.schema.json"):
+        stale_schema.unlink()
 
     openapi_json = output_dir / "kcs-v2-jobs.openapi.json"
     openapi_bytes = _json_bytes(document)

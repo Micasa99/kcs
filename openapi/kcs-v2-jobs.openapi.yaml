@@ -496,11 +496,11 @@ components:
     Cursor:
       name: cursor
       in: query
-      schema: {type: string, maxLength: 1024}
+      schema: {type: string}
     PageToken:
       name: page_token
       in: query
-      schema: {type: string, maxLength: 1024}
+      schema: {type: string}
     PageSize:
       name: page_size
       in: query
@@ -525,15 +525,9 @@ components:
     Timeout: *Error504
   schemas:
     ResourceId:
-      type: string
-      minLength: 1
-      maxLength: 64
-      pattern: '^[a-z0-9][a-z0-9-]*$'
+      $ref: '#/components/schemas/OpaqueRef'
     ActionId:
-      type: string
-      minLength: 1
-      maxLength: 128
-      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
+      $ref: '#/components/schemas/OpaqueRef'
     OpaqueRef:
       type: string
       minLength: 1
@@ -581,7 +575,6 @@ components:
         image:
           type: string
           pattern: '^.+@sha256:[0-9a-f]{64}$'
-          maxLength: 512
         env: {$ref: '#/components/schemas/Environment'}
         resources: {$ref: '#/components/schemas/AgentResources'}
     WorkspaceSpec:
@@ -592,7 +585,6 @@ components:
         image:
           type: string
           pattern: '^.+@sha256:[0-9a-f]{64}$'
-          maxLength: 512
         env: {$ref: '#/components/schemas/Environment'}
         resources: {$ref: '#/components/schemas/WorkspaceResources'}
     JobSpec:
@@ -628,7 +620,7 @@ components:
             - {type: 'null'}
         provisioningMessage:
           oneOf:
-            - {type: string, maxLength: 1024}
+            - {type: string}
             - {type: 'null'}
         outputLossPossible: {type: boolean, default: false}
         tombstoneExpiresAt:
@@ -643,17 +635,20 @@ components:
         items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/Job'}}
         nextPageToken:
           oneOf:
-            - {type: string, maxLength: 1024}
+            - {type: string}
             - {type: 'null'}
     RoleLogs:
       type: object
       additionalProperties: false
+      description: stdout and stderr share the requested limitBytes budget.
+      x-kcs-combinedUtf8Bytes: 1048576
+      x-kcs-combinedUtf8Properties: [stdout, stderr]
       required: [jobRef, container, stdout, stderr, truncated]
       properties:
         jobRef: {$ref: '#/components/schemas/ResourceId'}
         container: {type: string, enum: [agent, workspace]}
-        stdout: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
-        stderr: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
+        stdout: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
+        stderr: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
         truncated: {type: boolean}
     CredentialGrantRequest:
       type: object
@@ -679,7 +674,7 @@ components:
         expiresAt: {$ref: '#/components/schemas/Timestamp'}
         deletionError:
           oneOf:
-            - {type: string, maxLength: 1024}
+            - {type: string}
             - {type: 'null'}
     AgentStartRequest:
       type: object
@@ -701,7 +696,7 @@ components:
       required: [direction, path, sizeBytes, contentSha256]
       properties:
         direction: {type: string, enum: [stage, collect]}
-        path: {type: string, minLength: 1, maxLength: 4096, pattern: '^/workspace(?:/.*)?$'}
+        path: {type: string, minLength: 1, pattern: '^/workspace(?:/.*)?$'}
         sizeBytes: {type: integer, minimum: 0, maximum: 107374182400}
         contentSha256: {$ref: '#/components/schemas/Sha256'}
         mode: {type: string, const: direct}
@@ -727,8 +722,8 @@ components:
       additionalProperties: false
       required: [method, spec, specDigest]
       properties:
-        method: {type: string, minLength: 1, maxLength: 128, pattern: '^[a-z][a-z0-9._-]*$'}
-        spec: {type: object, maxProperties: 64}
+        method: {$ref: '#/components/schemas/OpaqueRef'}
+        spec: {type: object}
         specDigest: {$ref: '#/components/schemas/Sha256'}
     WorkspaceOperation:
       type: object
@@ -740,7 +735,7 @@ components:
         state: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
         stdout: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
         stderr: {type: string, maxLength: 65536, x-kcs-maxUtf8Bytes: 65536}
-        result: {type: object, maxProperties: 64}
+        result: {type: object}
     FinalizeJobRequest:
       type: object
       additionalProperties: false
@@ -764,8 +759,8 @@ components:
       additionalProperties: false
       required: [field, reason]
       properties:
-        field: {type: string, maxLength: 256}
-        reason: {type: string, maxLength: 1024}
+        field: {type: string}
+        reason: {type: string}
     ErrorEnvelope:
       type: object
       additionalProperties: false
@@ -776,11 +771,11 @@ components:
           additionalProperties: false
           required: [code, message, retryable, requestId]
           properties:
-            code: {type: string, minLength: 1, maxLength: 64, pattern: '^[A-Z][A-Z0-9_]*$'}
-            message: {type: string, minLength: 1, maxLength: 1024}
+            code: {type: string, minLength: 1, pattern: '^[A-Z][A-Z0-9_]*$'}
+            message: {type: string, minLength: 1}
             retryable: {type: boolean}
             requestId: {$ref: '#/components/schemas/ResourceId'}
-            details: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/ErrorDetail'}}
+            details: {type: array, items: {$ref: '#/components/schemas/ErrorDetail'}}
     OpenApiDocument:
       type: object
       additionalProperties: true

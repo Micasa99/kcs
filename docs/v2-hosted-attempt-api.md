@@ -102,7 +102,7 @@ Workspace operation states are `accepted`, `running`, `succeeded`, `failed`, and
 | Launch | — | 1 MiB |
 | Credential raw bytes | — | 64 KiB |
 | Supervisor stdout/stderr | — | 64 KiB each |
-| Logs response | 64 KiB | 1 MiB |
+| Logs response (stdout + stderr combined) | 64 KiB | 1 MiB |
 | Direct transfer | — | 100 GiB |
 | Pagination | 50 | 200 |
 | Agent CPU/memory/GPU | 1 CPU / 2 GiB / 0 | 8 CPU / 32 GiB / GPU forbidden |

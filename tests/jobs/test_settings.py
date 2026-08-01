@@ -66,3 +66,34 @@ def test_settings_repr_never_discloses_the_service_token() -> None:
     )
 
     assert "unit-test-placeholder" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "bad..prefix/name=value",
+        f"{'a' * 64}.example/name=value",
+        f"{'a' * 63}.{'b' * 63}.{'c' * 63}.{'d' * 62}/name=value",
+        f"prefix.example/{'n' * 64}=value",
+        f"prefix.example/name={'v' * 64}",
+    ],
+)
+def test_settings_reject_selector_components_outside_kubernetes_bounds(
+    selector: str,
+) -> None:
+    with pytest.raises(ValueError, match="KCS_V2_NODE_SELECTOR"):
+        V2RuntimeSettings.from_env(
+            {"KCS_ENV": "test", "KCS_V2_NODE_SELECTOR": selector}
+        )
+
+
+def test_settings_accept_selector_components_at_kubernetes_bounds() -> None:
+    prefix = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61])
+    name = "n" * 63
+    value = "v" * 63
+
+    settings = V2RuntimeSettings.from_env(
+        {"KCS_ENV": "test", "KCS_V2_NODE_SELECTOR": f"{prefix}/{name}={value}"}
+    )
+
+    assert settings.node_selector == {f"{prefix}/{name}": value}
