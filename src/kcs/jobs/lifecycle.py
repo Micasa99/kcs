@@ -35,6 +35,9 @@ class _CloseIdentity(TypedDict):
     digest: str
     requestSpec: str
     phase: str
+    phaseOrdinal: int
+    executorIdentity: str
+    executionEpoch: int
 
 
 class _LifecyclePayload(TypedDict):
@@ -87,6 +90,8 @@ class LifecycleClose:
     ref: str
     digest: str
     request_spec: str
+    executor_identity: str
+    execution_epoch: int
 
     def phase(self, phase: str, *, closed: bool = False) -> None:
         self.gate.set_close_phase(self, phase, closed=closed)
@@ -199,6 +204,7 @@ class LifecycleGate:
         digest: str,
         request_spec: str,
     ) -> LifecycleClose:
+        executor_identity = uuid4().hex
         identity = {
             "kind": kind,
             "ref": ref,
@@ -212,7 +218,41 @@ class LifecycleGate:
             if isinstance(close, Mapping) and all(
                 close.get(key) == value for key, value in identity.items()
             ):
-                return LifecycleClose(self, job_ref, kind, ref, digest, request_spec)
+                if payload["activeClaims"]:
+                    raise StateConflictError("Lifecycle close cannot retain active claims")
+                execution_epoch = int(close["executionEpoch"])
+                if payload["gate"] == "closed":
+                    return LifecycleClose(
+                        self,
+                        job_ref,
+                        kind,
+                        ref,
+                        digest,
+                        request_spec,
+                        str(close["executorIdentity"]),
+                        execution_epoch,
+                    )
+                desired = {
+                    **payload,
+                    "epoch": int(payload["epoch"]) + 1,
+                    "close": {
+                        **close,
+                        "executorIdentity": executor_identity,
+                        "executionEpoch": execution_epoch + 1,
+                    },
+                }
+                if self._cas(record, desired) is not None:
+                    return LifecycleClose(
+                        self,
+                        job_ref,
+                        kind,
+                        ref,
+                        digest,
+                        request_spec,
+                        executor_identity,
+                        execution_epoch + 1,
+                    )
+                continue
             if payload["activeClaims"]:
                 raise StateConflictError("The Job has an active lifecycle mutation claim")
             gate = payload["gate"]
@@ -229,10 +269,25 @@ class LifecycleGate:
                 **payload,
                 "gate": "closing",
                 "epoch": int(payload["epoch"]) + 1,
-                "close": {**identity, "phase": "accepted"},
+                "close": {
+                    **identity,
+                    "phase": "accepted",
+                    "phaseOrdinal": 0,
+                    "executorIdentity": executor_identity,
+                    "executionEpoch": 1,
+                },
             }
             if self._cas(record, desired) is not None:
-                return LifecycleClose(self, job_ref, kind, ref, digest, request_spec)
+                return LifecycleClose(
+                    self,
+                    job_ref,
+                    kind,
+                    ref,
+                    digest,
+                    request_spec,
+                    executor_identity,
+                    1,
+                )
         raise DependencyUnavailableError("lifecycle close changed concurrently")
 
     def set_close_phase(self, close: LifecycleClose, phase: str, *, closed: bool = False) -> None:
@@ -253,13 +308,32 @@ class LifecycleGate:
                 retained.get(key) != value for key, value in expected.items()
             ):
                 raise StateConflictError("Lifecycle close identity changed")
+            if payload["gate"] == "closed":
+                if closed and retained.get("phase") == phase:
+                    return
+                raise StateConflictError("Lifecycle close is terminal and cannot reopen")
+            if (
+                retained.get("executorIdentity") != close.executor_identity
+                or retained.get("executionEpoch") != close.execution_epoch
+            ):
+                raise StateConflictError("Lifecycle close execution ownership changed")
             if payload["activeClaims"]:
                 raise StateConflictError("Lifecycle cannot close with active mutation claims")
+            retained_ordinal = int(retained["phaseOrdinal"])
+            desired_ordinal = _close_phase_ordinal(close.kind, phase, retained_ordinal)
+            if desired_ordinal < retained_ordinal:
+                raise StateConflictError("Lifecycle close phase cannot regress")
             desired = {
                 **payload,
                 "gate": "closed" if closed else "closing",
                 "epoch": int(payload["epoch"]) + 1,
-                "close": {**expected, "phase": phase},
+                "close": {
+                    **expected,
+                    "phase": phase,
+                    "phaseOrdinal": desired_ordinal,
+                    "executorIdentity": close.executor_identity,
+                    "executionEpoch": close.execution_epoch,
+                },
             }
             if self._cas(record, desired) is not None:
                 return
@@ -340,16 +414,67 @@ def _lifecycle_payload(record: object, job_uid: str, pod_uid: str) -> _Lifecycle
     ):
         raise DependencyUnavailableError("lifecycle active claims are invalid")
     close = payload.get("close")
-    if close is not None and (
-        not isinstance(close, dict)
-        or set(close) != {"kind", "ref", "digest", "requestSpec", "phase"}
-        or not all(
+    if close is not None:
+        if not isinstance(close, dict) or not all(
             isinstance(close.get(key), str) and bool(close[key])
             for key in ("kind", "ref", "digest", "requestSpec", "phase")
-        )
-    ):
-        raise DependencyUnavailableError("lifecycle close identity is invalid")
+        ):
+            raise DependencyUnavailableError("lifecycle close identity is invalid")
+        legacy_fields = {"kind", "ref", "digest", "requestSpec", "phase"}
+        current_fields = legacy_fields | {
+            "phaseOrdinal",
+            "executorIdentity",
+            "executionEpoch",
+        }
+        if set(close) == legacy_fields:
+            close["phaseOrdinal"] = _close_phase_ordinal(str(close["kind"]), str(close["phase"]), 0)
+            close["executorIdentity"] = "legacy-unowned"
+            close["executionEpoch"] = 0
+        elif (
+            set(close) != current_fields
+            or not isinstance(close.get("phaseOrdinal"), int)
+            or int(close["phaseOrdinal"]) < 0
+            or not isinstance(close.get("executorIdentity"), str)
+            or not close["executorIdentity"]
+            or not isinstance(close.get("executionEpoch"), int)
+            or int(close["executionEpoch"]) < 0
+        ):
+            raise DependencyUnavailableError("lifecycle close execution authority is invalid")
     return cast(_LifecyclePayload, payload)
+
+
+def _close_phase_ordinal(kind: str, phase: str, retained_ordinal: int) -> int:
+    phases = {
+        "cancel": {
+            "accepted": 0,
+            "collections_drained": 1,
+            "credentials_revoked": 2,
+            "agent_stopped": 3,
+            "workspace_stopped": 4,
+            "succeeded": 5,
+        },
+        "finalize": {
+            "accepted": 0,
+            "credentials_revoked": 1,
+            "agent_stopped": 2,
+            "workspace_stopped": 3,
+            "succeeded": 4,
+        },
+        "delete": {
+            "accepted": 0,
+            "delete_intent_persisted": 1,
+            "credentials_destroyed": 2,
+            "job_delete_requested": 3,
+            "workload_absent": 4,
+            "cleanup_proven": 5,
+        },
+    }
+    if phase == "indeterminate":
+        return retained_ordinal
+    try:
+        return phases[kind][phase]
+    except KeyError as error:
+        raise DependencyUnavailableError("lifecycle close phase is invalid") from error
 
 
 @dataclass

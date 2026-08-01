@@ -8,7 +8,7 @@ import shutil
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -34,7 +34,6 @@ from kcs.jobs.contracts import (
 )
 from kcs.jobs.errors import (
     CredentialDestroyFailedError,
-    DependencyUnavailableError,
     StateConflictError,
 )
 from kcs.jobs.lifecycle import LifecycleGate
@@ -67,16 +66,18 @@ class _FakeKube:
         self.created_jobs = 0
         self.fail_cancel_phase_once = False
         self.fail_job_delete_once = False
-        self.fail_owner_cleanup_phase_once = False
         self.linger_secret_once = False
         self.pause_secret_create = False
         self.secret_create_claimed = Event()
         self.release_secret_create = Event()
+        self.owner_gc_completed = False
+        self.lifecycle_accesses_after_owner_gc: list[str] = []
 
     def create_config_map(self, body: object) -> object:
         value = deepcopy(body)
         assert isinstance(value, dict)
         name = value["metadata"]["name"]
+        self._record_lifecycle_access("create", name)
         if name in self.maps:
             raise _ConflictError()
         value["metadata"]["resourceVersion"] = "1"
@@ -85,10 +86,12 @@ class _FakeKube:
         return deepcopy(value)
 
     def read_config_map(self, name: str) -> object | None:
+        self._record_lifecycle_access("read", name)
         value = self.maps.get(name)
         return deepcopy(value) if value is not None else None
 
     def replace_config_map(self, name: str, body: object) -> object:
+        self._record_lifecycle_access("replace", name)
         value = deepcopy(body)
         assert isinstance(value, dict)
         if value["metadata"].get("resourceVersion") != self.maps[name]["metadata"].get(
@@ -103,13 +106,6 @@ class _FakeKube:
         ):
             self.fail_cancel_phase_once = False
             raise RuntimeError("simulated crash after agent stop")
-        if (
-            self.fail_owner_cleanup_phase_once
-            and value.get("data", {}).get("state") == "deleting"
-            and value.get("data", {}).get("cleanupPhase") == "owner_records_deleted"
-        ):
-            self.fail_owner_cleanup_phase_once = False
-            raise RuntimeError("simulated crash after owner runtime cleanup")
         value["metadata"]["resourceVersion"] = str(
             int(self.maps[name]["metadata"]["resourceVersion"]) + 1
         )
@@ -124,11 +120,13 @@ class _FakeKube:
                 "activeClaims": len(payload.get("activeClaims", [])),
                 "closePhase": (payload.get("close") or {}).get("phase"),
                 "closeKind": (payload.get("close") or {}).get("kind"),
+                "cleanupPhase": value.get("data", {}).get("cleanupPhase"),
             }
         )
         return deepcopy(value)
 
     def delete_config_map(self, name: str) -> bool:
+        self._record_lifecycle_access("delete", name)
         existed = self.maps.pop(name, None) is not None
         self.events.append({"kind": "ConfigMap", "verb": "delete", "name": name})
         return existed
@@ -191,6 +189,13 @@ class _FakeKube:
             self.job = None
             self.pods = []
             shutil.rmtree(self.workspace, ignore_errors=True)
+            for name, value in list(self.maps.items()):
+                if value.get("data", {}).get("kind") is not None:
+                    self.maps.pop(name)
+                    self.events.append(
+                        {"kind": "ConfigMap", "verb": "owner-gc-delete", "name": name}
+                    )
+            self.owner_gc_completed = True
             raise RuntimeError("simulated response loss after foreground deletion acceptance")
         self.job = None
         self.pods = []
@@ -268,6 +273,10 @@ class _FakeKube:
                 ],
             }
         return result
+
+    def _record_lifecycle_access(self, verb: str, name: str) -> None:
+        if self.owner_gc_completed and "-lifecycle-" in name:
+            self.lifecycle_accesses_after_owner_gc.append(verb)
 
 
 class _Renderer:
@@ -638,6 +647,7 @@ def test_cancel_delete_tombstone_journey(tmp_path: Path) -> None:
         if event.get("closeKind") == "delete" and event.get("closePhase") == "accepted"
     )
     assert claim_event < secret_effect < release_event < cancel_close < delete_close
+    assert delete_close < delete_intent_event < first_workload_delete < first_tombstone_event
 
     assert client.delete("/api/v2/jobs/job-1", headers=delete_headers).json() == tombstone
     assert (
@@ -706,7 +716,7 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     assert reserved_report.reconciled == 1
     assert reserved_kube.created_jobs == 1 and reserved_kube.job is not None
     retained_finalize = FinalizeSpec(operation_refs=[], transfer_refs=[], drain_timeout_seconds=1)
-    LifecycleGate(reserved_store).begin_close(
+    stale_finalize_close = LifecycleGate(reserved_store).begin_close(
         "job-1",
         str(JOB_UID),
         str(POD_UID),
@@ -715,6 +725,17 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
         canonical_digest(retained_finalize),
         retained_finalize.model_dump_json(by_alias=True),
     )
+    replacement_finalize_close = LifecycleGate(reserved_store).begin_close(
+        "job-1",
+        str(JOB_UID),
+        str(POD_UID),
+        "finalize",
+        "finalize-close-gap",
+        canonical_digest(retained_finalize),
+        retained_finalize.model_dump_json(by_alias=True),
+    )
+    with pytest.raises(StateConflictError):
+        stale_finalize_close.phase("credentials_revoked")
     close_gap_report = _provider(
         reserved_kube,
         reserved_store,
@@ -750,13 +771,48 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
         for event in kube.events
     )
 
+    canceled_lifecycle = store.read_runtime("lifecycle", "job-1", "slot")
+    assert canceled_lifecycle is not None
+    retained_close = json.loads(canceled_lifecycle.values["payload"])
+    retained_close["gate"] = "closing"
+    retained_close["close"]["phase"] = "workspace_stopped"
+    if "phaseOrdinal" in retained_close["close"]:
+        retained_close["close"]["phaseOrdinal"] = 4
+    store.update_runtime(
+        "lifecycle",
+        "job-1",
+        "slot",
+        {**canceled_lifecycle.values, "payload": json.dumps(retained_close, sort_keys=True)},
+    )
+    canceled_snapshot = recovered.inspect("job-1")
+    store.mark_deleted(
+        "request-task-7",
+        delete_ref="delete-after-crash",
+        delete_request_digest=EMPTY_OBJECT_DIGEST,
+        final_state="canceled",
+        deleted_at=NOW,
+        expires_at=NOW + timedelta(days=7),
+        cleanup_state="pending",
+        cleanup_phase="tombstone_persisted",
+        gpu_release_state="complete",
+        credential_observations=[
+            item.model_dump(mode="json", by_alias=True)
+            for item in canceled_snapshot.credential_observations
+        ],
+        transfer_observations=[
+            item.model_dump(mode="json", by_alias=True)
+            for item in canceled_snapshot.transfer_observations
+        ],
+    )
     kube.fail_job_delete_once = True
-    with pytest.raises(DependencyUnavailableError):
-        recovered.delete("job-1", "delete-after-crash", EMPTY_OBJECT_DIGEST)
+    deletion_gap = _provider(kube, store, agent, workspace)
+    interrupted_delete = deletion_gap.reconcile_all()
+    assert interrupted_delete.indeterminate == 1
     pending = store.read_create("request-task-7")
     assert pending is not None and pending.is_deleting and pending.cleanup_state == "pending"
+    assert pending.cleanup_phase == "job_delete_requested"
     assert pending.deleted_at is None and pending.expires_at is None
-    replayed_create = recovered.create(_create_request())
+    replayed_create = deletion_gap.create(_create_request())
     assert replayed_create.created is False
     assert replayed_create.snapshot.binding_state == "deleting"
     retained_delete = store.read_create("request-task-7")
@@ -770,23 +826,62 @@ def test_startup_reconcile_recovers_cancel_and_delete_crash_points(tmp_path: Pat
     for mutate in live_mutations:
         with pytest.raises(StateConflictError):
             mutate()
-    deleting = recovered.inspect("job-1")
+    deleting = deletion_gap.inspect("job-1")
     assert deleting.binding_state == "deleting"
     assert deleting.delete_action.action_ref == "delete-after-crash"
-    kube.fail_owner_cleanup_phase_once = True
-    deletion_gap = _provider(kube, store, agent, workspace)
-    interrupted_delete = deletion_gap.reconcile_all()
-    assert interrupted_delete.indeterminate == 1
+    assert kube.lifecycle_accesses_after_owner_gc == []
     assert store.read_runtime("lifecycle", "job-1", "slot") is None
+    kube.lifecycle_accesses_after_owner_gc.clear()
     raw, metadata = _credential()
     with pytest.raises(StateConflictError):
         deletion_gap.grant_credential_result("job-1", metadata, raw)
     assert not kube.secrets
+    cancel_repaired = next(
+        index
+        for index, event in enumerate(kube.events)
+        if event.get("closeKind") == "cancel"
+        and event.get("closePhase") == "succeeded"
+        and event.get("gate") == "closed"
+    )
+    delete_accepted = next(
+        index
+        for index, event in enumerate(kube.events[cancel_repaired + 1 :], cancel_repaired + 1)
+        if event.get("closeKind") == "delete" and event.get("closePhase") == "accepted"
+    )
+    delete_intent_before_effect = next(
+        index
+        for index, event in enumerate(kube.events[delete_accepted + 1 :], delete_accepted + 1)
+        if event.get("cleanupPhase") == "job_delete_requested"
+    )
+    workload_delete = next(
+        index
+        for index, event in enumerate(
+            kube.events[delete_intent_before_effect + 1 :], delete_intent_before_effect + 1
+        )
+        if event.get("kind") == "Job" and event.get("verb") == "delete"
+    )
+    assert cancel_repaired < delete_accepted < delete_intent_before_effect < workload_delete
     final = _provider(kube, store, agent, workspace).reconcile_all()
     assert final.deleted == 1 and kube.job is None and kube.pods == []
+    assert kube.lifecycle_accesses_after_owner_gc == []
     tombstone = store.read_create("request-task-7")
     assert tombstone is not None and tombstone.cleanup_state == "complete"
     assert all(item["data"].get("kind") is None for item in kube.maps.values())
+    assert not any(
+        event.get("kind") == "ConfigMap"
+        and event.get("verb") == "create"
+        and "lifecycle" in str(event.get("name"))
+        for event in kube.events[workload_delete + 1 :]
+    )
+    with pytest.raises(StateConflictError):
+        replacement_finalize_close.phase("agent_stopped")
+    finalized_lifecycle = reserved_store.read_runtime("lifecycle", "job-1", "slot")
+    assert finalized_lifecycle is not None
+    finalized_payload = json.loads(finalized_lifecycle.values["payload"])
+    assert finalized_payload["gate"] == "closed"
+    assert finalized_payload["close"]["phase"] == "succeeded"
+    assert finalized_payload["close"]["phaseOrdinal"] == 4
+    assert finalized_payload["close"]["executionEpoch"] >= 3
     print(
         "JOURNEY task7 recovery",
         json.dumps(

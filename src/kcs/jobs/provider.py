@@ -88,6 +88,7 @@ from .errors import (
 )
 from .lifecycle import (
     LifecycleClaim,
+    LifecycleClose,
     LifecycleGate,
     ReconcileReport,
     action_snapshot,
@@ -368,6 +369,14 @@ class V2JobProvider:
                 report.scanned += 1
                 job_ref = str(_field(record, "job_ref"))
                 try:
+                    if self._requires_ownerless_delete_recovery(record):
+                        self.delete(
+                            job_ref,
+                            str(_field(record, "delete_ref")),
+                            str(_field(record, "delete_request_digest")),
+                        )
+                        report.deleted += 1
+                        continue
                     lifecycle = self._lifecycle.inspect(job_ref)
                     if lifecycle is not None and lifecycle["activeClaims"]:
 
@@ -391,7 +400,7 @@ class V2JobProvider:
                     if (
                         lifecycle is not None
                         and lifecycle["gate"] == "closing"
-                        and close_kind in {"cancel", "finalize"}
+                        and close_kind in {"cancel", "finalize", "delete"}
                         and not self._runtime_records(str(close_kind), job_ref)
                     ):
                         if not isinstance(close, Mapping):
@@ -399,8 +408,12 @@ class V2JobProvider:
                                 "lifecycle close identity is unavailable"
                             )
                         self._resume_lifecycle_close(job_ref, close)
+                        if close_kind == "delete":
+                            report.deleted += 1
+                            continue
                         report.reconciled += 1
-                        continue
+                        if str(_field(record, "state", "")) != "deleting":
+                            continue
                     self._reconcile_record(record, report)
                 except Exception:
                     report.indeterminate += 1
@@ -415,6 +428,16 @@ class V2JobProvider:
         job_ref = str(_field(record, "job_ref"))
         if _is_deleted(record) or str(_field(record, "state", "")) == "deleting":
             if str(_field(record, "cleanup_state", "pending")) != "complete":
+                if not self._requires_ownerless_delete_recovery(record):
+                    lifecycle = self._lifecycle.inspect(job_ref)
+                    close = lifecycle.get("close") if lifecycle is not None else None
+                    if (
+                        lifecycle is not None
+                        and lifecycle.get("gate") == "closing"
+                        and isinstance(close, Mapping)
+                        and close.get("kind") in {"cancel", "finalize"}
+                    ):
+                        self._resume_lifecycle_close(job_ref, close)
                 self.delete(
                     job_ref,
                     str(_field(record, "delete_ref")),
@@ -1046,7 +1069,9 @@ class V2JobProvider:
         self._assert_no_cancel(job_ref)
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
-        binding = self._live_binding(job_ref)
+        binding = self._binding_for_close(
+            job_ref, "finalize", request.finalize_ref, request.request_digest
+        )
         request_spec = request.spec.model_dump_json(by_alias=True)
         close = self._lifecycle.begin_close(
             job_ref,
@@ -1127,7 +1152,9 @@ class V2JobProvider:
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
         self._assert_not_finalizing(job_ref)
-        binding = self._live_binding(job_ref)
+        binding = self._binding_for_close(
+            job_ref, "cancel", request.cancel_ref, request.request_digest
+        )
         request_spec = request.spec.model_dump_json(by_alias=True)
         close = self._lifecycle.begin_close(
             job_ref,
@@ -1234,12 +1261,13 @@ class V2JobProvider:
     cancel_job = cancel
 
     def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
-        """Persist an ownerless tombstone, then prove foreground cleanup in phases."""
+        """Fence close, persist ownerless delete intent, then prove foreground cleanup."""
         if not hmac.compare_digest(request_digest, EMPTY_OBJECT_DIGEST):
             raise DigestMismatchError
         record = self._store.read_by_job_ref(job_ref)
         if record is None:
             raise JobNotFoundError
+        ownerless_recovery = self._requires_ownerless_delete_recovery(record)
         if _is_deleted(record):
             self._raise_if_delete_conflicts(record, delete_ref, request_digest)
             if _field(record, "cleanup_state", "complete") == "complete":
@@ -1248,6 +1276,16 @@ class V2JobProvider:
             credential_observations, transfer_observations = _stored_tombstone_observations(record)
         elif str(_field(record, "state", "")) == "deleting":
             self._raise_if_delete_conflicts(record, delete_ref, request_digest)
+            if not ownerless_recovery:
+                lifecycle = self._lifecycle.inspect(job_ref)
+                retained_close = lifecycle.get("close") if lifecycle is not None else None
+                if (
+                    lifecycle is not None
+                    and lifecycle.get("gate") == "closing"
+                    and isinstance(retained_close, Mapping)
+                    and retained_close.get("kind") in {"cancel", "finalize"}
+                ):
+                    self._resume_lifecycle_close(job_ref, retained_close)
             final_state = _provider_terminal_state(_field(record, "final_state", "indeterminate"))
             credential_observations, transfer_observations = _stored_tombstone_observations(record)
         else:
@@ -1264,6 +1302,17 @@ class V2JobProvider:
 
         deleted_at = self._now()
         expires_at = deleted_at + self._tombstone_ttl
+        close: LifecycleClose | None = None
+        if not ownerless_recovery:
+            close = self._lifecycle.begin_close(
+                job_ref,
+                str(_field(record, "job_uid")),
+                str(_field(record, "pod_uid")),
+                "delete",
+                delete_ref,
+                request_digest,
+                "{}",
+            )
         record = self._mark_deleted(
             record,
             delete_ref=delete_ref,
@@ -1283,65 +1332,8 @@ class V2JobProvider:
             credential_observations=credential_observations,
             transfer_observations=transfer_observations,
         )
-        if _delete_phase_reached(record, "workload_absent"):
-            self._prove_secret_absent(job_ref)
-            if self._read_job(job_ref) is not None or self._list_job_pods(
-                job_ref, str(_field(record, "job_uid"))
-            ):
-                raise DependencyTimeoutError("Kubernetes workload absence must be re-proven")
-            self._store.delete_runtime_records(job_ref)
-            if self._store.has_runtime_records(job_ref):
-                raise DependencyTimeoutError(
-                    "Kubernetes owner runtime records remain after deletion"
-                )
-            completion_at = self._now()
-            gpu_requested = _workspace_gpu(record) > 0
-            record = self._mark_deleted(
-                record,
-                delete_ref=delete_ref,
-                request_digest=request_digest,
-                final_state=final_state,
-                deleted_at=completion_at,
-                expires_at=completion_at + self._tombstone_ttl,
-                cleanup_state=CleanupState.PENDING,
-                cleanup_phase="owner_records_deleted",
-                gpu_release_state=(
-                    CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED
-                ),
-                credential_observations=credential_observations,
-                transfer_observations=transfer_observations,
-            )
-            record = self._mark_deleted(
-                record,
-                delete_ref=delete_ref,
-                request_digest=request_digest,
-                final_state=final_state,
-                deleted_at=completion_at,
-                expires_at=completion_at + self._tombstone_ttl,
-                cleanup_state=CleanupState.COMPLETE,
-                cleanup_phase="complete",
-                gpu_release_state=(
-                    CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED
-                ),
-                credential_observations=credential_observations,
-                transfer_observations=transfer_observations,
-            )
-            return _as_tombstone(record)
-        try:
-            close = self._lifecycle.begin_close(
-                job_ref,
-                str(_field(record, "job_uid")),
-                str(_field(record, "pod_uid")),
-                "delete",
-                delete_ref,
-                request_digest,
-                "{}",
-            )
-        except StateConflictError as error:
-            raise DependencyUnavailableError(
-                "delete intent is retained while a lifecycle mutation finishes"
-            ) from error
-        close.phase("delete_intent_persisted")
+        if close is not None:
+            close.phase("delete_intent_persisted")
 
         for grant_record in self._store.list_runtime("credential", job_ref):
             grant = self._grant_snapshot(grant_record)
@@ -1364,9 +1356,9 @@ class V2JobProvider:
             credential_observations=credential_observations,
             transfer_observations=transfer_observations,
         )
-        close.phase("credentials_destroyed")
+        if close is not None:
+            close.phase("credentials_destroyed")
 
-        self._delete_job(job_ref)
         record = self._mark_deleted(
             record,
             delete_ref=delete_ref,
@@ -1380,7 +1372,30 @@ class V2JobProvider:
             credential_observations=credential_observations,
             transfer_observations=transfer_observations,
         )
-        close.phase("job_delete_requested")
+        if close is not None:
+            close.phase("job_delete_requested")
+        return self._finish_ownerless_delete(
+            record,
+            delete_ref,
+            request_digest,
+            final_state,
+            credential_observations,
+            transfer_observations,
+        )
+
+    def _finish_ownerless_delete(
+        self,
+        record: object,
+        delete_ref: str,
+        request_digest: str,
+        final_state: ProviderTerminalState,
+        credential_observations: Sequence[Mapping[str, object]],
+        transfer_observations: Sequence[Mapping[str, object]],
+    ) -> JobTombstone:
+        """Finish deletion using only the ownerless deleting record after Job delete intent."""
+        job_ref = str(_field(record, "job_ref"))
+        observed_at = self._now()
+        self._delete_job(job_ref)
         if not self._wait_for_job_absence(job_ref):
             raise DependencyTimeoutError("Kubernetes has not yet confirmed Job deletion")
         if self._list_job_pods(job_ref, str(_field(record, "job_uid"))):
@@ -1391,16 +1406,14 @@ class V2JobProvider:
             delete_ref=delete_ref,
             request_digest=request_digest,
             final_state=final_state,
-            deleted_at=deleted_at,
-            expires_at=expires_at,
+            deleted_at=observed_at,
+            expires_at=observed_at + self._tombstone_ttl,
             cleanup_state=CleanupState.PENDING,
             cleanup_phase=_later_delete_phase(record, "workload_absent"),
             gpu_release_state=CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED,
             credential_observations=credential_observations,
             transfer_observations=transfer_observations,
         )
-        close.phase("workload_absent")
-        close.phase("cleanup_proven", closed=True)
         self._store.delete_runtime_records(job_ref)
         if self._store.has_runtime_records(job_ref):
             raise DependencyTimeoutError("Kubernetes owner runtime records remain after deletion")
@@ -1433,6 +1446,14 @@ class V2JobProvider:
         )
         return _as_tombstone(record)
 
+    def _requires_ownerless_delete_recovery(self, record: object) -> bool:
+        if str(_field(record, "state", "")) != "deleting":
+            return False
+        return (
+            _delete_phase_reached(record, "job_delete_requested")
+            or self._read_job(str(_field(record, "job_ref"))) is None
+        )
+
     delete_job = delete
 
     def _reserve_create(
@@ -1461,6 +1482,28 @@ class V2JobProvider:
             raise ReplacementPodError()
         return binding
 
+    def _binding_for_close(
+        self, job_ref: str, kind: str, ref: str, digest: str
+    ) -> JobBindingSnapshot:
+        binding = self.inspect(job_ref)
+        if binding.binding_state is not JobBindingState.DELETING:
+            if binding.pod_uid is None or binding.binding_state is JobBindingState.INDETERMINATE:
+                raise ReplacementPodError()
+            return binding
+        lifecycle = self._lifecycle.inspect(job_ref)
+        close = lifecycle.get("close") if lifecycle is not None else None
+        if (
+            lifecycle is None
+            or lifecycle.get("gate") not in {"closing", "closed"}
+            or not isinstance(close, Mapping)
+            or close.get("kind") != kind
+            or close.get("ref") != ref
+            or close.get("digest") != digest
+            or binding.pod_uid is None
+        ):
+            raise StateConflictError("The deleting Job has no matching retained close authority")
+        return binding
+
     def _resume_lifecycle_close(self, job_ref: str, close: Mapping[str, object]) -> None:
         kind = str(close.get("kind", ""))
         ref = str(close.get("ref", ""))
@@ -1485,6 +1528,9 @@ class V2JobProvider:
                     spec=FinalizeSpec.model_validate_json(request_spec),
                 ),
             )
+            return
+        if kind == "delete":
+            self.delete(job_ref, ref, digest)
             return
         raise DependencyUnavailableError("lifecycle close has no replayable action kind")
 
