@@ -56,6 +56,7 @@ class _Kube:
         self.config_maps: dict[str, dict[str, Any]] = {}
         self.secrets: dict[str, dict[str, Any]] = {}
         self.audit_bytes: list[bytes] = []
+        self.secret_creates = 0
         self.secret_deletes = 0
         self.secret_delete_failures = 0
         self.terminated: set[str] = set()
@@ -96,23 +97,63 @@ class _Kube:
 
     def create_secret(self, body: object) -> object:
         value = json.loads(json.dumps(body))
-        value["metadata"]["uid"] = "00000000-0000-4000-8000-000000000005"
+        self.secret_creates += 1
+        value["metadata"]["uid"] = f"00000000-0000-4000-8000-{self.secret_creates + 4:012d}"
         self.secrets[value["metadata"]["name"]] = value
-        self.audit_bytes.append(b"secret-created")
+        annotations = value["metadata"]["annotations"]
+        self.audit_bytes.append(
+            json.dumps(
+                {
+                    "kind": "Secret",
+                    "verb": "create",
+                    "name": value["metadata"]["name"],
+                    "uid": value["metadata"]["uid"],
+                    "jobUid": annotations["researchcosmos.io/job-uid"],
+                    "podUid": annotations["researchcosmos.io/pod-uid"],
+                    "grantRef": annotations["researchcosmos.io/grant-ref"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
         return value
 
     def read_secret(self, name: str) -> object | None:
         return self.secrets.get(name)
 
     def delete_secret(self, name: str, secret_uid: str) -> bool:
-        if name in self.secrets and self.secrets[name]["metadata"]["uid"] != secret_uid:
+        observed = self.secrets.get(name)
+        observed_uid = observed["metadata"]["uid"] if observed is not None else None
+        observed_grant = (
+            observed["metadata"]["annotations"]["researchcosmos.io/grant-ref"]
+            if observed is not None
+            else None
+        )
+        event = {
+            "kind": "Secret",
+            "verb": "delete",
+            "name": name,
+            "uidPrecondition": secret_uid,
+            "observedUid": observed_uid,
+            "observedGrantRef": observed_grant,
+        }
+        if observed_uid is not None and observed_uid != secret_uid:
+            event["result"] = "uid-precondition-conflict"
+            self.audit_bytes.append(
+                json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+            )
             raise _ConflictError()
         self.secret_deletes += 1
         if self.secret_delete_failures:
             self.secret_delete_failures -= 1
+            event["result"] = "injected-failure"
+            self.audit_bytes.append(
+                json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+            )
             raise RuntimeError("simulated Secret delete failure")
         existed = self.secrets.pop(name, None) is not None
-        self.audit_bytes.append(b"secret-deleted")
+        event["result"] = "accepted" if existed else "already-absent"
+        self.audit_bytes.append(json.dumps(event, sort_keys=True, separators=(",", ":")).encode())
         return existed
 
     def read_job(self, job_ref: str) -> object:
@@ -212,11 +253,16 @@ def _setup(
     return kube, store, transport, provider
 
 
-def _credential() -> tuple[bytes, CredentialGrantMetadata]:
-    raw = b"synthetic-short-credential"
+def _credential(
+    *,
+    grant_ref: str = "grant-1",
+    raw: bytes = b"synthetic-short-credential",
+    agent_run_ref: str = "run-1",
+    generation: int = 1,
+) -> tuple[bytes, CredentialGrantMetadata]:
     payload = {
-        "agentRunRef": "run-1",
-        "generation": 1,
+        "agentRunRef": agent_run_ref,
+        "generation": generation,
         "launchBundleDigest": DIGEST,
         "audience": "agent",
         "credentialSha256": hashlib.sha256(raw).hexdigest(),
@@ -225,11 +271,11 @@ def _credential() -> tuple[bytes, CredentialGrantMetadata]:
         "podUid": str(POD_UID),
     }
     return raw, CredentialGrantMetadata(
-        credential_grant_ref="grant-1",
+        credential_grant_ref=grant_ref,
         credential_sha256=payload["credentialSha256"],
         grant_metadata_digest=canonical_digest(payload),
-        agent_run_ref="run-1",
-        generation=1,
+        agent_run_ref=agent_run_ref,
+        generation=generation,
         launch_bundle_digest=DIGEST,
         audience="agent",
         ttl_seconds=300,
@@ -341,7 +387,57 @@ def test_generation_recovery_uses_retained_grant_and_never_claims_unproved_clean
     assert transport.starts == 2
     assert provider.start_agent("job-1", request).replayed is True
     assert transport.starts == 2
+
+    rotated_raw, rotated_metadata = _credential(
+        grant_ref="grant-2",
+        raw=b"synthetic-rotated-credential",
+        agent_run_ref="run-2",
+        generation=2,
+    )
+    rotated = provider.grant_credential("job-1", rotated_metadata, rotated_raw)
+    assert rotated.state is CredentialState.AVAILABLE and rotated.secret_present is True
+    secret_name = next(iter(kube.secrets))
+    retained_secret_uid = kube.secrets[secret_name]["metadata"]["uid"]
+    deletes_before_restart = kube.secret_deletes
+    audit_before_restart = list(kube.audit_bytes)
+
+    restarted = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=_Transport(kube),
+    )
+    previous = restarted.inspect_credential_grant("job-1", "grant-1")
+    current = restarted.inspect_credential_grant("job-1", "grant-2")
+    assert secret_name in kube.secrets
+    retained_secret = kube.secrets[secret_name]
+    annotations = retained_secret["metadata"]["annotations"]
+    assert previous.state is CredentialState.DESTROYED and previous.secret_present is False
+    assert current.state is CredentialState.AVAILABLE and current.secret_present is True
+    assert annotations["researchcosmos.io/grant-ref"] == "grant-2"
+    assert annotations["researchcosmos.io/pod-uid"] == str(POD_UID)
+    assert retained_secret["metadata"]["uid"] == retained_secret_uid
+    assert kube.secret_deletes == deletes_before_restart
+    assert kube.audit_bytes == audit_before_restart
     assert raw not in json.dumps(kube.config_maps).encode()
+    assert raw not in b"\n".join(kube.audit_bytes)
+    assert rotated_raw not in b"\n".join(kube.audit_bytes)
+    print(
+        "JOURNEY task5 credential-rotation",
+        json.dumps(
+            {
+                "rawAuditUtf8": [event.decode() for event in kube.audit_bytes],
+                "restart": {
+                    "grant1": previous.model_dump(mode="json", by_alias=True),
+                    "grant2": current.model_dump(mode="json", by_alias=True),
+                    "retainedSecretUid": retained_secret_uid,
+                    "secretDeletes": kube.secret_deletes,
+                },
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 def test_finalize_drains_only_requested_records_and_recovers_lost_stop_phase() -> None:

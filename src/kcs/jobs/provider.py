@@ -330,7 +330,14 @@ class V2JobProvider:
                 grant = self._grant_snapshot(record)
                 read_secret = getattr(self._kube, "read_secret", None)
                 if callable(read_secret):
-                    present = read_secret(credential_secret_name(grant.job_ref)) is not None
+                    secret = read_secret(credential_secret_name(grant.job_ref))
+                    present = secret is not None and self._secret_matches_grant_binding(
+                        secret,
+                        grant.job_ref,
+                        str(grant.job_uid),
+                        grant.credential_grant_ref,
+                        str(grant.pod_uid),
+                    )
                     if grant.secret_present is True and not present:
                         target = self._cleanup_target(record)
                         if target is None:
@@ -2105,7 +2112,11 @@ class V2JobProvider:
                 destroyed_at=grant.destroyed_at or self._now(),
             )
         try:
-            deletion = self._delete_bound_secret(grant.job_ref, str(grant.job_uid))
+            deletion = self._delete_bound_secret(
+                grant.job_ref,
+                str(grant.job_uid),
+                grant_binding=(grant.credential_grant_ref, str(grant.pod_uid)),
+            )
             if deletion is not True:
                 raise DependencyUnavailableError("Kubernetes Secret absence was not confirmed")
         except Exception:
@@ -2167,11 +2178,9 @@ class V2JobProvider:
         if destroyed.state is CredentialState.DESTROY_FAILED:
             raise CredentialDestroyFailedError()
 
-    def _delete_bound_secret(self, job_ref: str, job_uid: str) -> bool:
-        name = credential_secret_name(job_ref)
-        secret = self._kube.read_secret(name)
-        if secret is None:
-            return True
+    def _bound_secret_annotations(
+        self, secret: object, job_ref: str, job_uid: str
+    ) -> Mapping[str, object]:
         metadata = _field(secret, "metadata", {})
         labels = _field(metadata, "labels", {})
         annotations = _field(metadata, "annotations", {})
@@ -2189,6 +2198,47 @@ class V2JobProvider:
             or str(_field(job_owners[0], "uid", "")) != job_uid
         ):
             raise StateConflictError("The credential Secret is not bound to the retained Job UID")
+        return annotations
+
+    def _secret_matches_grant_binding(
+        self,
+        secret: object,
+        job_ref: str,
+        job_uid: str,
+        credential_grant_ref: str,
+        pod_uid: str,
+    ) -> bool:
+        annotations = self._bound_secret_annotations(secret, job_ref, job_uid)
+        secret_grant_ref = annotations.get("researchcosmos.io/grant-ref")
+        secret_pod_uid = annotations.get("researchcosmos.io/pod-uid")
+        if (
+            not isinstance(secret_grant_ref, str)
+            or not secret_grant_ref
+            or not isinstance(secret_pod_uid, str)
+            or not secret_pod_uid
+        ):
+            raise StateConflictError("The credential Secret has no retained grant binding")
+        if secret_pod_uid != pod_uid:
+            raise StateConflictError("The credential Secret is not bound to the retained Pod UID")
+        return secret_grant_ref == credential_grant_ref
+
+    def _delete_bound_secret(
+        self,
+        job_ref: str,
+        job_uid: str,
+        *,
+        grant_binding: tuple[str, str] | None = None,
+    ) -> bool:
+        name = credential_secret_name(job_ref)
+        secret = self._kube.read_secret(name)
+        if secret is None:
+            return True
+        if grant_binding is None:
+            self._bound_secret_annotations(secret, job_ref, job_uid)
+        elif not self._secret_matches_grant_binding(
+            secret, job_ref, job_uid, grant_binding[0], grant_binding[1]
+        ):
+            return True
         secret_uid = _required_text(secret, "metadata", "uid")
         if self._kube.delete_secret(name, secret_uid) is not True:
             return False
