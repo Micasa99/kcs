@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7
 FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49 AS build
+ARG PIP_INDEX_URL=https://pypi.org/simple
 WORKDIR /build
 COPY LICENSE README.md pyproject.toml ./
 COPY src ./src
-RUN python -m pip install --timeout 120 --disable-pip-version-check --no-cache-dir \
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --timeout 120 --disable-pip-version-check --no-cache-dir \
       setuptools==80.9.0 wheel==0.45.1 \
-    && python -m pip wheel --timeout 120 --disable-pip-version-check --no-build-isolation \
+    && python -m pip wheel --index-url "$PIP_INDEX_URL" --timeout 120 --disable-pip-version-check --no-build-isolation \
       --no-deps --wheel-dir=/wheels .
 
 FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49
