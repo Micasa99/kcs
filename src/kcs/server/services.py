@@ -63,7 +63,18 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         config.load_incluster_config()
         batch_api = client.BatchV1Api(api_client=client.ApiClient())
         core_api = client.CoreV1Api(api_client=client.ApiClient())
-        kube = V2KubeAdapter(settings.namespace, batch_api, core_api)
+        kube = V2KubeAdapter(
+            settings.namespace,
+            batch_api,
+            core_api,
+            # kubernetes.stream.stream temporarily replaces its ApiClient's
+            # request transport with a websocket transport.  A fresh client
+            # per exec keeps that mutation away from concurrent REST reads
+            # and from every other exec call.
+            exec_core_api_factory=lambda: client.CoreV1Api(
+                api_client=client.ApiClient()
+            ),
+        )
         _v2_provider = V2JobProvider(
             kube,
             V2JobStore(kube),

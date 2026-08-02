@@ -103,6 +103,7 @@ class V2KubeAdapter:
         batch_api: BatchV1Api,
         core_api: CoreV1Api,
         *,
+        exec_core_api_factory: Callable[[], CoreV1Api] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not namespace or namespace == "default":
@@ -110,6 +111,7 @@ class V2KubeAdapter:
         self.namespace = namespace
         self._batch = batch_api
         self._core = core_api
+        self._exec_core_api_factory = exec_core_api_factory or (lambda: self._core)
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def create_job(self, body: Any) -> Any:
@@ -341,8 +343,9 @@ class V2KubeAdapter:
 
         pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
         pod_name = str(_value(_value(pod, "metadata"), "name"))
+        exec_core = self._exec_core_api_factory()
         websocket: Any = stream(
-            self._core.connect_get_namespaced_pod_exec,
+            exec_core.connect_get_namespaced_pod_exec,
             pod_name,
             self.namespace,
             container=container,
@@ -401,8 +404,9 @@ class V2KubeAdapter:
 
         pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
         pod_name = str(_value(_value(pod, "metadata"), "name"))
+        exec_core = self._exec_core_api_factory()
         websocket: Any = stream(
-            self._core.connect_get_namespaced_pod_exec,
+            exec_core.connect_get_namespaced_pod_exec,
             pod_name,
             self.namespace,
             container="workspace",

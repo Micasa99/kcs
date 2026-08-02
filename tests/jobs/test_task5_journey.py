@@ -886,14 +886,27 @@ def test_kubernetes_exec_requires_fragmented_zero_status_and_sanitizes_nonzero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     success = _WebSocket(['{"ok":', "true}"], {"status": "Success"})
-    monkeypatch.setattr("kubernetes.stream.stream", lambda *args, **kwargs: success)
-    adapter = V2KubeAdapter("researchcosmos-v2", cast(Any, object()), cast(Any, _ExecCore()))
+    streamed_from: list[object] = []
+
+    def stream(exec_method: object, *args: object, **kwargs: object) -> _WebSocket:
+        streamed_from.append(getattr(exec_method, "__self__", None))
+        return success
+
+    monkeypatch.setattr("kubernetes.stream.stream", stream)
+    exec_core = _ExecCore()
+    adapter = V2KubeAdapter(
+        "researchcosmos-v2",
+        cast(Any, object()),
+        cast(Any, _ExecCore()),
+        exec_core_api_factory=lambda: exec_core,
+    )
     binding = {"jobRef": "job-1", "jobUid": str(JOB_UID), "podUid": str(POD_UID)}
     output = adapter.exec_supervisor_rpc(
         binding, "agent", ["/opt/kcs/agent-supervisor", "rpc"], b"{}"
     )
     assert output == b'{"ok":true}'
     assert success.closed_channels == [0]
+    assert streamed_from == [exec_core]
 
     failed = _WebSocket(
         [],
