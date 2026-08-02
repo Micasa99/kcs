@@ -28,7 +28,9 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["get"]
+    # Kubernetes authorizes WebSocket pod exec as `create`; `get` alone
+    # rejects every supervisor/sidecar RPC at the handshake (403).
+    verbs: ["get", "create"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "get", "list", "update", "delete"]

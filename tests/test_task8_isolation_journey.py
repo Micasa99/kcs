@@ -252,7 +252,7 @@ def test_task8_legacy_isolation_and_ssh_identity_journey(
         (("batch",), ("jobs",)): {"create", "get", "patch", "delete"},
         (("",), ("pods",)): {"get", "list", "patch"},
         (("",), ("pods/log",)): {"get"},
-        (("",), ("pods/exec",)): {"get"},
+        (("",), ("pods/exec",)): {"get", "create"},
         (("",), ("configmaps",)): {"create", "get", "list", "update", "delete"},
         (("",), ("secrets",)): {"create", "get", "delete"},
     }
