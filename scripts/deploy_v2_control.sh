@@ -263,7 +263,8 @@ install -m 0600 "$KCS_TLS_CERT_FILE" "$secret_dir/tls.crt"
 install -m 0600 "$KCS_TLS_KEY_FILE" "$secret_dir/tls.key"
 install -m 0600 "$KCS_SERVICE_TOKEN_FILE" "$secret_dir/service-token"
 secret_archive="$secret_dir/secrets.tar"
-tar -C "$secret_dir" -cf "$secret_archive" tls.crt tls.key service-token
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$secret_dir" -cf "$secret_archive" \
+  tls.crt tls.key service-token
 chmod 0600 "$secret_archive"
 remote_secret_archive=$(ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   'umask 077; mktemp /tmp/kcs-v2-secrets.XXXXXX.tar')
@@ -299,7 +300,7 @@ printf 'KCS_PORT_FORWARD_ADDRESS=%s\nKCS_CONTROL_PRIVATE_ADDRESS=%s\n' \
   ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
     'sudo install -d -m 0750 /etc/kcs-v2 && sudo tee /etc/kcs-v2/port-forward.env >/dev/null'
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
-  'sudo systemctl daemon-reload && sudo systemctl enable --now kcs-v2.service >/dev/null && sudo k3s kubectl -n researchcosmos-v2 rollout status deployment/kcs-v2-api --timeout=180s'
+  'sudo systemctl daemon-reload && sudo systemctl enable kcs-v2.service >/dev/null && sudo k3s kubectl -n researchcosmos-v2 rollout status deployment/kcs-v2-api --timeout=180s && sudo systemctl restart kcs-v2.service && sudo systemctl is-active --quiet kcs-v2.service'
 observed_k3s_version=$(ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s --version 2>/dev/null | awk 'NR == 1 {print \$3}'")
 [[ $observed_k3s_version == "$KCS_K3S_VERSION" ]] || {
