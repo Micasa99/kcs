@@ -67,6 +67,13 @@ class DigestMismatchError(KcsV2Error):
     default_message = "The supplied digest does not match the request payload"
 
 
+class PreconditionFailedError(KcsV2Error):
+    code = "PRECONDITION_FAILED"
+    status_code = 422
+    recovery_action = "inspect_job"
+    default_message = "Required staged runtime material is not ready for agent start"
+
+
 class InvalidCursorError(KcsV2Error):
     code = "INVALID_CURSOR"
     status_code = 400

@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, overload
 from uuid import UUID
 
-from .canonical import canonical_digest
+from .canonical import canonical_bytes, canonical_digest
 from .contracts import (
     ActionSnapshot,
     ActionState,
@@ -78,6 +78,7 @@ from .errors import (
     KcsV2Error,
     OperationIndeterminateError,
     PayloadTooLargeError,
+    PreconditionFailedError,
     ReplacementPodError,
     StaleBindingError,
     StaleCursorError,
@@ -102,6 +103,7 @@ from .transport import (
     WorkspaceRpcTransportProtocol,
 )
 from .workspace_runtime import (
+    StartMaterialBinding,
     TransferResult,
     VerifiedContent,
     WorkspaceOperationResult,
@@ -126,6 +128,8 @@ _OPERATION_TERMINAL_STATES = frozenset({"succeeded", "failed", "indeterminate"})
 _TRANSFER_TERMINAL_STATES = frozenset(
     {"completed", "canceled", "discarded", "failed", "indeterminate"}
 )
+_START_MATERIAL_BINDINGS_KEY = "startMaterialBindings"
+_START_MATERIAL_BINDINGS_DIGEST_KEY = "startMaterialBindingsDigest"
 
 
 class V2JobRendererProtocol(Protocol):
@@ -194,7 +198,13 @@ class V2JobStoreProtocol(Protocol):
 
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> object | None: ...
 
-    def list_runtime(self, kind: str, job_ref: str | None = None) -> Sequence[object]: ...
+    def list_runtime(
+        self,
+        kind: str,
+        job_ref: str | None = None,
+        *,
+        strict: bool = False,
+    ) -> Sequence[object]: ...
 
     def update_runtime(
         self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
@@ -997,6 +1007,16 @@ class V2JobProvider:
             self._validate_retained_generation(retained, request, binding)
             if retained.runner_state is not RunnerState.ACCEPTED:
                 return retained.model_copy(update={"replayed": True})
+            retained_bindings = self._retained_start_material_bindings(existing)
+            self._workspace_runtime.validate_start_material_bindings(
+                job_ref,
+                binding,
+                request.launch_bundle_path,
+                request.launch_bundle_size_bytes,
+                request.launch_bundle_digest,
+                request.material_paths,
+                retained_bindings,
+            )
             record = existing
         else:
             previous = self._latest_generation(job_ref)
@@ -1008,12 +1028,27 @@ class V2JobProvider:
                 )
             ):
                 raise IllegalGenerationError()
+            material_bindings = self._workspace_runtime.resolve_start_material_bindings(
+                job_ref,
+                binding,
+                request.launch_bundle_path,
+                request.launch_bundle_size_bytes,
+                request.launch_bundle_digest,
+                request.material_paths,
+            )
             grant = self.inspect_credential_grant(job_ref, request.credential_grant_ref)
             if grant.state is not CredentialState.AVAILABLE or self._now() >= grant.expires_at:
                 self._expire_grant_if_needed(grant)
                 raise CredentialExpiredError()
             self._validate_generation_grant(grant, request, binding)
-            values = self._generation_values(job_ref, request, digest, binding, grant)
+            values = self._generation_values(
+                job_ref,
+                request,
+                digest,
+                binding,
+                grant,
+                material_bindings,
+            )
             record, _ = self._store.reserve_runtime(
                 "generation", str(request.generation), job_ref, values
             )
@@ -1021,6 +1056,8 @@ class V2JobProvider:
                 raise IdentityDigestConflict()
             retained = self._generation_snapshot(record, replayed=False)
             self._validate_retained_generation(retained, request, binding)
+            if self._retained_start_material_bindings(record) != material_bindings:
+                raise PreconditionFailedError()
             if retained.runner_state is not RunnerState.ACCEPTED:
                 return retained.model_copy(update={"replayed": True})
         if self._transport is None:
@@ -2338,6 +2375,7 @@ class V2JobProvider:
         digest: str,
         binding: JobBindingSnapshot,
         grant: CredentialGrantSnapshot,
+        material_bindings: Sequence[StartMaterialBinding],
     ) -> dict[str, str]:
         now = self._now()
         snapshot = GenerationSnapshot(
@@ -2363,14 +2401,74 @@ class V2JobProvider:
             credential_acknowledged_at=None,
             credential_destroyed_at=None,
         )
+        bindings_payload: dict[str, object] = {
+            "version": 1,
+            "bindings": [item.digest_payload() for item in material_bindings],
+        }
+        encoded_bindings = canonical_bytes(bindings_payload).decode("utf-8")
         return {
             "identityDigest": digest,
             "jobUid": str(binding.job_uid),
             "podUid": str(binding.pod_uid),
             "grantAudience": grant.audience,
             "credentialSha256": grant.credential_sha256,
+            _START_MATERIAL_BINDINGS_KEY: encoded_bindings,
+            _START_MATERIAL_BINDINGS_DIGEST_KEY: canonical_digest(bindings_payload),
             "payload": snapshot.model_dump_json(by_alias=True),
         }
+
+    @staticmethod
+    def _retained_start_material_bindings(record: object) -> tuple[StartMaterialBinding, ...]:
+        values = _runtime_values(record)
+        encoded = values.get(_START_MATERIAL_BINDINGS_KEY)
+        retained_digest = values.get(_START_MATERIAL_BINDINGS_DIGEST_KEY)
+        if not isinstance(encoded, str) or not isinstance(retained_digest, str):
+            raise PreconditionFailedError()
+        try:
+            payload = json.loads(encoded)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"version", "bindings"}
+                or type(payload.get("version")) is not int
+                or payload.get("version") != 1
+                or not isinstance(payload.get("bindings"), list)
+                or canonical_bytes(payload).decode("utf-8") != encoded
+                or not hmac.compare_digest(canonical_digest(payload), retained_digest)
+            ):
+                raise PreconditionFailedError()
+            bindings: list[StartMaterialBinding] = []
+            for item in payload["bindings"]:
+                if (
+                    not isinstance(item, dict)
+                    or set(item)
+                    != {
+                        "path",
+                        "transferRef",
+                        "requestDigest",
+                        "actualSizeBytes",
+                        "actualSha256",
+                    }
+                    or not isinstance(item.get("path"), str)
+                    or not isinstance(item.get("transferRef"), str)
+                    or not isinstance(item.get("requestDigest"), str)
+                    or type(item.get("actualSizeBytes")) is not int
+                    or not isinstance(item.get("actualSha256"), str)
+                ):
+                    raise PreconditionFailedError()
+                bindings.append(
+                    StartMaterialBinding(
+                        path=item["path"],
+                        transfer_ref=item["transferRef"],
+                        request_digest=item["requestDigest"],
+                        actual_size_bytes=item["actualSizeBytes"],
+                        actual_sha256=item["actualSha256"],
+                    )
+                )
+            return tuple(bindings)
+        except PreconditionFailedError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise PreconditionFailedError() from error
 
     @staticmethod
     def _generation_snapshot(record: object, *, replayed: bool) -> GenerationSnapshot:

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import pytest
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import kcs.conformance.agent_supervisor as supervisor
+from kcs.conformance.workspace_sidecar import WorkspaceSidecar
 from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.contracts import (
     AgentStartRequest,
@@ -24,8 +26,10 @@ from kcs.jobs.contracts import (
     CredentialState,
     FinalizeJobRequest,
     FinalizeSpec,
-    GenerationSnapshot,
     RunnerState,
+    TransferDirection,
+    TransferRegisterRequest,
+    TransferSpec,
 )
 from kcs.jobs.errors import (
     CredentialDestroyFailedError,
@@ -36,13 +40,16 @@ from kcs.jobs.errors import (
 from kcs.jobs.kube import V2KubeAdapter
 from kcs.jobs.provider import V2JobProvider
 from kcs.jobs.store import V2JobStore
-from kcs.jobs.transport import AgentRpcResponse, ExecRpcTransport
+from kcs.jobs.transport import AgentRpcResponse, ExecRpcTransport, LocalWorkspaceRpcTransport
 from kcs.server.routes.jobs import create_jobs_router
 
 JOB_UID = UUID("00000000-0000-4000-8000-000000000001")
 POD_UID = UUID("00000000-0000-4000-8000-000000000002")
 DIGEST = "a" * 64
 NOW = datetime(2026, 8, 2, tzinfo=UTC)
+START_LAUNCH = b'{"protocol":"kcs.conformance/1","action":"sharedWrite"}'
+START_LAUNCH_DIGEST = hashlib.sha256(START_LAUNCH).hexdigest()
+START_MATERIAL = b'{"kind":"synthetic-runtime-material","version":1}'
 
 
 class _ConflictError(Exception):
@@ -259,11 +266,12 @@ def _credential(
     raw: bytes = b"synthetic-short-credential",
     agent_run_ref: str = "run-1",
     generation: int = 1,
+    launch_digest: str = START_LAUNCH_DIGEST,
 ) -> tuple[bytes, CredentialGrantMetadata]:
     payload = {
         "agentRunRef": agent_run_ref,
         "generation": generation,
-        "launchBundleDigest": DIGEST,
+        "launchBundleDigest": launch_digest,
         "audience": "agent",
         "credentialSha256": hashlib.sha256(raw).hexdigest(),
         "ttlSeconds": 300,
@@ -276,7 +284,7 @@ def _credential(
         grant_metadata_digest=canonical_digest(payload),
         agent_run_ref=agent_run_ref,
         generation=generation,
-        launch_bundle_digest=DIGEST,
+        launch_bundle_digest=launch_digest,
         audience="agent",
         ttl_seconds=300,
         job_uid=JOB_UID,
@@ -291,44 +299,45 @@ def _start() -> AgentStartRequest:
         agent_run_ref="run-1",
         generation=1,
         launch_bundle_path="launch.json",
-        launch_bundle_digest=DIGEST,
-        launch_bundle_size_bytes=1,
+        launch_bundle_digest=START_LAUNCH_DIGEST,
+        launch_bundle_size_bytes=len(START_LAUNCH),
         material_paths=["material.json"],
         credential_grant_ref="grant-1",
     )
 
 
-def _reserve_accepted_generation(store: V2JobStore, request: AgentStartRequest) -> None:
-    snapshot = GenerationSnapshot(
-        job_ref="job-1",
-        generation=request.generation,
-        agent_run_ref=request.agent_run_ref,
-        execution_envelope_ref=request.execution_envelope_ref,
-        execution_envelope_digest=request.execution_envelope_digest,
-        launch_bundle_path=request.launch_bundle_path,
-        launch_bundle_digest=request.launch_bundle_digest,
-        launch_bundle_size_bytes=request.launch_bundle_size_bytes,
-        material_paths=request.material_paths,
-        credential_grant_ref=request.credential_grant_ref,
-        start_metadata_digest=canonical_digest(request.digest_payload()),
-        runner_state=RunnerState.ACCEPTED,
-        supervisor_alive=True,
-        pid=None,
-        exit_code=None,
-        started_at=None,
-        finished_at=None,
-        observed_at=NOW,
-        replayed=False,
-        credential_acknowledged_at=None,
-        credential_destroyed_at=None,
+def _stage_input(
+    provider: V2JobProvider,
+    transfer_ref: str,
+    path: str,
+    content: bytes,
+    *,
+    overwrite: Literal["forbid", "replace_authorized"] = "forbid",
+) -> None:
+    spec = TransferSpec(
+        direction=TransferDirection.STAGE_INPUT,
+        path=path,
+        declared_size_bytes=len(content),
+        authorized_max_size_bytes=len(content),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        mode="direct",
+        overwrite_policy=overwrite,
     )
-    values = {
-        "identityDigest": snapshot.start_metadata_digest,
-        "jobUid": str(JOB_UID),
-        "podUid": str(POD_UID),
-        "payload": snapshot.model_dump_json(by_alias=True),
-    }
-    store.reserve_runtime("generation", "1", "job-1", values)
+    request = TransferRegisterRequest(
+        transfer_ref=transfer_ref,
+        request_digest=canonical_digest(spec),
+        spec=spec,
+    )
+    assert provider.register_transfer("job-1", request).created is True
+    completed = provider.stage_transfer_content(
+        "job-1",
+        transfer_ref,
+        io.BytesIO(content),
+        content_length=len(content),
+    )
+    assert completed.state == "completed"
+    assert completed.actual_size_bytes == len(content)
+    assert completed.actual_sha256 == hashlib.sha256(content).hexdigest()
 
 
 def _finalize(
@@ -351,27 +360,156 @@ def _runtime_values(state: str) -> dict[str, str]:
     }
 
 
-def test_generation_recovery_uses_retained_grant_and_never_claims_unproved_cleanup() -> None:
-    kube, store, transport, provider = _setup()
+def test_start_material_binding_precedes_all_start_side_effects(tmp_path: Path) -> None:
+    kube, store, transport, _ = _setup()
+    sidecar = WorkspaceSidecar(tmp_path / "workspace")
+    workspace_transport = LocalWorkspaceRpcTransport(sidecar.dispatch)
+    provider = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=transport,
+        workspace_transport=workspace_transport,
+    )
+    launch_a = b'{"protocol":"kcs.conformance/1","action":"sharedWrite"}'
+    launch_b = b'{"protocol":"kcs.conformance/1","action":"sharedRead","sourceRole":"workspace"}'
+    material = b'{"kind":"synthetic-runtime-material","version":1}'
+    launch_digest = hashlib.sha256(launch_a).hexdigest()
+    _stage_input(provider, "launch-a", "launch.json", launch_a)
+    _stage_input(
+        provider,
+        "launch-b",
+        "launch.json",
+        launch_b,
+        overwrite="replace_authorized",
+    )
+    _stage_input(provider, "launch-unique", "launch-unique.json", launch_a)
+    _stage_input(provider, "material-1", "material.json", material)
+    corrupt_name = next(
+        name
+        for name, item in kube.config_maps.items()
+        if item["data"].get("identity") == "launch-b"
+    )
+    valid_history = json.loads(json.dumps(kube.config_maps[corrupt_name]))
+    kube.config_maps[corrupt_name]["data"]["recordVersion"] = "corrupt"
+    raw, metadata = _credential(launch_digest=launch_digest)
+    provider.grant_credential("job-1", metadata, raw)
+
+    restarted = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=transport,
+        workspace_transport=LocalWorkspaceRpcTransport(sidecar.dispatch),
+    )
+    app = FastAPI()
+    app.include_router(create_jobs_router(restarted, "token"))
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer token", "Content-Type": "application/json"}
+    ambiguous = AgentStartRequest(
+        execution_envelope_ref="envelope-1",
+        execution_envelope_digest=DIGEST,
+        agent_run_ref="run-1",
+        generation=1,
+        launch_bundle_path="launch.json",
+        launch_bundle_digest=launch_digest,
+        launch_bundle_size_bytes=len(launch_a),
+        material_paths=["material.json"],
+        credential_grant_ref="grant-1",
+    )
+    rejected = client.post(
+        "/api/v2/jobs/job-1/agent/start",
+        headers=headers,
+        json=ambiguous.model_dump(mode="json", by_alias=True),
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "PRECONDITION_FAILED"
+    assert store.list_runtime("generation", "job-1") == []
+    retained_grant = restarted.inspect_credential_grant("job-1", "grant-1")
+    assert retained_grant.state is CredentialState.AVAILABLE
+    assert retained_grant.secret_present is True
+    assert kube.secret_deletes == 0
+    assert transport.starts == 0
+
+    kube.config_maps[corrupt_name] = valid_history
+    accepted = client.post(
+        "/api/v2/jobs/job-1/agent/start",
+        headers=headers,
+        json=ambiguous.model_copy(update={"launch_bundle_path": "launch-unique.json"}).model_dump(
+            mode="json", by_alias=True
+        ),
+    )
+    assert accepted.status_code == 202
+    assert accepted.json()["runnerState"] == "exited"
+    assert transport.starts == 1
+    print(
+        "JOURNEY task5 start-material-binding",
+        json.dumps(
+            {
+                "rejected": {
+                    "status": rejected.status_code,
+                    "code": rejected.json()["error"]["code"],
+                    "generationReservations": 0,
+                    "grantState": retained_grant.state,
+                    "secretPresent": retained_grant.secret_present,
+                    "secretDeletes": 0,
+                    "agentRpcStarts": 0,
+                },
+                "accepted": {
+                    "status": accepted.status_code,
+                    "runnerState": accepted.json()["runnerState"],
+                    "agentRpcStarts": transport.starts,
+                },
+                "stageInstalls": sidecar.stats()["stageInstalls"],
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def test_generation_recovery_uses_retained_grant_and_never_claims_unproved_cleanup(
+    tmp_path: Path,
+) -> None:
+    kube, store, transport, _ = _setup()
+    sidecar = WorkspaceSidecar(tmp_path / "workspace")
+    workspace_transport = LocalWorkspaceRpcTransport(sidecar.dispatch)
+    provider = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=transport,
+        workspace_transport=workspace_transport,
+    )
+    _stage_input(provider, "launch-1", "launch.json", START_LAUNCH)
+    _stage_input(provider, "material-1", "material.json", START_MATERIAL)
     raw, metadata = _credential()
     provider.grant_credential("job-1", metadata, raw)
     request = _start()
-    _reserve_accepted_generation(store, request)
+    kube.secret_delete_failures = 1
+
+    with pytest.raises(CredentialDestroyFailedError):
+        provider.start_agent("job-1", request)
     current_name = next(
         name for name, item in kube.config_maps.items() if item["data"].get("kind") == "generation"
     )
     legacy_name = f"kcs-v2-generation-{hashlib.sha256(b'1').hexdigest()[:32]}"
     kube.config_maps[legacy_name] = kube.config_maps.pop(current_name)
     kube.config_maps[legacy_name]["metadata"]["name"] = legacy_name
-    kube.secret_delete_failures = 1
-
-    with pytest.raises(CredentialDestroyFailedError):
-        provider.start_agent("job-1", request)
     record = store.read_runtime("credential", "job-1", "grant-1")
     assert record is not None and record.values["cleanupTarget"] == "destroyed"
     failed = CredentialGrantSnapshot.model_validate_json(record.values["payload"])
     assert failed.state is CredentialState.DESTROY_FAILED
-    provider.reconcile_credentials()
+    provider = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=transport,
+        workspace_transport=LocalWorkspaceRpcTransport(sidecar.dispatch),
+    )
     deletes_after_absence_proof = kube.secret_deletes
 
     recovered = provider.start_agent("job-1", request)

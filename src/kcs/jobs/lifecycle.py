@@ -14,6 +14,15 @@ from .errors import DependencyUnavailableError, StateConflictError
 
 _SCHEMA_VERSION = 1
 _CAS_ATTEMPTS = 12
+_START_TRANSFER_EXCLUSIVE_KINDS = frozenset(
+    {
+        "agent-start",
+        "transfer-stage",
+        "transfer-reconcile",
+        "transfer-cancel",
+        "transfer-discard",
+    }
+)
 
 
 class _ClaimIntent(TypedDict):
@@ -119,9 +128,13 @@ class LifecycleGate:
             if payload["gate"] != "open":
                 raise StateConflictError("The Job lifecycle gate is closing")
             claims = list(payload["activeClaims"])
-            if kind not in {"transfer-collect", "workspace-invoke"} and any(
+            exclusive_conflict = kind in _START_TRANSFER_EXCLUSIVE_KINDS and any(
+                item["intent"]["kind"] in _START_TRANSFER_EXCLUSIVE_KINDS for item in claims
+            )
+            duplicate_conflict = kind not in {"transfer-collect", "workspace-invoke"} and any(
                 item["intent"]["kind"] == kind and item["intent"]["ref"] == ref for item in claims
-            ):
+            )
+            if exclusive_conflict or duplicate_conflict:
                 raise StateConflictError(
                     "The lifecycle mutation intent already has an active claim"
                 )

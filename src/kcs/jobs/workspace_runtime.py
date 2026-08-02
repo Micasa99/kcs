@@ -41,6 +41,7 @@ from .errors import (
     OperationIndeterminateError,
     OverwriteForbiddenError,
     PayloadTooLargeError,
+    PreconditionFailedError,
     StaleBindingError,
     StateConflictError,
     TransferBytesMismatchError,
@@ -61,7 +62,13 @@ class RuntimeStoreProtocol(Protocol):
 
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> object | None: ...
 
-    def list_runtime(self, kind: str, job_ref: str | None = None) -> Sequence[object]: ...
+    def list_runtime(
+        self,
+        kind: str,
+        job_ref: str | None = None,
+        *,
+        strict: bool = False,
+    ) -> Sequence[object]: ...
 
     def update_runtime(
         self, kind: str, job_ref: str, identity: str, values: Mapping[str, str]
@@ -119,6 +126,26 @@ class VerifiedContent:
         finally:
             if self.release_claim is not None:
                 self.release_claim()
+
+
+@dataclass(frozen=True, slots=True)
+class StartMaterialBinding:
+    """One immutable transfer identity retained privately with an agent generation."""
+
+    path: str
+    transfer_ref: str
+    request_digest: str
+    actual_size_bytes: int
+    actual_sha256: str
+
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "transferRef": self.transfer_ref,
+            "requestDigest": self.request_digest,
+            "actualSizeBytes": self.actual_size_bytes,
+            "actualSha256": self.actual_sha256,
+        }
 
 
 class WorkspaceRuntime:
@@ -311,6 +338,138 @@ class WorkspaceRuntime:
 
     def inspect_transfer(self, job_ref: str, transfer_ref: str) -> TransferSnapshot:
         return self._transfer_snapshot(self._transfer_record(job_ref, transfer_ref))
+
+    def resolve_start_material_bindings(
+        self,
+        job_ref: str,
+        binding: JobBindingSnapshot,
+        launch_path: str,
+        launch_size_bytes: int,
+        launch_digest: str,
+        material_paths: Sequence[str],
+    ) -> tuple[StartMaterialBinding, ...]:
+        """Resolve generation-unique staged paths before start has any side effects."""
+
+        paths = (launch_path, *material_paths)
+        if len({path.casefold() for path in paths}) != len(paths):
+            raise PreconditionFailedError()
+        try:
+            records = self._store.list_runtime("transfer", job_ref, strict=True)
+            snapshots = tuple(self._transfer_snapshot(record) for record in records)
+        except (DependencyUnavailableError, TypeError, ValueError) as error:
+            raise PreconditionFailedError() from error
+        return self._resolve_start_paths(
+            job_ref,
+            binding,
+            paths,
+            snapshots,
+            launch_size_bytes,
+            launch_digest,
+        )
+
+    def validate_start_material_bindings(
+        self,
+        job_ref: str,
+        binding: JobBindingSnapshot,
+        launch_path: str,
+        launch_size_bytes: int,
+        launch_digest: str,
+        material_paths: Sequence[str],
+        retained: Sequence[StartMaterialBinding],
+    ) -> None:
+        """Validate only the exact transfer identities retained by an accepted start."""
+
+        paths = (launch_path, *material_paths)
+        if len({path.casefold() for path in paths}) != len(paths) or len(retained) != len(paths):
+            raise PreconditionFailedError()
+        for index, (path, retained_binding) in enumerate(zip(paths, retained, strict=True)):
+            if retained_binding.path != path:
+                raise PreconditionFailedError()
+            record = self._store.read_runtime("transfer", job_ref, retained_binding.transfer_ref)
+            if record is None:
+                raise PreconditionFailedError()
+            snapshot = self._transfer_snapshot(record)
+            resolved = self._validated_start_binding(
+                job_ref,
+                binding,
+                path,
+                snapshot,
+                launch_size_bytes if index == 0 else None,
+                launch_digest if index == 0 else None,
+            )
+            if resolved != retained_binding:
+                raise PreconditionFailedError()
+
+    @staticmethod
+    def _resolve_start_paths(
+        job_ref: str,
+        binding: JobBindingSnapshot,
+        paths: Sequence[str],
+        snapshots: Sequence[TransferSnapshot],
+        launch_size_bytes: int,
+        launch_digest: str,
+    ) -> tuple[StartMaterialBinding, ...]:
+        by_path: dict[str, list[TransferSnapshot]] = {}
+        for snapshot in snapshots:
+            by_path.setdefault(snapshot.spec.path.casefold(), []).append(snapshot)
+        resolved: list[StartMaterialBinding] = []
+        for index, path in enumerate(paths):
+            history = by_path.get(path.casefold(), [])
+            if len(history) != 1:
+                raise PreconditionFailedError()
+            resolved.append(
+                WorkspaceRuntime._validated_start_binding(
+                    job_ref,
+                    binding,
+                    path,
+                    history[0],
+                    launch_size_bytes if index == 0 else None,
+                    launch_digest if index == 0 else None,
+                )
+            )
+        return tuple(resolved)
+
+    @staticmethod
+    def _validated_start_binding(
+        job_ref: str,
+        binding: JobBindingSnapshot,
+        path: str,
+        snapshot: TransferSnapshot,
+        expected_size_bytes: int | None,
+        expected_digest: str | None,
+    ) -> StartMaterialBinding:
+        actual_size = snapshot.actual_size_bytes
+        actual_digest = snapshot.actual_sha256
+        if (
+            snapshot.spec.path != path
+            or snapshot.spec.direction is not TransferDirection.STAGE_INPUT
+            or snapshot.job_ref != job_ref
+            or str(snapshot.job_uid) != str(binding.job_uid)
+            or str(snapshot.pod_uid) != str(_pod_uid(binding))
+            or snapshot.state is not TransferState.COMPLETED
+            or not snapshot.verified
+            or not snapshot.content_available
+            or actual_size is None
+            or actual_digest is None
+            or actual_size != snapshot.spec.declared_size_bytes
+            or not hmac.compare_digest(actual_digest, snapshot.spec.content_sha256)
+            or (
+                expected_size_bytes is not None
+                and (
+                    actual_size != expected_size_bytes
+                    or expected_digest is None
+                    or not hmac.compare_digest(actual_digest, expected_digest)
+                )
+            )
+        ):
+            raise PreconditionFailedError()
+        return StartMaterialBinding(
+            path=path,
+            transfer_ref=snapshot.transfer_ref,
+            request_digest=snapshot.request_digest,
+            actual_size_bytes=actual_size,
+            actual_sha256=actual_digest,
+        )
 
     def confirm_collect_delivery(
         self, job_ref: str, transfer_ref: str, snapshot_ref: str

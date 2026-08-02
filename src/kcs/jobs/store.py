@@ -453,7 +453,13 @@ class V2JobStore:
             raise DependencyUnavailableError("runtime record hash collision")
         return record
 
-    def list_runtime(self, kind: str, job_ref: str | None = None) -> list[RuntimeRecord]:
+    def list_runtime(
+        self,
+        kind: str,
+        job_ref: str | None = None,
+        *,
+        strict: bool = False,
+    ) -> list[RuntimeRecord]:
         selector = f"{RECORD_KIND_LABEL}=runtime-{kind}"
         if job_ref is not None:
             selector = f"{selector},{JOB_REF_HASH_LABEL}={_short_hash(job_ref)}"
@@ -461,8 +467,12 @@ class V2JobStore:
         for item in self._kube.list_config_maps(selector):
             try:
                 record = _runtime_record_from_config_map(item)
-            except (DependencyUnavailableError, ValueError, TypeError):
+            except (DependencyUnavailableError, ValueError, TypeError) as error:
                 self._scan_errors += 1
+                if strict:
+                    raise DependencyUnavailableError(
+                        "runtime record scan was incomplete"
+                    ) from error
                 continue
             if record.job_ref == job_ref or job_ref is None:
                 records.append(record)
