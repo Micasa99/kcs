@@ -655,7 +655,112 @@ class V2JobProvider:
             record = self._mark_indeterminate(record, replacement_reason)
 
         snapshot = self._snapshot(record, job, pods, replacement_reason=replacement_reason)
+        if replacement_reason is None and self._refresh_running_generation(snapshot):
+            snapshot = self._snapshot(
+                record,
+                job,
+                pods,
+                replacement_reason=replacement_reason,
+            )
         return self._deleting_snapshot(snapshot, record) if deleting else snapshot
+
+    def _refresh_running_generation(self, binding: JobBindingSnapshot) -> bool:
+        """Persist a terminal child observation exposed by the live supervisor.
+
+        A Kubernetes Job stays alive because both long-lived supervisors are
+        PID 1, so Pod phase cannot reveal that the hosted Work Agent child has
+        exited.  Refresh only the retained running generation and only through
+        the fixed, read-only supervisor inspection RPC.  This also reaps a
+        completed child instead of leaving it as a zombie under PID 1.
+        """
+
+        retained = binding.latest_agent_generation
+        inspect_supervisor = (
+            getattr(self._transport, "inspect_supervisor", None)
+            if self._transport is not None
+            else None
+        )
+        if (
+            retained is None
+            or retained.runner_state is not RunnerState.RUNNING
+            or binding.pod_uid is None
+            or not callable(inspect_supervisor)
+        ):
+            return False
+        observed = inspect_supervisor(
+            {
+                "jobRef": binding.job_ref,
+                "jobUid": str(binding.job_uid),
+                "podUid": str(binding.pod_uid),
+            },
+            "agent",
+        )
+        if (
+            observed.protocol_version != 1
+            or observed.generation != retained.generation
+            or observed.agent_run_ref != retained.agent_run_ref
+            or observed.launch_bundle_digest != retained.launch_bundle_digest
+            or observed.supervisor_alive is not True
+            or observed.state not in {"running", "exited"}
+        ):
+            raise StateConflictError(
+                "The supervisor inspection differs from the retained generation"
+            )
+        if observed.state == "running":
+            return False
+        if type(observed.exit_code) is not int:
+            raise StateConflictError(
+                "The terminal supervisor inspection has no integer exit code"
+            )
+        record = self._store.read_runtime(
+            "generation",
+            binding.job_ref,
+            str(retained.generation),
+        )
+        if record is None:
+            raise DependencyUnavailableError(
+                "The retained generation disappeared during inspection"
+            )
+        current = self._generation_snapshot(record, replayed=False)
+        if current.runner_state is RunnerState.EXITED:
+            return False
+        if current.runner_state is not RunnerState.RUNNING:
+            raise StateConflictError(
+                "The retained generation changed during supervisor inspection"
+            )
+        now = self._now()
+        terminal = current.model_copy(
+            update={
+                "runner_state": RunnerState.EXITED,
+                "supervisor_alive": True,
+                "pid": observed.pid,
+                "exit_code": observed.exit_code,
+                "finished_at": now,
+                "observed_at": now,
+            }
+        )
+        try:
+            self._cas_runtime_update(
+                record,
+                {"payload": terminal.model_dump_json(by_alias=True)},
+            )
+        except DependencyUnavailableError:
+            raced = self._store.read_runtime(
+                "generation",
+                binding.job_ref,
+                str(retained.generation),
+            )
+            if (
+                raced is not None
+                and self._generation_snapshot(
+                    raced,
+                    replayed=False,
+                ).runner_state
+                is RunnerState.EXITED
+            ):
+                return True
+            raise
+        return True
 
     def list_jobs(self, query: JobListQuery | None = None) -> JobBindingSnapshotList:
         """Return one stable-key-merge page over live bindings and tombstones."""

@@ -597,6 +597,82 @@ def test_generation_recovery_uses_retained_grant_and_never_claims_unproved_clean
     )
 
 
+def test_job_inspection_refreshes_a_completed_agent_child(tmp_path: Path) -> None:
+    kube, store, _transport, _ = _setup()
+    sidecar = WorkspaceSidecar(tmp_path / "workspace")
+
+    class _RunningThenExited(_Transport):
+        def __init__(self, kube: _Kube) -> None:
+            super().__init__(kube)
+            self.inspections = 0
+
+        def agent_rpc(
+            self,
+            binding: Mapping[str, str],
+            request: Mapping[str, object],
+        ) -> AgentRpcResponse:
+            response = super().agent_rpc(binding, request)
+            return AgentRpcResponse(
+                protocol_version=response.protocol_version,
+                generation=response.generation,
+                agent_run_ref=response.agent_run_ref,
+                launch_bundle_digest=response.launch_bundle_digest,
+                state="running",
+                supervisor_alive=True,
+                pid=71,
+                credential_grant_ref=response.credential_grant_ref,
+                audience=response.audience,
+                credential_sha256=response.credential_sha256,
+                credential_consumed=True,
+            )
+
+        def inspect_supervisor(
+            self,
+            binding: Mapping[str, str],
+            container: str,
+        ) -> AgentRpcResponse:
+            assert binding["podUid"] == str(POD_UID)
+            assert container == "agent"
+            self.inspections += 1
+            return AgentRpcResponse(
+                protocol_version=1,
+                generation=1,
+                agent_run_ref="run-1",
+                launch_bundle_digest=START_LAUNCH_DIGEST,
+                state="exited",
+                supervisor_alive=True,
+                pid=71,
+                exit_code=3,
+            )
+
+    transport = _RunningThenExited(kube)
+    provider = V2JobProvider(
+        kube,
+        store,
+        _Renderer(),
+        clock=lambda: NOW,
+        transport=transport,
+        workspace_transport=LocalWorkspaceRpcTransport(sidecar.dispatch),
+    )
+    _stage_input(provider, "launch-1", "launch.json", START_LAUNCH)
+    _stage_input(provider, "material-1", "material.json", START_MATERIAL)
+    raw, metadata = _credential()
+    provider.grant_credential("job-1", metadata, raw)
+
+    started = provider.start_agent("job-1", _start())
+    assert started.runner_state is RunnerState.RUNNING
+    observed = provider.inspect("job-1")
+
+    assert observed.latest_agent_generation is not None
+    assert observed.latest_agent_generation.runner_state is RunnerState.EXITED
+    assert observed.latest_agent_generation.exit_code == 3
+    assert transport.inspections == 1
+    assert provider.inspect("job-1").latest_agent_generation == (
+        observed.latest_agent_generation
+    )
+    assert transport.inspections == 1
+
+
 def test_finalize_drains_only_requested_records_and_recovers_lost_stop_phase() -> None:
     kube = _Kube()
     store = V2JobStore(kube, clock=lambda: NOW)
