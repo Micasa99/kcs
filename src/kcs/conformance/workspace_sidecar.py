@@ -691,9 +691,7 @@ class WorkspaceSidecar:
             elif action == "observeGpu":
                 action_result = observe_workspace_gpu()
             else:
-                runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL") or os.environ.get(
-                    "KCS_CONFORMANCE_RUNTIME_URL"
-                )
+                runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL")
                 action_result = probe_runtime_url(runtime_url)
             print(
                 json.dumps(action_result, sort_keys=True, separators=(",", ":")),

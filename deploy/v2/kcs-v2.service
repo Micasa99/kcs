@@ -6,7 +6,7 @@ Requires=k3s.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/kcs-v2/port-forward.env
-ExecStart=/bin/sh -ec 'test -n "$KCS_PORT_FORWARD_ADDRESS"; test "$KCS_PORT_FORWARD_ADDRESS" != "0.0.0.0"; test "$KCS_PORT_FORWARD_ADDRESS" != "::"; exec /usr/local/bin/k3s kubectl --namespace researchcosmos-v2 port-forward --address="$KCS_PORT_FORWARD_ADDRESS" service/kcs-v2-api 8443:443'
+ExecStart=/usr/local/libexec/kcs-v2-port-forward ${KCS_PORT_FORWARD_ADDRESS} ${KCS_CONTROL_PRIVATE_ADDRESS}
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true

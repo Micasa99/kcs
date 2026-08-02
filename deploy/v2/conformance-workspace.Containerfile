@@ -3,7 +3,10 @@ FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6d
 WORKDIR /build
 COPY LICENSE README.md pyproject.toml ./
 COPY src ./src
-RUN python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir=/wheels .
+RUN python -m pip install --disable-pip-version-check --no-cache-dir \
+      setuptools==80.9.0 wheel==0.45.1 \
+    && python -m pip wheel --disable-pip-version-check --no-build-isolation \
+      --no-deps --wheel-dir=/wheels .
 
 FROM --platform=linux/amd64 nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:828c4d878adcaa4265d80c95d8ec877149b49bb2419a4cf3bb6aa889bbb7ca2e
 ARG SOURCE_REVISION

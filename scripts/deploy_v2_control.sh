@@ -40,7 +40,11 @@ validate_exact_file() {
 
 validate_alias "$KCS_CONTROL_SSH_ALIAS"
 [[ $KCS_API_IMAGE =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
-  echo "KCS_API_IMAGE must be a digest-pinned image" >&2
+  echo "KCS_API_IMAGE must be a nonzero digest-pinned image" >&2
+  exit 2
+}
+[[ $KCS_API_IMAGE != *@sha256:0000000000000000000000000000000000000000000000000000000000000000 ]] || {
+  echo "KCS_API_IMAGE must be a nonzero digest-pinned image" >&2
   exit 2
 }
 [[ $KCS_K3S_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]] || {
@@ -55,11 +59,30 @@ python3 - <<'PY'
 import ipaddress
 import os
 
+SUPPORTED = tuple(ipaddress.ip_network(value) for value in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"
+))
+
+def supported_address(value: ipaddress._BaseAddress) -> bool:
+    return any(value.version == network.version and value in network for network in SUPPORTED)
+
 def address(name: str) -> ipaddress._BaseAddress:
     value = ipaddress.ip_address(os.environ[name])
-    if value.is_global or value.is_loopback or value.is_unspecified or value.is_link_local:
+    if any((value.is_global, value.is_loopback, value.is_unspecified, value.is_link_local,
+            value.is_multicast, value.is_reserved)) or not supported_address(value):
         raise SystemExit(f"{name} must be a nonpublic routed address")
     return value
+
+def unsafe_network(value: ipaddress._BaseNetwork) -> bool:
+    endpoints = (value.network_address, value.broadcast_address)
+    return not any(
+        value.version == network.version and value.subnet_of(network) for network in SUPPORTED
+    ) or any((value.is_global, value.is_loopback, value.is_unspecified, value.is_link_local,
+                value.is_multicast, value.is_reserved)) or any(
+        any((item.is_global, item.is_loopback, item.is_unspecified, item.is_link_local,
+             item.is_multicast, item.is_reserved))
+        for item in endpoints
+    )
 
 control = address("KCS_CONTROL_PRIVATE_ADDRESS")
 worker = address("KCS_WORKER_PRIVATE_ADDRESS")
@@ -67,7 +90,7 @@ forward = address("KCS_PORT_FORWARD_ADDRESS")
 if forward != control:
     raise SystemExit("KCS_PORT_FORWARD_ADDRESS must be the control private address")
 networks = [ipaddress.ip_network(value.strip()) for value in os.environ["KCS_ALLOWED_PEER_CIDRS"].split(",")]
-if not networks or any(net.is_global or net.is_loopback for net in networks):
+if not networks or any(unsafe_network(net) for net in networks):
     raise SystemExit("KCS_ALLOWED_PEER_CIDRS must contain only nonpublic peer CIDRs")
 if not any(control in net for net in networks) or not any(worker in net for net in networks):
     raise SystemExit("allowed peer CIDRs must contain both dedicated hosts")
@@ -84,7 +107,9 @@ except ValueError:
     ):
         raise SystemExit("KCS_TLS_SAN must be a valid DNS name or IP address")
 else:
-    if san_address.is_global or san_address.is_loopback or san_address.is_unspecified:
+    if any((san_address.is_global, san_address.is_loopback, san_address.is_unspecified,
+            san_address.is_link_local, san_address.is_multicast, san_address.is_reserved)) \
+            or not supported_address(san_address):
         raise SystemExit("an IP KCS_TLS_SAN must be nonpublic and non-loopback")
 PY
 
@@ -118,6 +143,45 @@ ip -o address show | grep -F -- " $control_address/" >/dev/null || {
 }
 interface=$(ip route get "$worker_address" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
 [[ -n $interface ]] || { echo "no private/overlay route to worker" >&2; exit 1; }
+[[ $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || { echo "private/overlay interface is invalid" >&2; exit 1; }
+
+validate_control_node() {
+  k3s kubectl get nodes -l researchcosmos.io/role=control -o json 2>/dev/null | python3 -c '
+import json, sys
+expected = sys.argv[1]
+items = json.load(sys.stdin).get("items", [])
+raise SystemExit(0 if any(
+    any(address.get("type") == "InternalIP" and address.get("address") == expected
+        for address in item.get("status", {}).get("addresses", []))
+    for item in items
+) else 1)
+' "$control_address"
+}
+
+validate_k3s_install() {
+  local installed_version effective_exec required
+  installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
+  [[ $installed_version == "$k3s_version" ]] || return 1
+  effective_exec=$(systemctl show --property=ExecStart --value k3s 2>/dev/null) || return 1
+  [[ $effective_exec == *"/usr/local/bin/k3s server "* ]] || return 1
+  for required in \
+    "--bind-address=$control_address" \
+    "--advertise-address=$control_address" \
+    "--node-ip=$control_address" \
+    "--tls-san=$tls_san" \
+    "--node-label=researchcosmos.io/role=control" \
+    "--flannel-iface=$interface" \
+    "--kubelet-arg=address=$control_address"; do
+    [[ $effective_exec == *"$required "* ]] || return 1
+  done
+  if systemctl is-active --quiet k3s && ! validate_control_node; then
+    return 1
+  fi
+}
+if command -v k3s >/dev/null && ! validate_k3s_install; then
+  echo "existing k3s version or private service configuration mismatch" >&2
+  exit 1
+fi
 
 for unit in ${legacy_units//,/ }; do
   [[ $unit =~ ^[A-Za-z0-9_.@-]+$ ]] || { echo "invalid legacy debug unit" >&2; exit 1; }
@@ -133,7 +197,15 @@ if ! command -v k3s >/dev/null; then
     INSTALL_K3S_EXEC="server --bind-address=$control_address --advertise-address=$control_address --node-ip=$control_address --tls-san=$tls_san --node-label=researchcosmos.io/role=control --flannel-iface=$interface --kubelet-arg=address=$control_address" sh -
 fi
 systemctl enable --now k3s >/dev/null
+if ! validate_k3s_install; then
+  echo "started k3s version or private service configuration mismatch" >&2
+  exit 1
+fi
 k3s kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null
+if ! validate_control_node; then
+  echo "started k3s control role or private node address mismatch" >&2
+  exit 1
+fi
 validate_listener() {
   local endpoint=$1
   local allowed_address=$2
@@ -213,9 +285,20 @@ REMOTE
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo tee /etc/systemd/system/kcs-v2.service \
   <"$ROOT/deploy/v2/kcs-v2.service" >/dev/null
-printf 'KCS_PORT_FORWARD_ADDRESS=%s\n' "$KCS_PORT_FORWARD_ADDRESS" | \
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  'sudo install -d -m 0755 /usr/local/libexec && sudo tee /usr/local/libexec/kcs-v2-port-forward >/dev/null && sudo chmod 0755 /usr/local/libexec/kcs-v2-port-forward' \
+  <"$ROOT/deploy/v2/kcs-v2-port-forward.py"
+printf 'KCS_PORT_FORWARD_ADDRESS=%s\nKCS_CONTROL_PRIVATE_ADDRESS=%s\n' \
+  "$KCS_PORT_FORWARD_ADDRESS" "$KCS_CONTROL_PRIVATE_ADDRESS" | \
   ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
     'sudo install -d -m 0750 /etc/kcs-v2 && sudo tee /etc/kcs-v2/port-forward.env >/dev/null'
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   'sudo systemctl daemon-reload && sudo systemctl enable --now kcs-v2.service >/dev/null && sudo k3s kubectl -n researchcosmos-v2 rollout status deployment/kcs-v2-api --timeout=180s'
-printf '{"event":"control_deployment","ok":true}\n'
+observed_k3s_version=$(ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s --version 2>/dev/null | awk 'NR == 1 {print \$3}'")
+[[ $observed_k3s_version == "$KCS_K3S_VERSION" ]] || {
+  echo "observed control k3s version mismatch" >&2
+  exit 1
+}
+printf '{"event":"control_deployment","observedK3sVersion":"%s","ok":true,"requestedK3sVersion":"%s"}\n' \
+  "$observed_k3s_version" "$KCS_K3S_VERSION"

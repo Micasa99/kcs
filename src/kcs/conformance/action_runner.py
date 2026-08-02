@@ -18,9 +18,7 @@ def main() -> None:
     value: Any = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("conformance action frame must be an object")
-    runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL") or os.environ.get(
-        "KCS_CONFORMANCE_RUNTIME_URL"
-    )
+    runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL")
     result = run_agent_action(
         Path(os.environ.get("KCS_WORKSPACE", "/workspace")), value, runtime_url
     )

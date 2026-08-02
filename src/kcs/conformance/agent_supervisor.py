@@ -161,9 +161,7 @@ def serve(socket_path: Path, credential_path: Path, workspace: Path = Path("/wor
                 if action == "probeRuntimeUrl" and _direct_action(
                     request, {"protocolVersion", "action"}
                 ):
-                    runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL") or os.environ.get(
-                        "KCS_CONFORMANCE_RUNTIME_URL"
-                    )
+                    runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL")
                     _send_event(connection, probe_runtime_url(runtime_url))
                     continue
                 if request.get("action") == "shutdown":

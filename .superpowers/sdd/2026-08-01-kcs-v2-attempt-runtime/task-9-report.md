@@ -9,6 +9,9 @@ Branch: `codex/kcs-v2-attempt-runtime`
 Requested implementation commit subject:
 `build(v2): package dedicated runtime deployment`
 
+Review-fix commit subject:
+`fix(v2): harden dedicated runtime deployment`
+
 Author/committer: `zhangbo <226653803@qq.com>`
 
 Task 9 packages the existing V2 provider without deploying it:
@@ -27,8 +30,9 @@ Task 9 packages the existing V2 provider without deploying it:
   `rpc` stdin/stdout path. The allowlist covers bidirectional fixed shared-file
   probes/digests, real workspace `nvidia-smi`, agent no-device observation,
   and `RC_PUBLIC_RUNTIME_BASE_URL` reachability. The probe rejects loopback,
-  unspecified, link-local, multicast, and reserved resolutions and never
-  follows redirects. Events are
+  unspecified, link-local, multicast, and reserved resolutions, connects
+  directly to a validated address while preserving Host/TLS SNI, and never
+  re-resolves, proxies, or follows redirects. Events are
   sanitized compact JSON lines; there is no shell or caller-selected command,
   path, content, URL, or result;
 - the API is a one-replica `Recreate` Kubernetes Deployment on the control
@@ -42,14 +46,18 @@ Task 9 packages the existing V2 provider without deploying it:
   pool. The worker script installs an explicitly pinned toolkit package,
   configures the NVIDIA containerd runtime as default, labels the GPU node,
   and applies that plugin;
-- control/worker scripts require explicit SSH-config aliases, nonpublic
+- control/worker scripts require explicit SSH-config aliases, supported
   addresses/CIDRs, pinned versions, exact no-newline token files, and have no
   host/user/key or local fallback. `--check` validates only. Real deploy paths
   bind k3s/kubelet to private addresses, reject IPv4/IPv6/star wildcard
   listeners plus any other-address TCP 6443/10250 or UDP 8472 listener, verify TLS SAN material, stop named V1 debug units, and reject
   the named legacy ServiceAccount in V2/cluster-wide bindings;
-- `kcs-v2.service` only port-forwards the TLS ClusterIP Service to the explicit
-  nonpublic address. Runtime secrets/config/evidence are ignored. Docs call
+- existing k3s fails closed unless exact requested version, effective private
+  service arguments, interface, node identity, and role match; live control and
+  worker node addresses/labels are verified after start;
+- `kcs-v2.service` invokes an installed narrow wrapper that validates an exact
+  RFC1918/CGNAT/ULA control bind and execs only the fixed TLS ClusterIP Service
+  port-forward. Runtime secrets/config/evidence are ignored. Docs call
   the existing Journey an early smoke and reserve full P6 evidence for Task 10.
 
 No SSH, remote mutation, deployment, local KCS, local k3s, or Kubernetes
@@ -76,7 +84,7 @@ Fixed conformance runtime:
 Deployment/docs:
 
 - `deploy/v2/namespace.yaml`, `kcs-api.yaml`, `config.example.yaml`,
-  `kcs-v2.service`, and `nvidia-device-plugin.yaml`;
+  `kcs-v2.service`, `kcs-v2-port-forward.py`, and `nvidia-device-plugin.yaml`;
 - existing `deploy/v2/rbac.yaml` and `network-policy.yaml` were preserved;
 - `scripts/deploy_v2_control.sh`, `scripts/deploy_v2_worker.sh`;
 - `.gitignore`, `README.md`, `docs/v2-hosted-attempt-api.md`;
@@ -96,16 +104,29 @@ ModuleNotFoundError: No module named 'kcs.openapi'
 The failure was the intended missing installed-package resource, not a test
 syntax/setup error. The final focused command is green:
 
+Review fix round 1 first tightened the same single Journey. Its RED was the
+floating build backend:
+
+```text
+assert ['setuptools>=68.0', 'wheel'] ==
+       ['setuptools==80.9.0', 'wheel==0.45.1']
+1 failed in 0.04s
+```
+
+A mutation check removing CGNAT from the supported topology then failed the
+Journey at the real control `--check` subprocess before support was restored.
+No additional test file was added.
+
 ```text
 .venv/bin/pytest -q -s tests/deploy/test_task9_packaging_journey.py
-1 passed in 0.40s
+1 passed in 0.54s
 ```
 
 ## Raw focused Journey events and interpretation
 
 ```jsonl
 {"event":"canonical_package_resource","sha256":"efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e"}
-{"event":"api_manifest_contract","image":"registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+{"event":"api_manifest_contract","imageState":"non_runnable_placeholder"}
 {"event":"oci_inputs_pinned","runtime_requirements":49}
 {"event":"shared_agent_to_workspace","sha256":"913a1506a91d42b2486c28eb56358718859ba4732231f22452f74404c1d9cd55"}
 {"event":"shared_workspace_to_agent","sha256":"043387c384035d7976448577990a75406a512aa0aefab7a5ee1cee685a5d2c59"}
@@ -119,7 +140,10 @@ syntax/setup error. The final focused command is green:
 The lines were read manually. The canonical digest is the frozen expected
 value. The two different shared-probe digests round-trip in opposite
 directions through the same real directory. The local agent truthfully sees
-no NVIDIA device. The workspace does not fake GPU success: because this Mac is
+no NVIDIA device. The API manifest event explicitly classifies the committed
+all-zero image as a non-runnable placeholder; the deploy gate rejects it and the
+positive check uses a distinct nonzero synthetic digest. The workspace does not
+fake GPU success: because this Mac is
 not a formal GPU host and has no `nvidia-smi`, it returns the fixed
 `GPU_UNAVAILABLE` observation. The unsafe loopback URL is rejected before connection;
 Task 10 must prove a real non-loopback success. Both script checks emitted one
@@ -129,20 +153,22 @@ success event without entering SSH.
 
 - `bash -n scripts/deploy_v2_control.sh scripts/deploy_v2_worker.sh`: pass.
 - `shellcheck`: unavailable on this machine; no result claimed.
-- `.venv/bin/python -m build`: pass; clean wheel and sdist produced, and the
-  wheel contains the package OpenAPI resource and fixed entrypoints.
+- `.venv/bin/python -m build`: pass; the isolated build log installed exactly
+  `setuptools==80.9.0` and `wheel==0.45.1`; clean wheel and sdist produced, and
+  the wheel contains the package OpenAPI resource and fixed entrypoints.
 - isolated temporary Python 3.12 environment, wheel installed with
   `--no-deps`: package resource smoke passed with
   `sha256=efcbb64f...09e193e`, `bytes=103962`; installed fixed action runner
-  returned the actual local no-GPU JSON line.
+  returned the actual local no-GPU JSON line. The repeated fix-round smoke
+  emitted `isolated_wheel_smoke` with `openapiBytes=103962` and the exact digest.
 - scoped Ruff lint and format check over all changed Python/test files: pass.
-- scoped strict Mypy over the five changed conformance/route source modules:
+- scoped strict Mypy over the five touched runtime/wrapper source modules:
   `Success: no issues found in 5 source files`.
 - `py_compile` over all changed Python/runtime/test entrypoints: pass.
 - `.venv/bin/python scripts/generate_v2_openapi_artifacts.py --check`: pass;
   `validated 31 route exchanges`, canonical SHA-256 exactly
   `efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e`.
-- relevant Task 5–8 regressions: `12 passed, 1 warning in 1.34s`. The warning
+- relevant Task 5–8 regressions: `12 passed, 1 warning in 1.25s`. The warning
   is the inherited Starlette TestClient/httpx deprecation.
 - `git diff --check`: pass.
 
@@ -191,6 +217,11 @@ evidence.
   from the distribution repository during build; that layer is not claimed
   bit-for-bit reproducible. The NVIDIA toolkit installed on the worker is
   explicitly version-pinned.
+- Python build-backend versions are exact and Containerfiles build with
+  `--no-build-isolation`, but `pip` still downloads those artifacts from the
+  configured online index without committed hashes or an offline wheelhouse.
+  Repository trust and artifact integrity for those downloads remain a publisher
+  boundary; this task does not claim an offline reproducible build.
 - The deployment scripts require an already configured secure SSH alias and an
   NVIDIA package repository capable of serving the exact requested toolkit
   version. They intentionally fail instead of guessing a host, user, key,

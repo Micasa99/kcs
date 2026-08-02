@@ -52,12 +52,33 @@ python3 - <<'PY'
 import ipaddress
 import os
 
+SUPPORTED = tuple(ipaddress.ip_network(value) for value in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"
+))
+
+def supported_address(value: ipaddress._BaseAddress) -> bool:
+    return any(value.version == network.version and value in network for network in SUPPORTED)
+
 control = ipaddress.ip_address(os.environ["KCS_CONTROL_PRIVATE_ADDRESS"])
 worker = ipaddress.ip_address(os.environ["KCS_WORKER_PRIVATE_ADDRESS"])
-if any(value.is_global or value.is_loopback or value.is_unspecified or value.is_link_local for value in (control, worker)):
+if any(any((value.is_global, value.is_loopback, value.is_unspecified, value.is_link_local,
+            value.is_multicast, value.is_reserved)) or not supported_address(value)
+       for value in (control, worker)):
     raise SystemExit("dedicated host addresses must be nonpublic routed addresses")
+
+def unsafe_network(value: ipaddress._BaseNetwork) -> bool:
+    endpoints = (value.network_address, value.broadcast_address)
+    return not any(
+        value.version == network.version and value.subnet_of(network) for network in SUPPORTED
+    ) or any((value.is_global, value.is_loopback, value.is_unspecified, value.is_link_local,
+                value.is_multicast, value.is_reserved)) or any(
+        any((item.is_global, item.is_loopback, item.is_unspecified, item.is_link_local,
+             item.is_multicast, item.is_reserved))
+        for item in endpoints
+    )
+
 networks = [ipaddress.ip_network(value.strip()) for value in os.environ["KCS_ALLOWED_PEER_CIDRS"].split(",")]
-if not networks or any(net.is_global or net.is_loopback for net in networks):
+if not networks or any(unsafe_network(net) for net in networks):
     raise SystemExit("allowed peer CIDRs must contain only nonpublic peer CIDRs")
 if not any(control in net for net in networks) or not any(worker in net for net in networks):
     raise SystemExit("allowed peer CIDRs must contain both dedicated hosts")
@@ -100,6 +121,28 @@ ip -o address show | grep -F -- " $worker_address/" >/dev/null || {
 }
 interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
 [[ -n $interface ]] || { echo "no private/overlay route to control" >&2; exit 1; }
+[[ $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || { echo "private/overlay interface is invalid" >&2; exit 1; }
+
+validate_k3s_install() {
+  local installed_version effective_exec required
+  installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
+  [[ $installed_version == "$k3s_version" ]] || return 1
+  effective_exec=$(systemctl show --property=ExecStart --value k3s-agent 2>/dev/null) || return 1
+  [[ $effective_exec == *"/usr/local/bin/k3s agent "* ]] || return 1
+  for required in \
+    "--server=https://$control_address:6443" \
+    "--node-name=$node_name" \
+    "--node-ip=$worker_address" \
+    "--flannel-iface=$interface" \
+    "--kubelet-arg=address=$worker_address"; do
+    [[ $effective_exec == *"$required "* ]] || return 1
+  done
+}
+if command -v k3s >/dev/null && ! validate_k3s_install; then
+  echo "existing k3s version or private service configuration mismatch" >&2
+  exit 1
+fi
+
 command -v nvidia-smi >/dev/null
 nvidia-smi >/dev/null
 installed_toolkit=$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)
@@ -113,12 +156,16 @@ if ! command -v k3s >/dev/null; then
   token=$(cat "$token_path")
   curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
     K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="agent --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address" sh -
+    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address" sh -
 fi
 nvidia-ctk runtime configure --runtime=containerd \
   --config=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl --set-as-default
 systemctl enable --now k3s-agent >/dev/null
 systemctl restart k3s-agent
+if ! validate_k3s_install; then
+  echo "started k3s version or private service configuration mismatch" >&2
+  exit 1
+fi
 validate_listener() {
   local endpoint=$1
   local allowed_address=$2
@@ -156,4 +203,26 @@ ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
   <"$ROOT/deploy/v2/nvidia-device-plugin.yaml" >/dev/null
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl wait --for=condition=Ready node/'$KCS_WORKER_NODE_NAME' --timeout=180s >/dev/null"
-printf '{"event":"worker_deployment","ok":true}\n'
+if ! ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl get node '$KCS_WORKER_NODE_NAME' -o json" | python3 -c '
+import json, sys
+expected_address = sys.argv[1]
+node = json.load(sys.stdin)
+labels = node.get("metadata", {}).get("labels", {})
+addresses = node.get("status", {}).get("addresses", [])
+raise SystemExit(0 if labels.get("researchcosmos.io/pool") == "gpu" and any(
+    item.get("type") == "InternalIP" and item.get("address") == expected_address
+    for item in addresses
+) else 1)
+' "$KCS_WORKER_PRIVATE_ADDRESS"; then
+  echo "started worker node identity, private address, or GPU label mismatch" >&2
+  exit 1
+fi
+observed_k3s_version=$(ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+  "sudo k3s --version 2>/dev/null | awk 'NR == 1 {print \$3}'")
+[[ $observed_k3s_version == "$KCS_K3S_VERSION" ]] || {
+  echo "observed worker k3s version mismatch" >&2
+  exit 1
+}
+printf '{"event":"worker_deployment","observedK3sVersion":"%s","ok":true,"requestedK3sVersion":"%s"}\n' \
+  "$observed_k3s_version" "$KCS_K3S_VERSION"

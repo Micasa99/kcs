@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import ipaddress
 import os
 import socket
+import ssl
 import subprocess
-import urllib.error
-import urllib.request
 from collections.abc import Mapping
-from http.client import HTTPMessage
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 from urllib.parse import urlsplit
 
 _SHARED_BYTES = {
@@ -21,20 +20,17 @@ _SHARED_BYTES = {
 }
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Return the first HTTP redirect instead of following an unvalidated hop."""
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """TLS connection whose transport address cannot be DNS-rebound."""
 
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: HTTPMessage,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        del req, fp, code, msg, headers, newurl
-        return None
+    def __init__(self, hostname: str, address: str, port: int) -> None:
+        self._tls_context = ssl.create_default_context()
+        super().__init__(hostname, port=port, timeout=10, context=self._tls_context)
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        transport = socket.create_connection((self._pinned_address, self.port), self.timeout)
+        self.sock = self._tls_context.wrap_socket(transport, server_hostname=self.host)
 
 
 def _unsafe_runtime_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -49,6 +45,34 @@ def _unsafe_runtime_address(address: ipaddress.IPv4Address | ipaddress.IPv6Addre
             address.is_reserved,
         )
     )
+
+
+def _runtime_host_header(hostname: str, port: int, scheme: str) -> str:
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 443 if scheme == "https" else 80
+    return host if port == default_port else f"{host}:{port}"
+
+
+def _head_runtime_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    hostname: str,
+    port: int,
+    scheme: str,
+    path: str,
+) -> int:
+    connection: http.client.HTTPConnection
+    if scheme == "https":
+        connection = _PinnedHTTPSConnection(hostname, str(address), port)
+    else:
+        connection = http.client.HTTPConnection(str(address), port=port, timeout=10)
+    try:
+        connection.putrequest("HEAD", path, skip_host=True, skip_accept_encoding=True)
+        connection.putheader("Host", _runtime_host_header(hostname, port, scheme))
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        return connection.getresponse().status
+    finally:
+        connection.close()
 
 
 def shared_write(workspace: Path, role: str) -> dict[str, object]:
@@ -132,7 +156,7 @@ def observe_workspace_gpu() -> dict[str, object]:
 
 
 def probe_runtime_url(raw_url: str | None) -> dict[str, object]:
-    """Reach one safe resolved runtime URL without following redirects."""
+    """Reach one already-resolved runtime address without DNS re-resolution."""
     if not raw_url:
         return _error("RUNTIME_URL_REQUIRED", "runtime_url_observation")
     parsed = urlsplit(raw_url)
@@ -141,11 +165,12 @@ def probe_runtime_url(raw_url: str | None) -> dict[str, object]:
     if parsed.password or parsed.query or parsed.fragment:
         return _error("INVALID_RUNTIME_URL", "runtime_url_observation")
     try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         addresses = {
             ipaddress.ip_address(item[4][0])
             for item in socket.getaddrinfo(
                 parsed.hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
+                port,
                 type=socket.SOCK_STREAM,
             )
         }
@@ -153,14 +178,20 @@ def probe_runtime_url(raw_url: str | None) -> dict[str, object]:
         return _error("RUNTIME_UNREACHABLE", "runtime_url_observation")
     if any(_unsafe_runtime_address(address) for address in addresses):
         return _error("LOOPBACK_RUNTIME_URL", "runtime_url_observation")
-    request = urllib.request.Request(raw_url, method="HEAD")
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    try:
-        with opener.open(request, timeout=10) as response:
-            status = response.status
-    except urllib.error.HTTPError as error:
-        status = error.code
-    except (OSError, urllib.error.URLError):
+    status = None
+    for address in sorted(addresses, key=lambda item: (item.version, int(item))):
+        try:
+            status = _head_runtime_address(
+                address,
+                parsed.hostname,
+                port,
+                parsed.scheme,
+                parsed.path or "/",
+            )
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            continue
+        break
+    if status is None:
         return _error("RUNTIME_UNREACHABLE", "runtime_url_observation")
     return {
         "event": "runtime_url_observation",

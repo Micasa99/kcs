@@ -616,8 +616,11 @@ and fixed bytes; callers cannot supply a command, path, or content. GPU observat
 executes the exact `nvidia-smi --query-gpu=uuid,name --format=csv,noheader` command
 and reports only count plus output digest. Runtime reachability reads
 `RC_PUBLIC_RUNTIME_BASE_URL`, rejects loopback, unspecified, link-local, multicast,
-and reserved destinations, never follows redirects, and reports
-only scheme/status. Every fixture event is one sanitized compact JSON line.
+and reserved resolutions, then connects directly to one validated address in stable
+order. HTTP preserves the original Host header; HTTPS additionally preserves the
+original SNI/certificate hostname. The fixed HEAD probe performs no proxy lookup or
+second DNS resolution, never follows redirects, and reports only scheme/status.
+Every fixture event is one sanitized compact JSON line.
 
 ## Dedicated two-host deployment assets
 
@@ -627,10 +630,12 @@ readiness/liveness probes, a bounded TMPDIR `emptyDir`, and ephemeral-storage
 requests/limits. Its Service is TLS-only ClusterIP. Attempt Jobs retain only the
 closed GPU worker selector; neither role receives a service token.
 
-The root and conformance Containerfiles are fixed to linux/amd64 digest-pinned bases
-and carry source revision/license labels. `deploy/v2/nvidia-device-plugin.yaml` pins
+The root and conformance Containerfiles are fixed to linux/amd64 digest-pinned bases,
+pin `setuptools==80.9.0` and `wheel==0.45.1`, build with `--no-build-isolation`, and
+carry source revision/license labels. `deploy/v2/nvidia-device-plugin.yaml` pins
 the linux/amd64 v0.19.0 device-plugin manifest digest. Rendered API and workload
-images must always be `name@sha256:<64 lowercase hex>`.
+images must always be `name@sha256:<64 lowercase hex>`; deploy validation rejects
+the committed all-zero placeholder digest.
 
 The deployment scripts require explicit SSH-config aliases, private/overlay host
 addresses, allowed peer CIDRs, pinned k3s version, TLS SAN/material, and exact token
@@ -641,7 +646,13 @@ host, user, or identity-file default. k3s and kubelet bind to the declared nonpu
 addresses, and the selected flannel interface must route between those addresses;
 k3s, kubelet, and VXLAN listeners are rejected unless bound to loopback or the
 declared role address. `allowedPeerCidrs` is validated topology input; these scripts
-do not rewrite the host firewall. Task 10 must verify that the operator-managed
+reject global/public, loopback, unspecified, link-local, multicast, and reserved
+networks. Every declared host and network must be wholly inside IPv4 RFC1918, CGNAT
+`100.64.0.0/10`, or IPv6 ULA `fc00::/7`, and the peer networks must contain both
+declared hosts. Existing k3s is accepted only if its exact version and effective
+private server/agent ExecStart flags, interface, node identity, and control role
+match; mismatches fail closed, and the same sanitized checks run after start. These
+scripts do not rewrite the host firewall. Task 10 must verify that the operator-managed
 firewall/overlay admits only those peers and denies all public paths.
 The exact `nvidia-container-toolkit` package version must be available from an
 already configured trusted NVIDIA apt repository. Both nodes must already reach and
@@ -649,9 +660,10 @@ authenticate to the immutable image registry; a private registry requires the
 operator's node-level k3s `registries.yaml`. Task 10 proves actual digest-pinned pulls.
 
 The TLS certificate must include `KCS_TLS_SAN`; callers use the operator-provided CA.
-The V2 API image runs only inside the Deployment. `kcs-v2.service` exposes only a
-port-forward of the TLS ClusterIP Service on the explicit nonpublic control address;
-it rejects wildcard binding. Runtime config, Secrets, topology, tokens, and evidence
+The V2 API image runs only inside the Deployment. `kcs-v2.service` invokes an
+installed narrow wrapper that rejects public, wildcard, loopback, unspecified,
+link-local, multicast, reserved, and non-control binds before execing only the fixed
+TLS ClusterIP Service port-forward. Runtime config, Secrets, topology, tokens, and evidence
 remain untracked, and KCS receives no model-provider key.
 
 `scripts/run_v2_attempt_journey.py` remains an early smoke only. Task 10 expands it

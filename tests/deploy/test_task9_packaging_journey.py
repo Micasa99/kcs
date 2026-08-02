@@ -12,12 +12,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SHA256 = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
+ZERO_DIGEST_IMAGE = (
+    "registry.example.invalid/researchcosmos/kcs-api@sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+SYNTHETIC_API_IMAGE = (
+    "registry.example.invalid/researchcosmos/kcs-api@sha256:"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+)
 
 
 def _documents(path: str) -> list[dict[str, object]]:
@@ -120,6 +129,8 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     assert pod["automountServiceAccountToken"] is True
     container = pod["containers"][0]
     assert SHA256.fullmatch(container["image"])
+    assert container["image"] == ZERO_DIGEST_IMAGE
+    assert container["image"] != SYNTHETIC_API_IMAGE
     assert container["env"] and container["volumeMounts"]
     assert container["startupProbe"]["httpGet"]["scheme"] == "HTTPS"
     assert container["readinessProbe"]["httpGet"]["scheme"] == "HTTPS"
@@ -129,7 +140,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     assert {volume["name"] for volume in pod["volumes"]} == {"tls", "tmp"}
     assert service["spec"]["type"] == "ClusterIP"
     assert service["spec"]["ports"] == [{"name": "https", "port": 443, "targetPort": "https"}]
-    events.append({"event": "api_manifest_contract", "image": container["image"]})
+    events.append({"event": "api_manifest_contract", "imageState": "non_runnable_placeholder"})
 
     plugin = _documents("deploy/v2/nvidia-device-plugin.yaml")
     daemonset = next(item for item in plugin if item["kind"] == "DaemonSet")
@@ -154,12 +165,16 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         )
         assert "org.opencontainers.image.revision" in text
         assert 'org.opencontainers.image.licenses="MIT"' in text
+        assert "setuptools==80.9.0" in text and "wheel==0.45.1" in text
+        assert "--no-build-isolation" in text
     requirements = [
         line
         for line in (ROOT / "requirements.lock").read_text().splitlines()
         if line and not line.startswith("#")
     ]
     assert requirements and all("==" in line for line in requirements)
+    build_system = tomllib.loads((ROOT / "pyproject.toml").read_text())["build-system"]
+    assert build_system["requires"] == ["setuptools==80.9.0", "wheel==0.45.1"]
     events.append({"event": "oci_inputs_pinned", "runtime_requirements": len(requirements)})
 
     workspace = tmp_path / "workspace"
@@ -252,7 +267,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         "KCS_TLS_SAN": "kcs-v2.internal.example",
         "KCS_K3S_VERSION": "v1.33.3+k3s1",
         "KCS_NVIDIA_TOOLKIT_VERSION": "1.17.8-1",
-        "KCS_API_IMAGE": container["image"],
+        "KCS_API_IMAGE": SYNTHETIC_API_IMAGE,
         "KCS_TLS_CERT_FILE": str(cert),
         "KCS_TLS_KEY_FILE": str(key),
         "KCS_SERVICE_TOKEN_FILE": str(token),
@@ -272,6 +287,57 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         check_event = json.loads(result.stdout.strip())
         assert check_event == {"event": "deployment_check", "ok": True, "script": Path(script).stem}
         events.append(check_event)
+
+        unsafe_cidr_environment = {
+            **deploy_environment,
+            "KCS_ALLOWED_PEER_CIDRS": "10.77.0.0/24,169.254.0.0/16",
+        }
+        unsafe_cidr = subprocess.run(
+            ["bash", str(ROOT / script), "--check"],
+            capture_output=True,
+            text=True,
+            env=unsafe_cidr_environment,
+        )
+        assert unsafe_cidr.returncode != 0
+        assert "nonpublic peer CIDRs" in unsafe_cidr.stderr
+
+        cgnat_environment = {
+            **deploy_environment,
+            "KCS_CONTROL_PRIVATE_ADDRESS": "100.64.7.10",
+            "KCS_WORKER_PRIVATE_ADDRESS": "100.64.7.20",
+            "KCS_ALLOWED_PEER_CIDRS": "100.64.7.0/24",
+            "KCS_PORT_FORWARD_ADDRESS": "100.64.7.10",
+        }
+        cgnat = subprocess.run(
+            ["bash", str(ROOT / script), "--check"],
+            capture_output=True,
+            text=True,
+            env=cgnat_environment,
+            check=True,
+        )
+        assert json.loads(cgnat.stdout) == {
+            "event": "deployment_check",
+            "ok": True,
+            "script": Path(script).stem,
+        }
+
+    zero_digest = subprocess.run(
+        ["bash", str(ROOT / "scripts/deploy_v2_control.sh"), "--check"],
+        capture_output=True,
+        text=True,
+        env={**deploy_environment, "KCS_API_IMAGE": ZERO_DIGEST_IMAGE},
+    )
+    assert zero_digest.returncode == 2
+    assert "nonzero digest-pinned image" in zero_digest.stderr
+
+    bind_validator = ROOT / "deploy/v2/kcs-v2-port-forward.py"
+    public_bind = subprocess.run(
+        [sys.executable, str(bind_validator), "8.8.8.8", "8.8.8.8"],
+        capture_output=True,
+        text=True,
+    )
+    assert public_bind.returncode == 2
+    assert "private or non-global overlay" in public_bind.stderr
 
     assert token.read_bytes() == b"synthetic-task9-service-token"
     assert b"\n" not in token.read_bytes()

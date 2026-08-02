@@ -82,10 +82,12 @@ This path is for V1 debugging only and cannot select or modify a formal V2 Attem
 The root `Containerfile` builds the V2 API image. The two
 `deploy/v2/conformance-*.Containerfile` definitions build the fixed agent and CUDA
 workspace smoke fixtures. All bases are pinned to linux/amd64 manifest digests and
-`requirements.lock` pins the API runtime graph. Published API and workload image
+`requirements.lock` pins the API runtime graph. The build backend is fixed to
+`setuptools==80.9.0` and `wheel==0.45.1`, and image builds install those exact tools
+before building without isolation. Published API and workload image
 references must be immutable `name@sha256:<digest>` values; the
 `registry.example.invalid` values in committed YAML are deliberate non-runnable
-placeholders, not published image claims.
+all-zero placeholders, not published image claims; deployment rejects them.
 
 Start with `deploy/v2/config.example.yaml`, exporting every corresponding value from
 an untracked operator environment. Both scripts perform a mutation-free local
@@ -102,11 +104,17 @@ the private TLS Service port-forward. The worker script changes only the separat
 k3s agent, NVIDIA container runtime/device plugin, and GPU node label. There is no
 localhost or local-k3s fallback.
 
-The control/worker addresses and allowed CIDRs must be nonpublic private/overlay
-topology. k3s, kubelet, and VXLAN must not be reachable from public interfaces. The
+The control/worker addresses and allowed CIDRs must be wholly inside IPv4 RFC1918,
+CGNAT `100.64.0.0/10`, or IPv6 ULA `fc00::/7` topology. k3s, kubelet, and VXLAN must
+not be reachable from public interfaces. The
 TLS certificate needs the configured private DNS/IP SAN; consumers trust the
 operator-provided CA. `kcs-v2.service` forwards only the TLS ClusterIP Service to the
 explicit nonpublic control address. The API image itself remains in-cluster-only.
+The installed port-forward wrapper independently rejects public, wildcard,
+loopback, unspecified, link-local, multicast, reserved, or non-control binds before
+execing its one fixed `k3s kubectl port-forward` command. An existing k3s binary is
+accepted only when its exact requested version and effective private service flags
+and node identity/role match; mismatches fail closed before deployment.
 The scripts validate `allowedPeerCidrs` but do not rewrite an existing host firewall;
 Task 10 must record the operator-managed firewall/overlay proof.
 The exact `KCS_NVIDIA_TOOLKIT_VERSION` package must be available from an already
