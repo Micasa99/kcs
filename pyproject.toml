@@ -7,7 +7,7 @@ name = "kcs"
 version = "0.1.0"
 description = "Container controller made simpler than k3s"
 requires-python = ">=3.12"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "lgc"}
 ]
@@ -22,6 +22,7 @@ dependencies = [
     "rfc8785>=0.1.4",
     "requests>=2.31.0",
     "slowapi>=0.1.9",
+    "python-multipart>=0.0.20",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,8 @@ dev = [
 
 [project.scripts]
 kcs = "kcs.cli:main"
+kcs-agent-supervisor = "kcs.conformance.agent_supervisor:_main"
+kcs-workspace-sidecar = "kcs.conformance.workspace_sidecar:_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -45,7 +48,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-kcs = ["static/*"]
+kcs = ["static/*", "openapi/*.json"]
 
 [tool.ruff]
 line-length = 100

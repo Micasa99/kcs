@@ -10,7 +10,6 @@ import shutil
 import socket
 import stat
 import struct
-import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -19,6 +18,12 @@ from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any, NoReturn
 
+from kcs.conformance.actions import (
+    observe_workspace_gpu,
+    probe_runtime_url,
+    shared_read,
+    shared_write,
+)
 from kcs.jobs.errors import DependencyUnavailableError
 from kcs.jobs.policy import validate_safe_relative_path
 from kcs.jobs.transport import (
@@ -102,6 +107,24 @@ class WorkspaceSidecar:
         self, request: Mapping[str, Any], body: Path | None
     ) -> tuple[dict[str, object], Path | None]:
         action = request.get("action")
+        if (
+            request.get("protocolVersion") == 1
+            and action == "sharedWrite"
+            and set(request) == {"protocolVersion", "action"}
+        ):
+            return shared_write(self.workspace, "workspace"), None
+        if (
+            request.get("protocolVersion") == 1
+            and action == "sharedRead"
+            and set(request) == {"protocolVersion", "action", "sourceRole"}
+        ):
+            return shared_read(self.workspace, "workspace", request.get("sourceRole")), None
+        if (
+            request.get("protocolVersion") == 1
+            and action == "observeGpu"
+            and set(request) == {"protocolVersion", "action"}
+        ):
+            return observe_workspace_gpu(), None
         if action == "validateTransfer":
             self._validate_transfer_path(request)
             return {"ok": True, "state": "validated"}, None
@@ -623,6 +646,21 @@ class WorkspaceSidecar:
         frame = request.get("frame")
         if not isinstance(frame, dict) or frame.get("protocol") != "cosmos.workspace/1":
             raise _RpcRejectedError("INVALID_REQUEST", "workspace frame is invalid")
+        action = frame.get("action")
+        allowed_fields = {
+            "sharedWrite": {"protocol", "action"},
+            "sharedRead": {"protocol", "action", "sourceRole"},
+            "observeGpu": {"protocol", "action"},
+            "probeRuntimeUrl": {"protocol", "action"},
+        }
+        if (
+            not isinstance(action, str)
+            or action not in allowed_fields
+            or set(frame) != allowed_fields[action]
+        ):
+            raise _RpcRejectedError(
+                "INVALID_REQUEST", "workspace action is not a fixed conformance action"
+            )
         with self._operation_lock:
             retained = self._operations.get(operation_ref)
             if retained is not None:
@@ -646,21 +684,35 @@ class WorkspaceSidecar:
                     "requestDigest": digest,
                     "dispatchToken": dispatch_token,
                 }
-            subprocess.run([sys.executable, "-c", "pass"], check=True)
+            if action == "sharedWrite":
+                action_result = shared_write(self.workspace, "workspace")
+            elif action == "sharedRead":
+                action_result = shared_read(self.workspace, "workspace", frame.get("sourceRole"))
+            elif action == "observeGpu":
+                action_result = observe_workspace_gpu()
+            else:
+                runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL") or os.environ.get(
+                    "KCS_CONFORMANCE_RUNTIME_URL"
+                )
+                action_result = probe_runtime_url(runtime_url)
+            print(
+                json.dumps(action_result, sort_keys=True, separators=(",", ":")),
+                file=sys.stderr,
+                flush=True,
+            )
             self._operation_side_effects += 1
-            exit_code = frame.get("exitCode", 0)
-            if type(exit_code) is not int:
-                raise _RpcRejectedError("INVALID_REQUEST", "echo exitCode must be an integer")
+            exit_code = 0 if action_result.get("ok") is True else 1
+            output = json.dumps(action_result, sort_keys=True, separators=(",", ":")) + "\n"
             result = {
                 "ok": True,
                 "operationRef": operation_ref,
                 "requestDigest": digest,
                 "state": "succeeded" if exit_code == 0 else "failed",
                 "exitCode": exit_code,
-                "stdout": str(frame.get("stdout", "")),
-                "stderr": str(frame.get("stderr", "")),
-                "inlineResult": frame.get("result"),
-                "resultTransferRef": frame.get("resultTransferRef"),
+                "stdout": output,
+                "stderr": "",
+                "inlineResult": action_result,
+                "resultTransferRef": None,
             }
             self._operations[operation_ref] = result
             return dict(result)
@@ -810,6 +862,12 @@ def _serve_connection(connection: socket.socket, sidecar: WorkspaceSidecar) -> N
                     output.write(chunk)
                     remaining -= len(chunk)
         sidecar.dispatch(frame, body_path, response_path)
+        with response_path.open("rb") as emitted:
+            prefix = emitted.read(4)
+            header_size = struct.unpack(">I", prefix)[0]
+            event = json.loads(emitted.read(header_size))
+            if isinstance(event, dict) and "event" in event:
+                print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr)
         with response_path.open("rb") as response:
             while chunk := response.read(_COPY_CHUNK):
                 connection.sendall(chunk)
@@ -1028,8 +1086,14 @@ def _main() -> None:
     parser = argparse.ArgumentParser()
     subcommands = parser.add_subparsers(dest="command")
     serve_parser = subcommands.add_parser("serve")
-    serve_parser.add_argument("--socket", type=Path, default=Path("/run/kcs/workspace.sock"))
-    serve_parser.add_argument("--workspace", type=Path, default=Path("/workspace"))
+    serve_parser.add_argument(
+        "--socket",
+        type=Path,
+        default=Path(os.environ.get("KCS_WORKSPACE_SOCKET", "/run/kcs/workspace.sock")),
+    )
+    serve_parser.add_argument(
+        "--workspace", type=Path, default=Path(os.environ.get("KCS_WORKSPACE", "/workspace"))
+    )
     rpc_parser = subcommands.add_parser("rpc")
     rpc_parser.add_argument(
         "--socket",
@@ -1039,8 +1103,12 @@ def _main() -> None:
     arguments = parser.parse_args()
     if arguments.command in {None, "serve"}:
         serve(
-            getattr(arguments, "socket", Path("/run/kcs/workspace.sock")),
-            getattr(arguments, "workspace", Path("/workspace")),
+            getattr(
+                arguments,
+                "socket",
+                Path(os.environ.get("KCS_WORKSPACE_SOCKET", "/run/kcs/workspace.sock")),
+            ),
+            getattr(arguments, "workspace", Path(os.environ.get("KCS_WORKSPACE", "/workspace"))),
         )
     else:
         rpc(arguments.socket)

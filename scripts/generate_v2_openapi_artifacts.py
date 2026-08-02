@@ -26,6 +26,7 @@ from openapi_spec_validator import validate
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "openapi" / "kcs-v2-jobs.openapi.yaml"
 DEFAULT_OUTPUT = ROOT / "openapi" / "generated"
+DEFAULT_PACKAGE_RESOURCE = ROOT / "src" / "kcs" / "openapi" / "kcs-v2-jobs.openapi.json"
 HTTP_METHODS = {"delete", "get", "head", "options", "patch", "post", "put", "trace"}
 EXCHANGE_FIELDS = {
     "scenario",
@@ -2911,6 +2912,11 @@ def main() -> int:
                 args.output_dir
             ):
                 raise SystemExit("committed generated artifacts are stale")
+            if (
+                not DEFAULT_PACKAGE_RESOURCE.is_file()
+                or DEFAULT_PACKAGE_RESOURCE.read_bytes() != first.openapi_json.read_bytes()
+            ):
+                raise SystemExit("packaged canonical OpenAPI resource is stale")
             print(
                 f"validated {first.validated_examples} route exchanges; "
                 f"sha256 {first.sha256}  {first.openapi_json.name}"
@@ -2918,6 +2924,8 @@ def main() -> int:
             return 0
 
     artifacts = generate_artifacts(args.source, args.output_dir)
+    DEFAULT_PACKAGE_RESOURCE.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_PACKAGE_RESOURCE.write_bytes(artifacts.openapi_json.read_bytes())
     print(f"{artifacts.sha256}  {artifacts.openapi_json.name}")
     return 0
 

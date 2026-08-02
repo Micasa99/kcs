@@ -1,0 +1,17 @@
+.git
+.gitignore
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.superpowers
+.venv
+build
+dist
+review-pack
+**/__pycache__
+**/*.pyc
+deploy/v2/config.runtime.yaml
+deploy/v2/*.env
+deploy/v2/*.key
+deploy/v2/*.crt
+deploy/v2/*token*

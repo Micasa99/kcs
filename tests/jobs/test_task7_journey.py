@@ -496,7 +496,7 @@ def _seed_runtime(tmp_path: Path, store: V2JobStore, provider: V2JobProvider) ->
         (tmp_path / "workspace" / name).write_bytes(content)
         provider.register_transfer("job-1", _collect(ref, name, content))
     frame = WorkspaceFrame.model_validate(
-        {"protocol": "cosmos.workspace/1", "action": "echo", "result": {"answer": 7}}
+        {"protocol": "cosmos.workspace/1", "action": "sharedWrite"}
     )
     operation = WorkspaceInvokeRequest(
         operation_ref="operation-task-7",

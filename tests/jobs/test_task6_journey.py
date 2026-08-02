@@ -728,11 +728,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     frame = WorkspaceFrame.model_validate(
         {
             "protocol": "cosmos.workspace/1",
-            "action": "echo",
-            "stdout": "x" * 70000,
-            "stderr": "\N{SNOWMAN}" * 30000,
-            "result": {"value": 7},
-            "exitCode": 0,
+            "action": "sharedWrite",
         }
     )
     request = WorkspaceInvokeRequest(
@@ -755,11 +751,14 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
     result = replay.snapshot
     assert replay.created is False
     assert result.state == "succeeded" and result.exit_code == 0
-    assert len(result.stdout.encode()) == 65536 and result.stdout_truncated is True
-    assert len(result.stderr.encode()) <= 65536 and result.stderr_truncated is True
-    assert result.inline_result == {"value": 7}
-    assert result.inline_result_size == len(b'{"value":7}')
-    assert result.inline_result_digest == hashlib.sha256(b'{"value":7}').hexdigest()
+    assert result.stdout.endswith("\n") and result.stdout_truncated is False
+    assert result.stderr == "" and result.stderr_truncated is False
+    assert result.inline_result["event"] == "workspace_shared_write"
+    expected_inline = json.dumps(
+        result.inline_result, sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert result.inline_result_size == len(expected_inline)
+    assert result.inline_result_digest == hashlib.sha256(expected_inline).hexdigest()
     assert decode_workspace_header(local.last_request_frame)["action"] == "fenceOperation"
     assert sidecar.stats()["operationSideEffects"] == 1
     restarted = _provider(kube, store, local)
@@ -928,7 +927,7 @@ def test_workspace_invoke_recovers_after_restart_without_redispatch(tmp_path: Pa
                 "stdoutBytes": len(result.stdout.encode()),
                 "stderrBytes": len(result.stderr.encode()),
                 "inlineResultDigest": result.inline_result_digest,
-                "stdoutPrefix": result.stdout[:16],
+                "stdoutPrefix": result.stdout[:32],
                 "stderrPrefix": result.stderr[:4],
                 "inlineResult": result.inline_result,
             },

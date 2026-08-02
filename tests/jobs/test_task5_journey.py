@@ -534,25 +534,13 @@ def test_supervisor_generation_slot_and_frame_validation_are_strict(
 ) -> None:
     credential_path = tmp_path / "credential"
     credential_path.write_bytes(b"fixture-credential")
-    launches = 0
-
-    class _Child:
-        pid = 9
-        returncode = 0
-
-        def wait(self) -> None:
-            return None
-
-    def popen(command: list[str]) -> _Child:
-        nonlocal launches
-        launches += 1
-        assert command == ["/bin/true"]
-        return _Child()
-
-    monkeypatch.setattr(supervisor.subprocess, "Popen", popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launch_bytes = b'{"action":"sharedWrite","protocol":"kcs.conformance/1"}'
+    (workspace / "launch.json").write_bytes(launch_bytes)
     slots_type = getattr(supervisor, "_GenerationSlots", None)
     assert slots_type is not None
-    slots = slots_type(credential_path)
+    slots = slots_type(credential_path, workspace)
     frame: dict[str, object] = {
         "protocolVersion": 1,
         "generation": 1,
@@ -560,18 +548,20 @@ def test_supervisor_generation_slot_and_frame_validation_are_strict(
         "executionEnvelopeRef": "env-1",
         "executionEnvelopeDigest": DIGEST,
         "launchBundlePath": "launch.json",
-        "launchBundleDigest": DIGEST,
-        "launchBundleSizeBytes": 1,
+        "launchBundleDigest": hashlib.sha256(launch_bytes).hexdigest(),
+        "launchBundleSizeBytes": len(launch_bytes),
         "materialPaths": ["material.json"],
         "credentialGrantRef": "grant-1",
         "audience": "agent",
         "credentialSha256": hashlib.sha256(b"fixture-credential").hexdigest(),
     }
-    assert slots.dispatch(frame) == slots.dispatch(frame)
+    response = slots.dispatch(frame)
+    assert response == slots.dispatch(frame)
+    assert json.loads(response)["pid"] > 0
     changed = {**frame, "audience": "other"}
     with pytest.raises(ValueError, match="generation"):
         slots.dispatch(changed)
-    assert launches == 1
+    assert (workspace / ".kcs-conformance/agent.probe").is_file()
     with pytest.raises(ValueError):
         slots.dispatch({**frame, "generation": True})
     with pytest.raises(ValueError):

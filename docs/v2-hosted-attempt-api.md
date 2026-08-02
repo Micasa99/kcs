@@ -525,6 +525,13 @@ Legacy/debug identities have no V2 namespace API access, V2 mutation authority,
 `pods/exec`, or Secret authority. The later RBAC implementation must enforce this
 documented fail-closed matrix.
 
+The committed `deploy/v2/rbac.yaml` enforces the namespace-scoped API adapter verbs.
+The workload ServiceAccount has token automount disabled and no RoleBinding. The
+deployment gate stops explicitly named V1 debug units and rejects a named legacy
+ServiceAccount if it appears in a V2 RoleBinding. Task 10 records the deployed
+`kubectl auth can-i` proof for the actual legacy identity; packaging checks do not
+claim that live result.
+
 `runtimeEnv` accepts only the seven public allowlisted keys above and also rejects
 secret-shaped values even under an allowed key. Rejected values include proxy URLs
 with userinfo; Authorization, Bearer, cookie, API-key, token, secret, or credential
@@ -580,3 +587,75 @@ explicit `synthetic-` marker and still pass signature scanning. The generator em
 every component schema, generates twice, and compares those outputs byte for byte.
 The test suite separately regenerates the artifact set and compares it with the
 committed canonical JSON, component schemas, and checksum.
+
+The same generation/check command owns the byte-identical
+`kcs.openapi/kcs-v2-jobs.openapi.json` package resource. The V2 route reads that
+resource through Python package-resource APIs, so an installed wheel never reaches
+back into a source checkout. Its digest remains
+`efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e`.
+
+## Fixed conformance actions
+
+The conformance images are deliberately not general-purpose test runners. Their PID
+1 command has no arguments (`/opt/kcs/agent-supervisor` or
+`/opt/kcs/workspace-sidecar`); KCS execs only the fixed `rpc` subcommand. No TCP
+listener or arbitrary shell action exists.
+
+Agent start reads the staged `launchBundlePath` from `/workspace`, verifies its exact
+declared byte count and SHA-256, and accepts only this closed launch shape:
+
+```json
+{"protocol":"kcs.conformance/1","action":"sharedWrite"}
+```
+
+The allowlisted agent actions are `sharedWrite`, `sharedRead` (only the workspace
+probe), `observeNoGpu`, and `probeRuntimeUrl`. Workspace invoke accepts the unchanged
+`cosmos.workspace/1` envelope with only `sharedWrite`, `sharedRead` (only the agent
+probe), `observeGpu`, or `probeRuntimeUrl`. Shared writes use fixed role-owned paths
+and fixed bytes; callers cannot supply a command, path, or content. GPU observation
+executes the exact `nvidia-smi --query-gpu=uuid,name --format=csv,noheader` command
+and reports only count plus output digest. Runtime reachability reads
+`RC_PUBLIC_RUNTIME_BASE_URL`, rejects loopback, unspecified, link-local, multicast,
+and reserved destinations, never follows redirects, and reports
+only scheme/status. Every fixture event is one sanitized compact JSON line.
+
+## Dedicated two-host deployment assets
+
+`deploy/v2/kcs-api.yaml` is a one-replica `Recreate` Deployment on the control node,
+using the dedicated API ServiceAccount, TLS/Bearer Secret references, HTTPS startup/
+readiness/liveness probes, a bounded TMPDIR `emptyDir`, and ephemeral-storage
+requests/limits. Its Service is TLS-only ClusterIP. Attempt Jobs retain only the
+closed GPU worker selector; neither role receives a service token.
+
+The root and conformance Containerfiles are fixed to linux/amd64 digest-pinned bases
+and carry source revision/license labels. `deploy/v2/nvidia-device-plugin.yaml` pins
+the linux/amd64 v0.19.0 device-plugin manifest digest. Rendered API and workload
+images must always be `name@sha256:<64 lowercase hex>`.
+
+The deployment scripts require explicit SSH-config aliases, private/overlay host
+addresses, allowed peer CIDRs, pinned k3s version, TLS SAN/material, and exact token
+files with no trailing newline. `--check` validates locally and performs no SSH or
+mutation. The deploy path has no local fallback: control scope is k3s server/V2 API;
+worker scope is k3s agent/NVIDIA runtime/plugin/node label. Neither script supplies a
+host, user, or identity-file default. k3s and kubelet bind to the declared nonpublic
+addresses, and the selected flannel interface must route between those addresses;
+k3s, kubelet, and VXLAN listeners are rejected unless bound to loopback or the
+declared role address. `allowedPeerCidrs` is validated topology input; these scripts
+do not rewrite the host firewall. Task 10 must verify that the operator-managed
+firewall/overlay admits only those peers and denies all public paths.
+The exact `nvidia-container-toolkit` package version must be available from an
+already configured trusted NVIDIA apt repository. Both nodes must already reach and
+authenticate to the immutable image registry; a private registry requires the
+operator's node-level k3s `registries.yaml`. Task 10 proves actual digest-pinned pulls.
+
+The TLS certificate must include `KCS_TLS_SAN`; callers use the operator-provided CA.
+The V2 API image runs only inside the Deployment. `kcs-v2.service` exposes only a
+port-forward of the TLS ClusterIP Service on the explicit nonpublic control address;
+it rejects wildcard binding. Runtime config, Secrets, topology, tokens, and evidence
+remain untracked, and KCS receives no model-provider key.
+
+`scripts/run_v2_attempt_journey.py` remains an early smoke only. Task 10 expands it
+on the dedicated servers to prove the complete P6 Journey, including real GPU,
+non-loopback runtime reachability, restart, cancellation, deletion, proxy isolation,
+and resource recovery. Local process and Docker results are supporting checks, not
+formal KCS/k3s evidence.

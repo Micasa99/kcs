@@ -24,6 +24,12 @@ htmlcov/
 
 # Local config and data
 local/
+deploy/v2/config.runtime.yaml
+deploy/v2/*.runtime.env
+deploy/v2/*.runtime.crt
+deploy/v2/*.runtime.key
+deploy/v2/*.runtime.token
+review-pack/
 
 # Claude Code
 .claude/

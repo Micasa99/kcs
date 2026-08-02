@@ -1,0 +1,24 @@
+# Export these exact names from an untracked operator environment. This example is
+# documentation only and is never sourced or parsed by the deployment scripts.
+environment:
+  KCS_CONTROL_SSH_ALIAS: <required-ssh-config-alias>
+  KCS_WORKER_SSH_ALIAS: <required-ssh-config-alias>
+  KCS_CONTROL_PRIVATE_ADDRESS: <required-private-or-overlay-address>
+  KCS_WORKER_PRIVATE_ADDRESS: <required-private-or-overlay-address>
+  KCS_ALLOWED_PEER_CIDRS: <required-private-or-overlay-cidrs>
+  KCS_PORT_FORWARD_ADDRESS: <required-nonpublic-control-address>
+  KCS_TLS_SAN: <required-dns-san-or-private-address>
+  KCS_K3S_VERSION: <required-pinned-k3s-version>
+  KCS_NVIDIA_TOOLKIT_VERSION: <required-exact-package-version>
+  KCS_API_IMAGE: registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  KCS_TLS_CERT_FILE: <required-untracked-path>
+  KCS_TLS_KEY_FILE: <required-untracked-path>
+  KCS_SERVICE_TOKEN_FILE: <required-untracked-path-exact-bytes-no-newline>
+  KCS_K3S_TOKEN_FILE: <required-untracked-path-exact-bytes-no-newline>
+  KCS_WORKER_NODE_NAME: <required-worker-node-name>
+  KCS_LEGACY_DEBUG_UNITS: <required-explicit-unit-list>
+  KCS_LEGACY_SERVICE_ACCOUNT: <required-explicit-service-account-name>
+
+workloadImagesForApiRequests:
+  agent: registry.example.invalid/researchcosmos/kcs-conformance-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  workspace: registry.example.invalid/researchcosmos/kcs-conformance-workspace@sha256:0000000000000000000000000000000000000000000000000000000000000000

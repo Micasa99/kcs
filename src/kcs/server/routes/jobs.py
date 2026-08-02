@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.resources
 import os
 import re
 import tempfile
@@ -68,9 +69,14 @@ _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_DEFAULT_OPENAPI_PATH = (
-    Path(__file__).resolve().parents[4] / "openapi/generated/kcs-v2-jobs.openapi.json"
-)
+
+
+def _canonical_openapi_bytes(path: Path | None) -> bytes:
+    if path is not None:
+        return path.read_bytes()
+    return (
+        importlib.resources.files("kcs.openapi").joinpath("kcs-v2-jobs.openapi.json").read_bytes()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +274,7 @@ def create_jobs_router(
 ) -> APIRouter:
     """Build the minimal V2 Job router around explicitly injected runtime dependencies."""
 
-    openapi_bytes = (canonical_openapi_path or _DEFAULT_OPENAPI_PATH).read_bytes()
+    openapi_bytes = _canonical_openapi_bytes(canonical_openapi_path)
     openapi_sha256 = hashlib.sha256(openapi_bytes).hexdigest()
     canonical = yaml.safe_load(openapi_bytes)
     paths = canonical.get("paths") if isinstance(canonical, Mapping) else None
