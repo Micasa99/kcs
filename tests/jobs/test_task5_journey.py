@@ -825,10 +825,14 @@ class _WebSocket:
         self.events.extend((("status", json.dumps(status)), ("close", "")))
         self.stdout = ""
         self.channels: dict[int, str] = {}
+        self.closed_channels: list[int] = []
         self.open = True
 
     def write_stdin(self, data: str) -> None:
         assert data.startswith("{")
+
+    def close_channel(self, channel: int) -> None:
+        self.closed_channels.append(channel)
 
     def is_open(self) -> bool:
         return self.open
@@ -873,6 +877,7 @@ def test_kubernetes_exec_requires_fragmented_zero_status_and_sanitizes_nonzero(
         binding, "agent", ["/opt/kcs/agent-supervisor", "rpc"], b"{}"
     )
     assert output == b'{"ok":true}'
+    assert success.closed_channels == [0]
 
     failed = _WebSocket(
         [],

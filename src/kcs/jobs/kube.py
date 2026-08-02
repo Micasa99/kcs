@@ -353,6 +353,12 @@ class V2KubeAdapter:
             _preload_content=False,
         )
         websocket.write_stdin(frame.decode("utf-8"))
+        # The fixed in-pod RPC client reads one bounded JSON frame from stdin
+        # until EOF before it connects to the supervisor socket.  Kubernetes
+        # exec keeps channel 0 open after ``write_stdin``; on the negotiated
+        # v5 channel protocol it must be closed explicitly or every agent RPC
+        # waits until this adapter's deadline and is reported as a 504.
+        websocket.close_channel(0)
         output: list[str] = []
         errors: list[str] = []
         deadline = time.monotonic() + 10
