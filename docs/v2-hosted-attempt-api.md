@@ -339,6 +339,24 @@ already-staged content before dispatch and must not treat an in-flight or
 case-fold unique so differently cased aliases cannot name one material twice. The
 public request shape intentionally adds no transfer refs or material bytes.
 
+Every launch or material path used by a fresh start must have exactly one retained
+`stage_input` transfer history. That transfer must carry the exact normalized path,
+the current immutable Job/Pod binding, `completed` state, verified and available
+content, and matching declared/actual size and digest; the launch record must also
+match the size and digest in the start request. A path with multiple retained
+histories is ambiguous even if `replace_authorized` completed successfully. KCS
+returns `422 PRECONDITION_FAILED` with `inspect_job` recovery before reserving the
+generation, inspecting the grant, dispatching RPC, or consuming credentials. The
+caller stages a generation-unique path instead of asking KCS to guess which history
+is current.
+
+KCS privately retains the resolved path-to-transfer bindings, including each exact
+`transferRef`, transfer `requestDigest`, actual byte count and SHA-256, plus their
+canonical binding digest. Recovery of an `accepted` generation validates those exact
+stored transfer records and never re-resolves a same-path replacement. Terminal
+generation replay retains its existing result. These private bindings do not add
+fields to `AgentStartRequest` or otherwise change the public OpenAPI.
+
 The generation snapshot includes generation, AgentRun/envelope identity and digests,
 launch path/digest/size, material paths, grant ref, internal metadata digest, runner
 state, supervisor liveness, PID/exit code, start/finish/observation timestamps, replay
@@ -663,11 +681,97 @@ The TLS certificate must include `KCS_TLS_SAN`; callers use the operator-provide
 The V2 API image runs only inside the Deployment. `kcs-v2.service` invokes an
 installed narrow wrapper that rejects public, wildcard, loopback, unspecified,
 link-local, multicast, reserved, and non-control binds before execing only the fixed
-TLS ClusterIP Service port-forward. Runtime config, Secrets, topology, tokens, and evidence
-remain untracked, and KCS receives no model-provider key.
+TLS ClusterIP Service port-forward. Runtime config, Secrets, topology, tokens, and
+evidence remain untracked, and KCS receives no model-provider key.
 
-`scripts/run_v2_attempt_journey.py` remains an early smoke only. Task 10 expands it
-on the dedicated servers to prove the complete P6 Journey, including real GPU,
-non-loopback runtime reachability, restart, cancellation, deletion, proxy isolation,
-and resource recovery. Local process and Docker results are supporting checks, not
-formal KCS/k3s evidence.
+## Task 10 dedicated-server standalone Journey
+
+`scripts/run_v2_attempt_journey.py` drives the deployed HTTPS API and retains one
+complete evidence session. Its target must be the dedicated KCS control server and
+its Attempts must run on the separate GPU worker. The script does not deploy KCS,
+run SSH or `kubectl`, or accept a shell hook. A local process, local k3s, and local
+Docker output are supporting checks only and can never satisfy this Journey. The
+presence of the tooling and documentation is not a claim that deployment or the
+live Journey has passed.
+
+Copy the [runtime config example](../deploy/v2/config.runtime.example.yaml) to the
+ignored `deploy/v2/config.runtime.yaml`, then replace every synthetic host, path, and
+image with the actual private endpoint, operator CA, checkpoint directory, and
+published immutable image digests. The runtime URL must be reachable from the Pod
+and must not resolve to loopback. `KCS_V2_SERVICE_TOKEN` must already be loaded from
+the operator's secret store; it is the only token source and must not be placed in
+YAML, argv, evidence, or tracked files. Both the evidence directory and checkpoint
+file names must be fresh for a run.
+
+```bash
+.venv/bin/python scripts/run_v2_attempt_journey.py \
+  --config deploy/v2/config.runtime.yaml \
+  --evidence-dir review-pack/kcs-v2-standalone
+```
+
+The pytest entry point is only a thin opt-in wrapper around that same real script. It
+skips unless all three opt-in variables are present; it adds no mock Journey or local
+Kubernetes fallback.
+
+```bash
+KCS_V2_LIVE=1 \
+KCS_V2_LIVE_CONFIG=deploy/v2/config.runtime.yaml \
+KCS_V2_LIVE_EVIDENCE_DIR=review-pack/kcs-v2-standalone \
+  .venv/bin/pytest -m v2_live tests/test_v2_journey.py -v -s
+```
+
+One invocation creates three distinct Attempts under the same session and evidence
+root because their terminal paths are mutually exclusive:
+
+| Attempt | Provider reality proved in that branch |
+|---|---|
+| A — normal | One Job/Pod and two roles; generation-unique staging/start; bidirectional shared-file digests; workspace GPU and agent no-GPU observations; non-loopback runtime reachability; collect integrity; operation replay/conflict; KCS API restart with stable Attempt UIDs; later legal generations; retained finalize/log/operation/transfer reality; delete and tombstone. |
+| B — cancel | An authorized output snapshot is deliberately left uncollected; cancel replay reports `outputLossPossible=true`, revokes the active credential, and retains the transfer, operation, role logs, and terminal provider snapshot before delete. |
+| C — Pod loss | The operator deletes only the bound Pod with a UID precondition; inspect becomes `indeterminate`, create replay retains the original UIDs, further mutation is rejected, no replacement Pod is adopted, and the Attempt is then deleted. |
+
+### O0–O3 operator result boundary
+
+At each checkpoint the script creates
+`<name>.request.json` in `operator.checkpointDirectory` and waits for the operator to
+write `<name>.result.json` beside it. The request gives the exact expected identities,
+required boolean facts, instructions, result filename, and forbidden disclosures.
+The operator performs those commands on the dedicated servers, writes the raw
+evidence files under the same checkpoint directory, and returns a result shaped as:
+
+```json
+{
+  "checkpoint": "<name>",
+  "requestSha256": "<sha256-of-exact-request-file>",
+  "status": "passed",
+  "completedAt": "<RFC-3339 timestamp>",
+  "observed": {"<expected-field>": "<observed-value>"},
+  "facts": {"<required-fact>": true},
+  "evidenceFiles": ["relative/path-to-raw-evidence"]
+}
+```
+
+`observed` must contain the request's complete `expected` object as an exact recursive
+subset, every requested fact must be `true`, and each evidence path must be relative,
+contained by the checkpoint directory, present, and not a symlink. The script only
+validates and copies these files into its evidence root; it never executes the
+operator instructions.
+
+| Phase | Checkpoint result files and operator responsibility |
+|---|---|
+| O0 | `o0-deployment-baseline.result.json`: Ready control/GPU nodes, worker label and GPU allocatable, exact image IDs, legacy RBAC and debug-proxy denial, private listener/firewall/overlay proof, initial resource baseline, and Secret metadata only. |
+| O1 | `o1-api-restart.result.json`: set `facts.oldApiPodUid` and `facts.newApiPodUid` to the exact UID strings and make them differ; the Attempt Pod UID must stay unchanged; retain old/new API logs plus Attempt Job/Pod YAML; prove one Pod/two roles/shared `emptyDir`, GPU only on workspace, tokenless workload identity, exact image IDs, and actual legacy debug-proxy denial for that Pod. |
+| O2 | `o2-attempt-a-finalized.result.json` and `o2-attempt-b-canceled.result.json`: terminal resources, owner references, role termination, credential Secret absence, and GPU release. `o2-final-resource-baseline.result.json`: deleted refs, recovered runtime/GPU baseline, healthy API, only expected tombstones, and an operator assertion made only after actually reading the raw agent/workspace/API logs. |
+| O3 | `o3-attempt-c-pod-delete.result.json`: raw UID-precondition deletion and missing/replacement Pod reality; `facts.preconditionUid` must equal `observed.podUid`, and the retained binding must not adopt a replacement. |
+
+No checkpoint may read or include Kubernetes Secret `.data`, bearer values,
+credentials, or a substituted UID. The evidence session retains exact API response
+bodies, a safe response-header projection, raw bounded role logs, transfer artifacts,
+checkpoint results and raw files, summary, and a SHA-256 manifest. Its final secret
+scan checks the exact service token and generated credential bytes plus forbidden
+credential patterns. `secret-scan.json` reports only file paths and hit counts, never
+matched values, and any nonzero count fails the Journey. This scan supports rather
+than replaces the required human reading of the original runtime logs.
+
+`deploy/v2/config.runtime.yaml`, checkpoint inputs/results, and everything under
+`review-pack/` except its `.gitignore` remain untracked. Sanitized tooling and docs
+may be committed; private topology and runtime evidence must not be committed.

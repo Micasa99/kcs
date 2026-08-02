@@ -1,0 +1,3 @@
+# Runtime evidence can contain private topology and remains operator-owned.
+*
+!.gitignore

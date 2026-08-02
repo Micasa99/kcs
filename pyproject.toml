@@ -63,3 +63,6 @@ strict = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "v2_live: opt-in Journey against the dedicated KCS V2 deployment",
+]

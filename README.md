@@ -122,10 +122,12 @@ configured trusted NVIDIA apt repository. Both nodes must already reach and
 authenticate to the immutable image registry; configure node-level k3s
 `registries.yaml` for a private registry. Task 10 proves the real image pulls.
 
-The current `scripts/run_v2_attempt_journey.py` is an early API smoke, not the full
-standalone Journey. Task 10 expands it with dedicated-host Kubernetes/GPU/restart/
-cancel/delete evidence; local Docker builds and local process smokes are never formal
-deployment evidence.
+`scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation
+drives the normal, cancel, and UID-precondition Pod-loss branches and retains raw API,
+role-log, transfer, and operator-checkpoint evidence. It is valid only against the
+dedicated KCS control server and separate GPU worker; local Docker builds, local
+process smokes, and local k3s are never formal deployment evidence. See
+`docs/v2-hosted-attempt-api.md` for the O0-O3 operator boundary and Review Pack shape.
 
 ## Tests
 
