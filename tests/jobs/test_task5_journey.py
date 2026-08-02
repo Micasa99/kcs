@@ -40,7 +40,7 @@ from kcs.jobs.errors import (
     IdentityDigestConflict,
     StateConflictError,
 )
-from kcs.jobs.kube import V2KubeAdapter
+from kcs.jobs.kube import V2KubeAdapter, _decode_log_body
 from kcs.jobs.provider import V2JobProvider
 from kcs.jobs.store import V2JobStore
 from kcs.jobs.transport import AgentRpcResponse, ExecRpcTransport, LocalWorkspaceRpcTransport
@@ -53,6 +53,22 @@ NOW = datetime(2026, 8, 2, tzinfo=UTC)
 START_LAUNCH = b'{"protocol":"kcs.conformance/1","action":"sharedWrite"}'
 START_LAUNCH_DIGEST = hashlib.sha256(START_LAUNCH).hexdigest()
 START_MATERIAL = b'{"kind":"synthetic-runtime-material","version":1}'
+
+
+def test_raw_kubernetes_log_body_is_decoded_and_released() -> None:
+    class _Response:
+        data = b'2026-08-02T00:00:00Z {"event":"one"}\n'
+
+        def __init__(self) -> None:
+            self.released = False
+
+        def release_conn(self) -> None:
+            self.released = True
+
+    response = _Response()
+
+    assert _decode_log_body(response) == '2026-08-02T00:00:00Z {"event":"one"}\n'
+    assert response.released is True
 
 
 class _ConflictError(Exception):

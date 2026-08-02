@@ -57,7 +57,7 @@ class CoreV1Api(Protocol):
 
     def read_namespaced_pod(self, *, name: str, namespace: str) -> Any: ...
 
-    def read_namespaced_pod_log(self, *, name: str, namespace: str, **kwargs: Any) -> str: ...
+    def read_namespaced_pod_log(self, *, name: str, namespace: str, **kwargs: Any) -> Any: ...
 
     def patch_namespaced_pod(self, *, name: str, namespace: str, body: Any) -> Any: ...
 
@@ -199,12 +199,13 @@ class V2KubeAdapter:
         }
         if boundary is not None:
             kwargs["since_seconds"] = self._since_seconds(boundary)
-        raw = self._core.read_namespaced_pod_log(
+        response = self._core.read_namespaced_pod_log(
             name=pod_name,
             namespace=self.namespace,
+            _preload_content=False,
             **kwargs,
         )
-        raw = raw or ""
+        raw = _decode_log_body(response)
         fetched_bytes = len(raw.encode("utf-8"))
         partial_final_line = fetched_bytes >= limit_bytes and bool(raw) and not raw.endswith("\n")
         content, latest_timestamp = _parse_timestamped_log(
@@ -616,6 +617,28 @@ def _parse_timestamped_log(
         latest = timestamp
         content.append(message + ("\n" if line.endswith("\n") else ""))
     return "".join(content), latest
+
+
+def _decode_log_body(response: object) -> str:
+    """Decode the raw Kubernetes log body without the client's ``str(bytes)`` coercion."""
+    release = getattr(response, "release_conn", None)
+    try:
+        body = getattr(response, "data", response)
+        if isinstance(body, bytes):
+            try:
+                return body.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise DependencyUnavailableError(
+                    "Kubernetes log response is not valid UTF-8"
+                ) from exc
+        if isinstance(body, str):
+            return body
+        if body is None:
+            return ""
+        raise DependencyUnavailableError("Kubernetes log response has an unexpected type")
+    finally:
+        if callable(release):
+            release()
 
 
 def _utf8_prefix(value: str, limit_bytes: int) -> tuple[str, bool]:
