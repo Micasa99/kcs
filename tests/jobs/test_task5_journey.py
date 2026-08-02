@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import socket
+import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +35,7 @@ from kcs.jobs.contracts import (
 )
 from kcs.jobs.errors import (
     CredentialDestroyFailedError,
+    DependencyTimeoutError,
     DependencyUnavailableError,
     IdentityDigestConflict,
     StateConflictError,
@@ -706,6 +709,106 @@ def test_supervisor_generation_slot_and_frame_validation_are_strict(
         slots.dispatch({**frame, "generation": 2, "launchBundleDigest": "G" * 64})
     with pytest.raises(ValueError):
         slots.dispatch({**frame, "generation": 2, "credentialSha256": "a" * 63})
+
+
+def test_supervisor_waits_for_rotated_projection_and_survives_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    socket_path = Path("/tmp") / (
+        "kcs-agent-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16] + ".sock"
+    )
+    socket_path.unlink(missing_ok=True)
+    credential_path = tmp_path / "credential"
+    old_credential = b"synthetic-old-projection"
+    current_credential = b"synthetic-current-projection"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launch_bytes = b'{"action":"sharedWrite","protocol":"kcs.conformance/1"}'
+    (workspace / "launch.json").write_bytes(launch_bytes)
+    monkeypatch.setattr(supervisor, "_CREDENTIAL_WAIT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(supervisor, "_CREDENTIAL_POLL_SECONDS", 0.005, raising=False)
+
+    frame: dict[str, object] = {
+        "protocolVersion": 1,
+        "generation": 1,
+        "agentRunRef": "run-1",
+        "executionEnvelopeRef": "env-1",
+        "executionEnvelopeDigest": DIGEST,
+        "launchBundlePath": "launch.json",
+        "launchBundleDigest": hashlib.sha256(launch_bytes).hexdigest(),
+        "launchBundleSizeBytes": len(launch_bytes),
+        "materialPaths": [],
+        "credentialGrantRef": "grant-1",
+        "audience": "agent",
+        "credentialSha256": hashlib.sha256(current_credential).hexdigest(),
+    }
+
+    server = threading.Thread(
+        target=supervisor.serve,
+        args=(socket_path, credential_path, workspace),
+        daemon=True,
+    )
+    server.start()
+    for _ in range(100):
+        if socket_path.exists():
+            break
+        threading.Event().wait(0.005)
+    assert socket_path.exists()
+
+    def exchange(value: Mapping[str, object]) -> bytes:
+        request = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(str(socket_path))
+            client.sendall(request)
+            return client.recv(65537)
+
+    missing_raw = exchange(frame)
+    missing = json.loads(missing_raw)
+    assert missing["error"] == "CREDENTIAL_PROJECTION_TIMEOUT"
+    assert missing["credentialConsumed"] is False
+    assert missing["supervisorAlive"] is True
+    assert server.is_alive()
+    assert not (workspace / ".kcs-conformance/agent.probe").exists()
+
+    credential_path.write_bytes(old_credential)
+    stale_raw = exchange(frame)
+    stale = json.loads(stale_raw)
+    assert stale["error"] == "CREDENTIAL_PROJECTION_TIMEOUT"
+    assert stale["credentialConsumed"] is False
+    assert server.is_alive()
+    assert not (workspace / ".kcs-conformance/agent.probe").exists()
+    transport = ExecRpcTransport(lambda *_: stale_raw)
+    with pytest.raises(DependencyTimeoutError) as timeout:
+        transport.agent_rpc({}, frame)
+    assert timeout.value.status_code == 504
+    assert timeout.value.retryable is True
+    assert timeout.value.recovery_action == "retry_same"
+
+    rejected_raw = exchange({"protocolVersion": 1, "action": "not-allowlisted"})
+    rejected = json.loads(rejected_raw)
+    assert rejected["error"] == "SUPERVISOR_REQUEST_REJECTED"
+    assert server.is_alive()
+    unavailable_transport = ExecRpcTransport(lambda *_: rejected_raw)
+    with pytest.raises(DependencyUnavailableError) as unavailable:
+        unavailable_transport.agent_rpc({}, frame)
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.retryable is True
+    assert unavailable.value.recovery_action == "retry_same"
+
+    credential_path.write_bytes(current_credential)
+    accepted = json.loads(exchange(frame))
+    assert accepted["state"] == "exited"
+    assert accepted["credentialConsumed"] is True
+    assert (workspace / ".kcs-conformance/agent.probe").is_file()
+    assert server.is_alive()
+
+    inspected = json.loads(exchange({"protocolVersion": 1, "action": "inspect"}))
+    assert inspected["state"] == "idle" and inspected["supervisorAlive"] is True
+    exchange({"protocolVersion": 1, "action": "shutdown"})
+    server.join(timeout=1)
+    assert not server.is_alive()
+    socket_path.unlink(missing_ok=True)
 
 
 class _ExecCore:

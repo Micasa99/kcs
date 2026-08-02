@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,10 @@ from .actions import (
 )
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_CREDENTIAL_WAIT_SECONDS = 5.0
+_CREDENTIAL_POLL_SECONDS = 0.05
+_CREDENTIAL_PROJECTION_TIMEOUT = "CREDENTIAL_PROJECTION_TIMEOUT"
+_SUPERVISOR_REQUEST_REJECTED = "SUPERVISOR_REQUEST_REJECTED"
 _START_FIELDS = frozenset(
     {
         "protocolVersion",
@@ -41,6 +47,10 @@ _START_FIELDS = frozenset(
         "credentialSha256",
     }
 )
+
+
+class _CredentialProjectionTimeoutError(RuntimeError):
+    """The optional Secret volume has not exposed the requested grant yet."""
 
 
 class _GenerationSlots:
@@ -63,9 +73,7 @@ class _GenerationSlots:
                 raise ValueError("generation is already bound to different start metadata")
             return response
 
-        credential = self._credential_path.read_bytes()
-        if hashlib.sha256(credential).hexdigest() != request["credentialSha256"]:
-            raise ValueError("projected credential digest does not match the frame")
+        self._wait_for_credential(str(request["credentialSha256"]))
         launch_path = self._workspace / validate_safe_relative_path(request["launchBundlePath"])
         try:
             resolved_launch = launch_path.resolve(strict=True)
@@ -127,6 +135,25 @@ class _GenerationSlots:
         self._completed[generation] = (frame_identity, response)
         return response
 
+    def _wait_for_credential(self, expected_digest: str) -> None:
+        # Kubernetes accepts the Secret before its optional projected volume is
+        # refreshed. Keep this shorter than the pod-exec deadline so a timed-out
+        # client can never leave this supervisor dispatching a child in the background.
+        deadline = time.monotonic() + _CREDENTIAL_WAIT_SECONDS
+        while True:
+            try:
+                credential: bytes | None = self._credential_path.read_bytes()
+            except OSError:
+                credential = None
+            if credential is not None and hmac.compare_digest(
+                hashlib.sha256(credential).hexdigest(), expected_digest
+            ):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _CredentialProjectionTimeoutError
+            time.sleep(min(_CREDENTIAL_POLL_SECONDS, remaining))
+
 
 def serve(socket_path: Path, credential_path: Path, workspace: Path = Path("/workspace")) -> None:
     """Keep serving local frames; each start consumes a projection and launches one child."""
@@ -139,61 +166,91 @@ def serve(socket_path: Path, credential_path: Path, workspace: Path = Path("/wor
         while True:
             connection, _ = listener.accept()
             with connection:
-                request = _json(connection.recv(65536))
-                action = request.get("action")
-                if action == "sharedWrite" and _direct_action(
-                    request, {"protocolVersion", "action"}
-                ):
-                    response = shared_write(workspace, "agent")
-                    _send_event(connection, response)
-                    continue
-                if action == "sharedRead" and _direct_action(
-                    request, {"protocolVersion", "action", "sourceRole"}
-                ):
-                    response = shared_read(workspace, "agent", request.get("sourceRole"))
-                    _send_event(connection, response)
-                    continue
-                if action == "observeNoGpu" and _direct_action(
-                    request, {"protocolVersion", "action"}
-                ):
-                    _send_event(connection, observe_agent_no_gpu())
-                    continue
-                if action == "probeRuntimeUrl" and _direct_action(
-                    request, {"protocolVersion", "action"}
-                ):
-                    runtime_url = os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL")
-                    _send_event(connection, probe_runtime_url(runtime_url))
-                    continue
-                if request.get("action") == "shutdown":
-                    connection.sendall(
-                        _frame(
-                            {
-                                "protocolVersion": 1,
-                                "generation": 0,
-                                "agentRunRef": "",
-                                "launchBundleDigest": "",
-                                "state": "stopped",
-                                "supervisorAlive": False,
-                            }
-                        )
-                    )
-                    return
-                if request.get("action") == "inspect":
-                    connection.sendall(
-                        _frame(
-                            {
-                                "protocolVersion": 1,
-                                "generation": 0,
-                                "agentRunRef": "",
-                                "launchBundleDigest": "",
-                                "state": "idle",
-                                "supervisorAlive": True,
-                            }
-                        )
-                    )
-                    continue
-                _validate_start(request)
-                connection.sendall(slots.dispatch(request))
+                try:
+                    if _serve_connection(connection, slots, workspace):
+                        return
+                except _CredentialProjectionTimeoutError:
+                    _send_rpc_error(connection, _CREDENTIAL_PROJECTION_TIMEOUT)
+                except (OSError, ValueError):
+                    # One malformed or failed RPC is a connection failure, not a PID-1
+                    # failure. The fixed error code intentionally exposes no exception text.
+                    _send_rpc_error(connection, _SUPERVISOR_REQUEST_REJECTED)
+
+
+def _serve_connection(connection: socket.socket, slots: _GenerationSlots, workspace: Path) -> bool:
+    request = _json(connection.recv(65536))
+    action = request.get("action")
+    if action == "sharedWrite" and _direct_action(request, {"protocolVersion", "action"}):
+        _send_event(connection, shared_write(workspace, "agent"))
+        return False
+    if action == "sharedRead" and _direct_action(
+        request, {"protocolVersion", "action", "sourceRole"}
+    ):
+        _send_event(connection, shared_read(workspace, "agent", request.get("sourceRole")))
+        return False
+    if action == "observeNoGpu" and _direct_action(request, {"protocolVersion", "action"}):
+        _send_event(connection, observe_agent_no_gpu())
+        return False
+    if action == "probeRuntimeUrl" and _direct_action(request, {"protocolVersion", "action"}):
+        _send_event(connection, probe_runtime_url(os.environ.get("RC_PUBLIC_RUNTIME_BASE_URL")))
+        return False
+    if action == "shutdown":
+        connection.sendall(
+            _frame(
+                {
+                    "protocolVersion": 1,
+                    "generation": 0,
+                    "agentRunRef": "",
+                    "launchBundleDigest": "",
+                    "state": "stopped",
+                    "supervisorAlive": False,
+                }
+            )
+        )
+        return True
+    if action == "inspect":
+        connection.sendall(
+            _frame(
+                {
+                    "protocolVersion": 1,
+                    "generation": 0,
+                    "agentRunRef": "",
+                    "launchBundleDigest": "",
+                    "state": "idle",
+                    "supervisorAlive": True,
+                }
+            )
+        )
+        return False
+    _validate_start(request)
+    connection.sendall(slots.dispatch(request))
+    return False
+
+
+def _send_rpc_error(connection: socket.socket, code: str) -> None:
+    response = {
+        "protocolVersion": 1,
+        "generation": 0,
+        "agentRunRef": "",
+        "launchBundleDigest": "",
+        "state": "retryable",
+        "supervisorAlive": True,
+        "credentialConsumed": False,
+        "error": code,
+    }
+    try:
+        connection.sendall(_frame(response))
+    except OSError:
+        return
+    print(
+        json.dumps(
+            {"event": "agent_rpc_retryable_error", "code": code},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _send_event(connection: socket.socket, response: Mapping[str, object]) -> None:

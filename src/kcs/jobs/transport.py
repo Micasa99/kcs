@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .errors import DependencyUnavailableError
+from .errors import DependencyTimeoutError, DependencyUnavailableError
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RPC_HEADER = 4 * 1024 * 1024
@@ -230,6 +230,18 @@ def _response(output: bytes) -> AgentRpcResponse:
         value["credentialSha256"]
     ):
         raise DependencyUnavailableError("supervisor RPC credential digest is invalid")
+    retryable_error = value.get("error")
+    if retryable_error in {"CREDENTIAL_PROJECTION_TIMEOUT", "SUPERVISOR_REQUEST_REJECTED"}:
+        if (
+            generation != 0
+            or value["state"] != "retryable"
+            or supervisor_alive is not True
+            or value.get("credentialConsumed") is not False
+        ):
+            raise DependencyUnavailableError("supervisor retryable RPC response is invalid")
+        if retryable_error == "CREDENTIAL_PROJECTION_TIMEOUT":
+            raise DependencyTimeoutError("credential projection did not become ready")
+        raise DependencyUnavailableError("supervisor rejected the fixed RPC")
     return AgentRpcResponse(
         protocol_version=protocol,
         generation=generation,
