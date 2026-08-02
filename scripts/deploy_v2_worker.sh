@@ -108,13 +108,14 @@ ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" "umask 077; cat >'$remote_token_
 
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" sudo bash -s -- \
   "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_K3S_VERSION" \
-  "$KCS_WORKER_NODE_NAME" "$remote_token_path" <<'REMOTE'
+  "$KCS_WORKER_NODE_NAME" "$remote_token_path" "$KCS_NVIDIA_TOOLKIT_VERSION" <<'REMOTE'
 set -euo pipefail
 control_address=$1
 worker_address=$2
 k3s_version=$3
 node_name=$4
 token_path=$5
+toolkit_version=$6
 trap 'rm -f -- "$token_path"' EXIT
 
 ip -o address show | grep -F -- " $worker_address/" >/dev/null || {
@@ -124,6 +125,15 @@ ip -o address show | grep -F -- " $worker_address/" >/dev/null || {
 interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
 [[ -n $interface ]] || { echo "no private/overlay route to control" >&2; exit 1; }
 [[ $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || { echo "private/overlay interface is invalid" >&2; exit 1; }
+
+command -v nvidia-smi >/dev/null
+nvidia-smi >/dev/null
+installed_toolkit=$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)
+if [[ $installed_toolkit != "$toolkit_version" ]]; then
+  apt-get update
+  apt-get install --yes --no-install-recommends "nvidia-container-toolkit=$toolkit_version"
+fi
+command -v nvidia-container-runtime >/dev/null
 
 validate_k3s_install() {
   local installed_version
@@ -142,7 +152,7 @@ if ! command -v k3s >/dev/null; then
   token=$(cat "$token_path")
   curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
     K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address" sh -
+    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=127.0.0.1 --default-runtime=nvidia" sh -
 fi
 systemctl enable --now k3s-agent >/dev/null
 systemctl restart k3s-agent
@@ -187,14 +197,8 @@ interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i
 command -v nvidia-smi >/dev/null
 nvidia-smi >/dev/null
 installed_toolkit=$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)
-if [[ $installed_toolkit != "$toolkit_version" ]]; then
-  apt-get update
-  apt-get install --yes --no-install-recommends "nvidia-container-toolkit=$toolkit_version"
-fi
-command -v nvidia-ctk >/dev/null
-nvidia-ctk runtime configure --runtime=containerd \
-  --config=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl --set-as-default
-systemctl restart k3s-agent
+[[ $installed_toolkit == "$toolkit_version" ]]
+command -v nvidia-container-runtime >/dev/null
 installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
 [[ $installed_version == "$k3s_version" ]] || {
   echo "started k3s version mismatch" >&2
@@ -206,6 +210,24 @@ systemctl show --property=ExecStart --value k3s-agent 2>/dev/null | \
       echo "started k3s private service configuration mismatch" >&2
       exit 1
     }
+k3s crictl info 2>/dev/null | python3 -c '
+import json, sys
+info = json.load(sys.stdin)
+containerd = info.get("config", {}).get("containerd", {})
+conditions = {
+    item.get("type"): item.get("status")
+    for item in info.get("status", {}).get("conditions", [])
+}
+if (
+    containerd.get("defaultRuntimeName") != "nvidia"
+    or "nvidia" not in containerd.get("runtimes", {})
+    or conditions.get("RuntimeReady") is not True
+    or conditions.get("NetworkReady") is not True
+):
+    raise SystemExit("K3s CRI is not ready with NVIDIA as the default runtime")
+'
+grep -F 'conf_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"' \
+  /var/lib/rancher/k3s/agent/etc/containerd/config.toml >/dev/null
 validate_listener() {
   local endpoint=$1
   local allowed_address=$2
@@ -241,6 +263,8 @@ ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
   <"$ROOT/deploy/v2/nvidia-device-plugin.yaml" >/dev/null
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl -n kube-system rollout status daemonset/nvidia-device-plugin-daemonset --timeout=180s >/dev/null"
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl wait --for=condition=Ready node/'$KCS_WORKER_NODE_NAME' --timeout=180s >/dev/null"
 if ! ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl get node '$KCS_WORKER_NODE_NAME' -o json" | python3 -c '
@@ -249,12 +273,15 @@ expected_address = sys.argv[1]
 node = json.load(sys.stdin)
 labels = node.get("metadata", {}).get("labels", {})
 addresses = node.get("status", {}).get("addresses", [])
+capacity = node.get("status", {}).get("capacity", {}).get("nvidia.com/gpu")
+allocatable = node.get("status", {}).get("allocatable", {}).get("nvidia.com/gpu")
 raise SystemExit(0 if labels.get("researchcosmos.io/pool") == "gpu" and any(
     item.get("type") == "InternalIP" and item.get("address") == expected_address
     for item in addresses
-) else 1)
+) and capacity is not None and allocatable is not None
+    and int(capacity) > 0 and int(allocatable) > 0 else 1)
 ' "$KCS_WORKER_PRIVATE_ADDRESS"; then
-  echo "started worker node identity, private address, or GPU label mismatch" >&2
+  echo "started worker identity, private address, GPU label, or allocatable GPU mismatch" >&2
   exit 1
 fi
 observed_k3s_version=$(ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \

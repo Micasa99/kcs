@@ -660,10 +660,13 @@ addresses, allowed peer CIDRs, pinned k3s version, TLS SAN/material, and exact t
 files with no trailing newline. `--check` validates locally and performs no SSH or
 mutation. The deploy path has no local fallback: control scope is k3s server/V2 API;
 worker scope is k3s agent/NVIDIA runtime/plugin/node label. Neither script supplies a
-host, user, or identity-file default. k3s and kubelet bind to the declared nonpublic
-addresses, and the selected flannel interface must route between those addresses;
-k3s, kubelet, and VXLAN listeners are rejected unless bound to loopback or the
-declared role address. `allowedPeerCidrs` is validated topology input; these scripts
+host, user, or identity-file default. The control services bind to the declared
+nonpublic address. The worker kubelet binds only to loopback so that pod logs flow
+through the authenticated k3s remotedialer instead of a host-exposed listener; its
+node identity and flannel traffic still use the declared worker address. The selected
+flannel interface must route between the declared addresses; k3s, kubelet, and VXLAN
+listeners are rejected unless bound to loopback or the declared role address.
+`allowedPeerCidrs` is validated topology input; these scripts
 reject global/public, loopback, unspecified, link-local, multicast, and reserved
 networks. Every declared host and network must be wholly inside IPv4 RFC1918, CGNAT
 `100.64.0.0/10`, or IPv6 ULA `fc00::/7`, and the peer networks must contain both
@@ -673,7 +676,10 @@ match; mismatches fail closed, and the same sanitized checks run after start. Th
 scripts do not rewrite the host firewall. Task 10 must verify that the operator-managed
 firewall/overlay admits only those peers and denies all public paths.
 The exact `nvidia-container-toolkit` package version must be available from an
-already configured trusted NVIDIA apt repository. Both nodes must already reach and
+already configured trusted NVIDIA apt repository. The worker installs it before the
+first k3s start, selects `nvidia` as the explicit default runtime, and reports success
+only after the device plugin is available and the node advertises allocatable GPUs.
+Both nodes must already reach and
 authenticate to the immutable image registry; a private registry requires the
 operator's node-level k3s `registries.yaml`. Task 10 proves actual digest-pinned pulls.
 

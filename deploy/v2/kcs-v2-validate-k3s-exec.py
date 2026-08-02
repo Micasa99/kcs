@@ -10,6 +10,7 @@ from collections import defaultdict
 _CRITICAL_SINGLETONS = {
     "advertise-address",
     "bind-address",
+    "default-runtime",
     "flannel-iface",
     "node-ip",
     "node-name",
@@ -95,13 +96,14 @@ def _validate(raw: str, arguments: list[str]) -> None:
         _exact_singletons(
             options,
             {
+                "default-runtime": "nvidia",
                 "flannel-iface": interface,
                 "node-ip": worker_address,
                 "node-name": node_name,
                 "server": f"https://{control_address}:6443",
             },
         )
-        _exact_keyed(options, "kubelet-arg", "address", worker_address)
+        _exact_keyed(options, "kubelet-arg", "address", "127.0.0.1")
         return
     raise ValueError
 

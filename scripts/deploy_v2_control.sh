@@ -262,13 +262,25 @@ trap 'rm -rf -- "$secret_dir"' EXIT
 install -m 0600 "$KCS_TLS_CERT_FILE" "$secret_dir/tls.crt"
 install -m 0600 "$KCS_TLS_KEY_FILE" "$secret_dir/tls.key"
 install -m 0600 "$KCS_SERVICE_TOKEN_FILE" "$secret_dir/service-token"
-tar -C "$secret_dir" -cf - tls.crt tls.key service-token | \
-  ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo bash -s <<'REMOTE'
+secret_archive="$secret_dir/secrets.tar"
+tar -C "$secret_dir" -cf "$secret_archive" tls.crt tls.key service-token
+chmod 0600 "$secret_archive"
+remote_secret_archive=$(ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  'umask 077; mktemp /tmp/kcs-v2-secrets.XXXXXX.tar')
+[[ $remote_secret_archive == /tmp/kcs-v2-secrets.*.tar ]] || {
+  echo "unsafe remote Secret archive path" >&2
+  exit 1
+}
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "umask 077; cat >'$remote_secret_archive'" <"$secret_archive"
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo bash -s -- \
+  "$remote_secret_archive" <<'REMOTE'
 set -euo pipefail
+archive=$1
 tmp=$(mktemp -d)
-trap 'rm -rf -- "$tmp"' EXIT
+trap 'rm -rf -- "$tmp"; rm -f -- "$archive"' EXIT
 umask 077
-tar -C "$tmp" -xf -
+tar -C "$tmp" -xf "$archive"
 k3s kubectl -n researchcosmos-v2 create secret tls kcs-v2-tls \
   --cert="$tmp/tls.crt" --key="$tmp/tls.key" --dry-run=client -o yaml | \
   k3s kubectl apply -f - >/dev/null
