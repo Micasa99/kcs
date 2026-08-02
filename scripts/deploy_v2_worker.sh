@@ -91,6 +91,9 @@ fi
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" true
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" true
+ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+  'sudo install -d -m 0755 /usr/local/libexec && sudo tee /usr/local/libexec/kcs-v2-validate-k3s-exec >/dev/null && sudo chmod 0755 /usr/local/libexec/kcs-v2-validate-k3s-exec' \
+  <"$ROOT/deploy/v2/kcs-v2-validate-k3s-exec.py"
 
 remote_token_path=$(ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
   'umask 077; tmp=$(mktemp); printf "%s" "$tmp"')
@@ -105,14 +108,13 @@ ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" "umask 077; cat >'$remote_token_
 
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" sudo bash -s -- \
   "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_K3S_VERSION" \
-  "$KCS_WORKER_NODE_NAME" "$remote_token_path" "$KCS_NVIDIA_TOOLKIT_VERSION" <<'REMOTE'
+  "$KCS_WORKER_NODE_NAME" "$remote_token_path" <<'REMOTE'
 set -euo pipefail
 control_address=$1
 worker_address=$2
 k3s_version=$3
 node_name=$4
 token_path=$5
-toolkit_version=$6
 trap 'rm -f -- "$token_path"' EXIT
 
 ip -o address show | grep -F -- " $worker_address/" >/dev/null || {
@@ -124,25 +126,64 @@ interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i
 [[ $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || { echo "private/overlay interface is invalid" >&2; exit 1; }
 
 validate_k3s_install() {
-  local installed_version effective_exec required
+  local installed_version
   installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
   [[ $installed_version == "$k3s_version" ]] || return 1
-  effective_exec=$(systemctl show --property=ExecStart --value k3s-agent 2>/dev/null) || return 1
-  [[ $effective_exec == *"/usr/local/bin/k3s agent "* ]] || return 1
-  for required in \
-    "--server=https://$control_address:6443" \
-    "--node-name=$node_name" \
-    "--node-ip=$worker_address" \
-    "--flannel-iface=$interface" \
-    "--kubelet-arg=address=$worker_address"; do
-    [[ $effective_exec == *"$required "* ]] || return 1
-  done
+  systemctl show --property=ExecStart --value k3s-agent 2>/dev/null | \
+    /usr/local/libexec/kcs-v2-validate-k3s-exec \
+      worker "$control_address" "$worker_address" "$node_name" "$interface" || return 1
 }
 if command -v k3s >/dev/null && ! validate_k3s_install; then
   echo "existing k3s version or private service configuration mismatch" >&2
   exit 1
 fi
 
+if ! command -v k3s >/dev/null; then
+  token=$(cat "$token_path")
+  curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
+    K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
+    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address" sh -
+fi
+systemctl enable --now k3s-agent >/dev/null
+systemctl restart k3s-agent
+if ! validate_k3s_install; then
+  echo "started k3s version or private service configuration mismatch" >&2
+  exit 1
+fi
+REMOTE
+trap - EXIT
+
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl wait --for=condition=Ready node/'$KCS_WORKER_NODE_NAME' --timeout=180s >/dev/null"
+if ! ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl get node '$KCS_WORKER_NODE_NAME' -o json" | python3 -c '
+import json, sys
+expected_address = sys.argv[1]
+node = json.load(sys.stdin)
+addresses = node.get("status", {}).get("addresses", [])
+raise SystemExit(0 if node.get("metadata", {}).get("name") == sys.argv[2] and any(
+    item.get("type") == "InternalIP" and item.get("address") == expected_address
+    for item in addresses
+) else 1)
+' "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_WORKER_NODE_NAME"; then
+  echo "live worker node identity or private address mismatch" >&2
+  exit 1
+fi
+
+ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" sudo bash -s -- \
+  "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_K3S_VERSION" \
+  "$KCS_WORKER_NODE_NAME" "$KCS_NVIDIA_TOOLKIT_VERSION" <<'REMOTE'
+set -euo pipefail
+control_address=$1
+worker_address=$2
+k3s_version=$3
+node_name=$4
+toolkit_version=$5
+interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+[[ -n $interface && $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || {
+  echo "private/overlay interface is invalid" >&2
+  exit 1
+}
 command -v nvidia-smi >/dev/null
 nvidia-smi >/dev/null
 installed_toolkit=$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)
@@ -151,21 +192,20 @@ if [[ $installed_toolkit != "$toolkit_version" ]]; then
   apt-get install --yes --no-install-recommends "nvidia-container-toolkit=$toolkit_version"
 fi
 command -v nvidia-ctk >/dev/null
-
-if ! command -v k3s >/dev/null; then
-  token=$(cat "$token_path")
-  curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
-    K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address" sh -
-fi
 nvidia-ctk runtime configure --runtime=containerd \
   --config=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl --set-as-default
-systemctl enable --now k3s-agent >/dev/null
 systemctl restart k3s-agent
-if ! validate_k3s_install; then
-  echo "started k3s version or private service configuration mismatch" >&2
+installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
+[[ $installed_version == "$k3s_version" ]] || {
+  echo "started k3s version mismatch" >&2
   exit 1
-fi
+}
+systemctl show --property=ExecStart --value k3s-agent 2>/dev/null | \
+  /usr/local/libexec/kcs-v2-validate-k3s-exec \
+    worker "$control_address" "$worker_address" "$node_name" "$interface" || {
+      echo "started k3s private service configuration mismatch" >&2
+      exit 1
+    }
 validate_listener() {
   local endpoint=$1
   local allowed_address=$2
@@ -195,7 +235,6 @@ while IFS= read -r listener; do
   esac
 done < <(ss -H -lnu | awk '{print $4}')
 REMOTE
-trap - EXIT
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl label node '$KCS_WORKER_NODE_NAME' researchcosmos.io/pool=gpu --overwrite >/dev/null"

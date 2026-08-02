@@ -12,6 +12,9 @@ Requested implementation commit subject:
 Review-fix commit subject:
 `fix(v2): harden dedicated runtime deployment`
 
+Review-fix round 2 commit subject:
+`fix(v2): validate effective k3s runtime identity`
+
 Author/committer: `zhangbo <226653803@qq.com>`
 
 Task 9 packages the existing V2 provider without deploying it:
@@ -53,8 +56,14 @@ Task 9 packages the existing V2 provider without deploying it:
   listeners plus any other-address TCP 6443/10250 or UDP 8472 listener, verify TLS SAN material, stop named V1 debug units, and reject
   the named legacy ServiceAccount in V2/cluster-wide bindings;
 - existing k3s fails closed unless exact requested version, effective private
-  service arguments, interface, node identity, and role match; live control and
-  worker node addresses/labels are verified after start;
+  service arguments, interface, node identity, and role match. The effective
+  systemd `argv[]` is parsed with `shlex`; critical singleton and key-scoped
+  values must occur exactly once, so later conflicting flags cannot override a
+  safe-looking earlier value;
+- the worker installs/starts or validates k3s, then proves the exact Ready node
+  name/InternalIP through the control API before any NVIDIA package/runtime
+  mutation. Only its second bounded phase installs/configures NVIDIA, restarts
+  the agent, and proceeds to the final InternalIP/GPU-label proof;
 - `kcs-v2.service` invokes an installed narrow wrapper that validates an exact
   RFC1918/CGNAT/ULA control bind and execs only the fixed TLS ClusterIP Service
   port-forward. Runtime secrets/config/evidence are ignored. Docs call
@@ -84,7 +93,8 @@ Fixed conformance runtime:
 Deployment/docs:
 
 - `deploy/v2/namespace.yaml`, `kcs-api.yaml`, `config.example.yaml`,
-  `kcs-v2.service`, `kcs-v2-port-forward.py`, and `nvidia-device-plugin.yaml`;
+  `kcs-v2.service`, `kcs-v2-port-forward.py`,
+  `kcs-v2-validate-k3s-exec.py`, and `nvidia-device-plugin.yaml`;
 - existing `deploy/v2/rbac.yaml` and `network-policy.yaml` were preserved;
 - `scripts/deploy_v2_control.sh`, `scripts/deploy_v2_worker.sh`;
 - `.gitignore`, `README.md`, `docs/v2-hosted-attempt-api.md`;
@@ -117,9 +127,14 @@ A mutation check removing CGNAT from the supported topology then failed the
 Journey at the real control `--check` subprocess before support was restored.
 No additional test file was added.
 
+Review fix round 2 added one behavior to that same Journey. RED failed because
+the effective-argv validator did not exist; GREEN runs the real validator with
+a valid systemd `argv[]` and proves that appending a conflicting second
+`--bind-address` returns only the sanitized configuration-mismatch error.
+
 ```text
 .venv/bin/pytest -q -s tests/deploy/test_task9_packaging_journey.py
-1 passed in 0.54s
+1 passed in 0.55s
 ```
 
 ## Raw focused Journey events and interpretation
@@ -164,6 +179,8 @@ success event without entering SSH.
 - scoped Ruff lint and format check over all changed Python/test files: pass.
 - scoped strict Mypy over the five touched runtime/wrapper source modules:
   `Success: no issues found in 5 source files`.
+- review-fix round 2 Ruff/format plus strict Mypy over the new effective-argv
+  validator and updated Journey: pass; Mypy reports no issues in its source file.
 - `py_compile` over all changed Python/runtime/test entrypoints: pass.
 - `.venv/bin/python scripts/generate_v2_openapi_artifacts.py --check`: pass;
   `validated 31 route exchanges`, canonical SHA-256 exactly

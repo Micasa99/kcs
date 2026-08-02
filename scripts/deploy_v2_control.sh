@@ -119,6 +119,9 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
 fi
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" true
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  'sudo install -d -m 0755 /usr/local/libexec && sudo tee /usr/local/libexec/kcs-v2-validate-k3s-exec >/dev/null && sudo chmod 0755 /usr/local/libexec/kcs-v2-validate-k3s-exec' \
+  <"$ROOT/deploy/v2/kcs-v2-validate-k3s-exec.py"
 if python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$KCS_TLS_SAN" \
   >/dev/null 2>&1; then
   openssl x509 -in "$KCS_TLS_CERT_FILE" -noout -checkip "$KCS_TLS_SAN" >/dev/null
@@ -159,21 +162,12 @@ raise SystemExit(0 if any(
 }
 
 validate_k3s_install() {
-  local installed_version effective_exec required
+  local installed_version
   installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
   [[ $installed_version == "$k3s_version" ]] || return 1
-  effective_exec=$(systemctl show --property=ExecStart --value k3s 2>/dev/null) || return 1
-  [[ $effective_exec == *"/usr/local/bin/k3s server "* ]] || return 1
-  for required in \
-    "--bind-address=$control_address" \
-    "--advertise-address=$control_address" \
-    "--node-ip=$control_address" \
-    "--tls-san=$tls_san" \
-    "--node-label=researchcosmos.io/role=control" \
-    "--flannel-iface=$interface" \
-    "--kubelet-arg=address=$control_address"; do
-    [[ $effective_exec == *"$required "* ]] || return 1
-  done
+  systemctl show --property=ExecStart --value k3s 2>/dev/null | \
+    /usr/local/libexec/kcs-v2-validate-k3s-exec \
+      control "$control_address" "$tls_san" "$interface" || return 1
   if systemctl is-active --quiet k3s && ! validate_control_node; then
     return 1
   fi

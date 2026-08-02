@@ -339,6 +339,46 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     assert public_bind.returncode == 2
     assert "private or non-global overlay" in public_bind.stderr
 
+    exec_validator = ROOT / "deploy/v2/kcs-v2-validate-k3s-exec.py"
+    effective_exec = (
+        "{ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s server "
+        "--bind-address=10.77.0.10 --advertise-address=10.77.0.10 "
+        "--node-ip=10.77.0.10 --tls-san=kcs-v2.internal.example "
+        "--node-label=researchcosmos.io/role=control --flannel-iface=eth0 "
+        "--kubelet-arg=address=10.77.0.10 ; ignore_errors=no ; }"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(exec_validator),
+            "control",
+            "10.77.0.10",
+            "kcs-v2.internal.example",
+            "eth0",
+        ],
+        input=effective_exec,
+        text=True,
+        check=True,
+    )
+    conflicting_exec = effective_exec.replace(
+        "--bind-address=10.77.0.10", "--bind-address=10.77.0.10 --bind-address=0.0.0.0"
+    )
+    conflict = subprocess.run(
+        [
+            sys.executable,
+            str(exec_validator),
+            "control",
+            "10.77.0.10",
+            "kcs-v2.internal.example",
+            "eth0",
+        ],
+        input=conflicting_exec,
+        capture_output=True,
+        text=True,
+    )
+    assert conflict.returncode == 2
+    assert conflict.stderr == "effective k3s service configuration mismatch\n"
+
     assert token.read_bytes() == b"synthetic-task9-service-token"
     assert b"\n" not in token.read_bytes()
     for event in events:
