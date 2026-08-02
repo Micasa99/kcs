@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import importlib.resources
+import logging
 import os
 import re
 import tempfile
@@ -69,6 +70,7 @@ _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+log = logging.getLogger("kcs")
 
 
 def _canonical_openapi_bytes(path: Path | None) -> bytes:
@@ -159,6 +161,12 @@ class _V2Route(APIRoute):
             except KcsV2Error as error:
                 response = _error_response(error, request)
             except Exception:
+                log.exception(
+                    "unhandled KCS V2 route failure requestId=%s method=%s path=%s",
+                    _request_id(request),
+                    request.method,
+                    request.url.path,
+                )
                 response = _error_response(_InternalRouteError(), request)
             response.headers.setdefault("Cache-Control", "no-store")
             return response
