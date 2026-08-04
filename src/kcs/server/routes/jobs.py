@@ -30,6 +30,7 @@ from kcs.jobs.canonical import DigestMismatchError as CanonicalDigestMismatchErr
 from kcs.jobs.contracts import (
     AgentStartRequest,
     CancelJobRequest,
+    CapacitySnapshot,
     CreateJobRequest,
     CredentialGrantMetadata,
     CredentialGrantSnapshot,
@@ -40,6 +41,7 @@ from kcs.jobs.contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    QueueSnapshot,
     RoleLogs,
     TransferCancelRequest,
     TransferRegisterRequest,
@@ -65,7 +67,7 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.0.0"
+API_VERSION = "2.1.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -308,6 +310,26 @@ def create_jobs_router(
         route_class=_V2Route,
         dependencies=[Depends(require_v2_caller), Depends(_require_json_media_type)],
     )
+
+    @router.get(
+        "/api/v2/capacity",
+        operation_id="getCapacity",
+        tags=["Cluster observations"],
+        response_model=CapacitySnapshot,
+        responses=_error_responses(401, 403, 500, 503),
+    )
+    def get_capacity() -> Response:
+        return _json_model(provider.capacity())
+
+    @router.get(
+        "/api/v2/queue",
+        operation_id="getQueue",
+        tags=["Cluster observations"],
+        response_model=QueueSnapshot,
+        responses=_error_responses(401, 403, 500, 503),
+    )
+    def get_queue() -> Response:
+        return _json_model(provider.queue())
 
     @router.post(
         "/api/v2/jobs",

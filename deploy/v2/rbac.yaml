@@ -19,7 +19,7 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "patch", "delete"]
+    verbs: ["create", "get", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "patch"]
@@ -51,3 +51,25 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: kcs-v2-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kcs-v2-capacity-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kcs-v2-capacity-reader
+subjects:
+  - kind: ServiceAccount
+    name: kcs-v2-api
+    namespace: researchcosmos-v2
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kcs-v2-capacity-reader

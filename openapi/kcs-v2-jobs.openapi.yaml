@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KCS V2 Hosted Attempt API
-  version: 2.0.0
+  version: 2.1.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -43,6 +43,7 @@ tags:
   - {name: Credentials}
   - {name: Transfers}
   - {name: Workspace}
+  - {name: Cluster observations}
   - {name: Contract}
 paths:
   /api/v2/jobs:
@@ -985,6 +986,46 @@ paths:
         '500': *Error500
         '503': *Error503
         '504': *Error504
+  /api/v2/capacity:
+    get:
+      tags: [Cluster observations]
+      operationId: getCapacity
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: >-
+            Fresh Kubernetes Node capacity, allocatable resources, and requests from
+            KCS V2 managed Jobs. Requests are not resource utilization.
+          content: {application/json: {schema: {$ref: '#/components/schemas/CapacitySnapshot'}}}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+        '503': *Error503
+  /api/v2/queue:
+    get:
+      tags: [Cluster observations]
+      operationId: getQueue
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: >-
+            Fresh projection of KCS V2 managed Jobs that Kubernetes has not made ready;
+            this is not a second scheduling queue.
+          content: {application/json: {schema: {$ref: '#/components/schemas/QueueSnapshot'}}}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+        '503': *Error503
   /api/v2/openapi.json:
     get:
       tags: [Contract]
@@ -1005,7 +1046,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.0.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.1.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -1132,6 +1173,88 @@ components:
       required: [researchcosmos.io/pool]
       properties:
         researchcosmos.io/pool: {type: string, const: gpu}
+    QueueReason:
+      type: string
+      enum: [unschedulable, image_pull, quota, provisioning, unknown]
+    GpuCapacitySnapshot:
+      type: object
+      additionalProperties: false
+      required: [kind, capacity, allocatable, requestedByManagedJobs]
+      properties:
+        kind: {type: string, const: nvidia.com/gpu}
+        capacity: {type: integer, minimum: 0}
+        allocatable: {type: integer, minimum: 0}
+        requestedByManagedJobs: {type: integer, minimum: 0}
+    CpuCapacitySnapshot:
+      type: object
+      additionalProperties: false
+      required: [capacityMilli, allocatableMilli, requestedByManagedJobsMilli]
+      properties:
+        capacityMilli: {type: integer, minimum: 0}
+        allocatableMilli: {type: integer, minimum: 0}
+        requestedByManagedJobsMilli: {type: integer, minimum: 0}
+    MemoryCapacitySnapshot:
+      type: object
+      additionalProperties: false
+      required: [capacityBytes, allocatableBytes, requestedByManagedJobsBytes]
+      properties:
+        capacityBytes: {type: integer, minimum: 0}
+        allocatableBytes: {type: integer, minimum: 0}
+        requestedByManagedJobsBytes: {type: integer, minimum: 0}
+    CapacityNodeSnapshot:
+      type: object
+      additionalProperties: false
+      required: [displayComputeNode, pool, ready, conditions, gpu, cpu, memory, managedJobCount]
+      properties:
+        displayComputeNode: {type: string, minLength: 1, maxLength: 128}
+        pool: {type: string, minLength: 1, maxLength: 128}
+        ready: {type: boolean}
+        conditions:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 128}
+        gpu: {$ref: '#/components/schemas/GpuCapacitySnapshot'}
+        cpu: {$ref: '#/components/schemas/CpuCapacitySnapshot'}
+        memory: {$ref: '#/components/schemas/MemoryCapacitySnapshot'}
+        managedJobCount: {type: integer, minimum: 0}
+    CapacitySnapshot:
+      type: object
+      additionalProperties: false
+      required: [observedAt, nodes]
+      properties:
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        nodes:
+          type: array
+          items: {$ref: '#/components/schemas/CapacityNodeSnapshot'}
+    QueueRequestedResources:
+      type: object
+      additionalProperties: false
+      required: [gpu, cpuMilli, memoryBytes]
+      properties:
+        gpu: {type: integer, minimum: 0}
+        cpuMilli: {type: integer, minimum: 0}
+        memoryBytes: {type: integer, minimum: 0}
+    PendingJobSnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, subjectRef, createdAt, reason, message, requested]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        reason: {$ref: '#/components/schemas/QueueReason'}
+        message: {type: string, maxLength: 512, x-kcs-maxUtf8Bytes: 512}
+        requested: {$ref: '#/components/schemas/QueueRequestedResources'}
+    QueueSnapshot:
+      type: object
+      additionalProperties: false
+      required: [observedAt, pending]
+      properties:
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        pending:
+          type: array
+          items: {$ref: '#/components/schemas/PendingJobSnapshot'}
     AgentResources:
       type: object
       additionalProperties: false

@@ -4,8 +4,8 @@ api:
   baseUrl: https://kcs-v2.private.example.invalid:8443
   caFile: /path/to/untracked/kcs-v2-ca.pem
   image: registry.example.invalid/researchcosmos/kcs-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
-  expectedVersion: "2.0.0"
-  expectedOpenapiSha256: efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e
+  expectedVersion: "2.1.0"
+  expectedOpenapiSha256: 14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229
 
 workloads:
   agentImage: registry.example.invalid/researchcosmos/kcs-conformance-agent@sha256:2222222222222222222222222222222222222222222222222222222222222222

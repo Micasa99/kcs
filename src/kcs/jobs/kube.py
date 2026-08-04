@@ -39,6 +39,8 @@ class BatchV1Api(Protocol):
 
     def read_namespaced_job(self, *, name: str, namespace: str) -> Any: ...
 
+    def list_namespaced_job(self, *, namespace: str, label_selector: str) -> Any: ...
+
     def delete_namespaced_job(
         self,
         *,
@@ -54,6 +56,8 @@ class CoreV1Api(Protocol):
     """The small generated CoreV1Api surface used by this adapter."""
 
     def list_namespaced_pod(self, *, namespace: str, label_selector: str) -> Any: ...
+
+    def list_node(self) -> Any: ...
 
     def read_namespaced_pod(self, *, name: str, namespace: str) -> Any: ...
 
@@ -117,6 +121,30 @@ class V2KubeAdapter:
     def create_job(self, body: Any) -> Any:
         """Create a rendered Job in the adapter namespace."""
         return self._batch.create_namespaced_job(namespace=self.namespace, body=body)
+
+    def list_nodes(self) -> list[Any]:
+        """List cluster Node facts for the read-only capacity feed."""
+        return list(_value(self._core.list_node(), "items") or ())
+
+    def list_managed_jobs(self) -> list[Any]:
+        """List only KCS V2 Jobs in the fixed runtime namespace."""
+        from .cluster_feed import MANAGED_SELECTOR
+
+        result = self._batch.list_namespaced_job(
+            namespace=self.namespace,
+            label_selector=MANAGED_SELECTOR,
+        )
+        return list(_value(result, "items") or ())
+
+    def list_managed_pods(self) -> list[Any]:
+        """List only KCS V2 Pods in the fixed runtime namespace."""
+        from .cluster_feed import MANAGED_SELECTOR
+
+        result = self._core.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=MANAGED_SELECTOR,
+        )
+        return list(_value(result, "items") or ())
 
     def read_job(self, job_ref: str) -> Any | None:
         """Read a Job by its deterministic job ref, returning ``None`` for 404."""

@@ -12,6 +12,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "openapi" / "kcs-v2-jobs.openapi.yaml"
 EXPECTED_PATHS = {
+    "/api/v2/capacity",
+    "/api/v2/queue",
     "/api/v2/jobs",
     "/api/v2/jobs/{jobRef}",
     "/api/v2/jobs/{jobRef}/logs",
@@ -29,6 +31,8 @@ EXPECTED_PATHS = {
     "/api/v2/openapi.json",
 }
 EXPECTED_OPERATIONS = {
+    "/api/v2/capacity": {"get"},
+    "/api/v2/queue": {"get"},
     "/api/v2/jobs": {"get", "post"},
     "/api/v2/jobs/{jobRef}": {"get", "delete"},
     "/api/v2/jobs/{jobRef}/logs": {"get"},
@@ -79,7 +83,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.0.0"
+    assert openapi["info"]["version"] == "2.1.0"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {
         path: {method for method in item if method in {"get", "post", "put", "delete"}}

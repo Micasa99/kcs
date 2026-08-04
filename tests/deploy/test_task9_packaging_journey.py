@@ -77,7 +77,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     )
     digest = hashlib.sha256(packaged).hexdigest()
     assert packaged == canonical
-    assert digest == "efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e"
+    assert digest == "14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229"
     events.append({"event": "canonical_package_resource", "sha256": digest})
 
     namespace = _documents("deploy/v2/namespace.yaml")[0]
@@ -93,6 +93,8 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         "ServiceAccount/kcs-v2-workload",
         "Role/kcs-v2-api",
         "RoleBinding/kcs-v2-api",
+        "ClusterRole/kcs-v2-capacity-reader",
+        "ClusterRoleBinding/kcs-v2-capacity-reader",
     }
     assert rbac["ServiceAccount/kcs-v2-workload"]["automountServiceAccountToken"] is False
     binding = rbac["RoleBinding/kcs-v2-api"]
@@ -104,7 +106,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         }
     ]
     expected_verbs = {
-        ("batch", "jobs"): {"create", "get", "patch", "delete"},
+        ("batch", "jobs"): {"create", "get", "list", "patch", "delete"},
         ("", "pods"): {"get", "list", "patch"},
         ("", "pods/log"): {"get"},
         ("", "pods/exec"): {"get", "create"},
@@ -117,6 +119,9 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         for resource in rule["resources"]
     }
     assert actual_verbs == expected_verbs
+    assert rbac["ClusterRole/kcs-v2-capacity-reader"]["rules"] == [
+        {"apiGroups": [""], "resources": ["nodes"], "verbs": ["list"]}
+    ]
 
     api_docs = _documents("deploy/v2/kcs-api.yaml")
     deployment = next(item for item in api_docs if item["kind"] == "Deployment")

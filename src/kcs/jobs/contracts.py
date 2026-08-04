@@ -257,6 +257,78 @@ class LogContainer(StrEnum):
     WORKSPACE = "workspace"
 
 
+class QueueReason(StrEnum):
+    UNSCHEDULABLE = "unschedulable"
+    IMAGE_PULL = "image_pull"
+    QUOTA = "quota"
+    PROVISIONING = "provisioning"
+    UNKNOWN = "unknown"
+
+
+class GpuCapacitySnapshot(ContractModel):
+    kind: Literal["nvidia.com/gpu"]
+    capacity: Annotated[StrictInt, Field(ge=0)]
+    allocatable: Annotated[StrictInt, Field(ge=0)]
+    requested_by_managed_jobs: Annotated[StrictInt, Field(ge=0)]
+
+
+class CpuCapacitySnapshot(ContractModel):
+    capacity_milli: Annotated[StrictInt, Field(ge=0)]
+    allocatable_milli: Annotated[StrictInt, Field(ge=0)]
+    requested_by_managed_jobs_milli: Annotated[StrictInt, Field(ge=0)]
+
+
+class MemoryCapacitySnapshot(ContractModel):
+    capacity_bytes: Annotated[StrictInt, Field(ge=0)]
+    allocatable_bytes: Annotated[StrictInt, Field(ge=0)]
+    requested_by_managed_jobs_bytes: Annotated[StrictInt, Field(ge=0)]
+
+
+class CapacityNodeSnapshot(ContractModel):
+    display_compute_node: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    pool: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    ready: StrictBool
+    conditions: Annotated[
+        list[Annotated[StrictStr, Field(min_length=1, max_length=128)]],
+        Field(max_length=64),
+    ]
+    gpu: GpuCapacitySnapshot
+    cpu: CpuCapacitySnapshot
+    memory: MemoryCapacitySnapshot
+    managed_job_count: Annotated[StrictInt, Field(ge=0)]
+
+
+class CapacitySnapshot(ContractModel):
+    observed_at: Timestamp
+    nodes: list[CapacityNodeSnapshot]
+
+
+class QueueRequestedResources(ContractModel):
+    gpu: Annotated[StrictInt, Field(ge=0)]
+    cpu_milli: Annotated[StrictInt, Field(ge=0)]
+    memory_bytes: Annotated[StrictInt, Field(ge=0)]
+
+
+class PendingJobSnapshot(ContractModel):
+    job_ref: OpaqueRef
+    subject_ref: OpaqueRef
+    created_at: Timestamp
+    reason: QueueReason
+    message: Annotated[StrictStr, Field(max_length=512)]
+    requested: QueueRequestedResources
+
+    @model_validator(mode="after")
+    def validate_message_bytes(self) -> PendingJobSnapshot:
+        if len(self.message.encode("utf-8")) > 512:
+            raise ValueError("queue message exceeds the 512-byte UTF-8 bound")
+        return self
+
+
+class QueueSnapshot(ContractModel):
+    observed_at: Timestamp
+    pending: list[PendingJobSnapshot]
+
+
 class AgentRequestedResources(ContractModel):
     cpu_millis: Annotated[StrictInt, Field(ge=1, le=8000)]
     memory_mib: Annotated[StrictInt, Field(ge=1, le=32768)]

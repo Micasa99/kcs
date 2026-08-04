@@ -1,4 +1,4 @@
-# KCS V2 Hosted Attempt API 2.0.0
+# KCS V2 Hosted Attempt API 2.1.0
 
 The wire authority is `openapi/kcs-v2-jobs.openapi.yaml` (OpenAPI 3.1.0). KCS owns
 provider workload reality only: it accepts opaque owner references, does not import
@@ -10,7 +10,7 @@ Generated component schemas and the checksum file are deterministic review artif
 the YAML remains the source of truth. The committed
 [canonical compact JSON](../openapi/generated/kcs-v2-jobs.openapi.json) and
 [checksum](../openapi/generated/kcs-v2-jobs.openapi.sha256) currently have digest
-`efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e`.
+`14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229`.
 
 ## Runtime boundary and topology
 
@@ -47,14 +47,37 @@ forbidden request-body logging, sensitive-header redaction, and
 | Cancel/discard transfer | `POST /api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel`; `DELETE /api/v2/jobs/{jobRef}/transfers/{transferRef}` |
 | Invoke/inspect workspace | `POST /api/v2/jobs/{jobRef}/workspace/invoke`; `GET /api/v2/jobs/{jobRef}/operations/{operationRef}` |
 | Finalize/cancel | `POST /api/v2/jobs/{jobRef}/finalize`; `POST /api/v2/jobs/{jobRef}/cancel` |
+| Capacity observation | `GET /api/v2/capacity` |
+| Pending managed Jobs | `GET /api/v2/queue` |
 | Canonical OpenAPI | `GET /api/v2/openapi.json` |
 
 The OpenAPI endpoint returns the exact committed canonical JSON with `ETag` equal to
-its SHA-256, `X-KCS-API-Version: 2.0.0`, and `Cache-Control: no-store`. Required wire
+its SHA-256, `X-KCS-API-Version: 2.1.0`, and `Cache-Control: no-store`. Required wire
 headers are declared per response with `x-kcs-required-headers`; the generator checks
 that declaration for every status, including statuses without a route example. Every
 response from credential grant/inspect, transfer content PUT/GET, and canonical
 OpenAPI discovery carries the declared `Cache-Control: no-store` policy.
+
+## Capacity and queue observations
+
+`GET /api/v2/capacity` rebuilds a snapshot directly from Kubernetes Nodes and Pods.
+It reports capacity, allocatable resources, and the declared requests of active Pods
+carrying `researchcosmos.io/managed-by=v2-attempt-runtime`. Those requests are the
+scheduler reservation input, not CPU, memory, or GPU utilization. No utilization
+field exists without a separate metrics/DCGM source. `managedJobCount` counts the
+distinct managed Jobs with active Pods assigned to a Node. Raw Kubernetes node names
+are not returned: an operator may set
+`researchcosmos.io/display-compute-node`; otherwise KCS emits a stable SHA-256-derived
+alias. The pool is the `researchcosmos.io/pool` label or `unlabeled`.
+
+`GET /api/v2/queue` lists only nonterminal managed Jobs that do not yet have a Ready
+Pod. It is a projection of Kubernetes reality, not a KCS scheduling state machine.
+Reasons are closed to `unschedulable`, `image_pull`, `quota`, `provisioning`, and
+`unknown`; messages are control-character normalized, private address/URL redacted,
+and bounded to 512 UTF-8 bytes. Requested GPU, CPU, and memory come from the same Pod
+or Job template requests Kubernetes schedules. Neither endpoint exposes Secrets,
+kubeconfig, internal node identity, billing, balance, tenant quota negotiation, or a
+mutation surface.
 
 ## Identity, digest, replay, and recovery
 
@@ -247,7 +270,7 @@ suite uses only an explicitly synthetic binary fixture, never a credential JSON
 field. The request is
 service-to-service only over TLS/private ingress, requires the private credential
 writer authorization role, forbids body logging, redacts sensitive headers, and
-returns `Cache-Control: no-store`. Bearer service auth is the V2.0.0 wire mechanism;
+returns `Cache-Control: no-store`. Bearer service auth is the V2.1.0 wire mechanism;
 mTLS is not mandatory.
 
 The request metadata is carried by these typed headers:
@@ -384,7 +407,7 @@ be NFC and may not contain Unicode general categories `Cc`, `Cf`, `Cs`, `Co`, `C
 `Zl`, or `Zp`. It preserves path case but rejects registration when the requested
 path case-folds to an existing workspace path.
 
-V2.0.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
+V2.1.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
 It exposes no signed URL or transfer token and implements no `Range` request mode.
 Clients must use the OpenAPI feature declaration (`transferModes: [direct]`,
 `rangeRequests: false`, `signedTransfers: false`) to negotiate or fail closed.
@@ -524,7 +547,7 @@ Bearer service authentication, TLS, and private ingress are required globally fo
 all V2 routes. Raw credential upload additionally requires the private
 credential-writer role, forbidden body logging, sensitive-header redaction, and
 `Cache-Control: no-store`. mTLS may be deployed as an infrastructure
-control but is not a V2.0.0 wire requirement. Routes additionally require the
+control but is not a V2.1.0 wire requirement. Routes additionally require the
 declared service authorization role: `v2-reader`, `v2-mutator`, or, for raw
 credential upload, `v2-private-credential-writer`.
 
@@ -610,7 +633,7 @@ The same generation/check command owns the byte-identical
 `kcs.openapi/kcs-v2-jobs.openapi.json` package resource. The V2 route reads that
 resource through Python package-resource APIs, so an installed wheel never reaches
 back into a source checkout. Its digest remains
-`efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e`.
+`14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229`.
 
 ## Fixed conformance actions
 
@@ -647,6 +670,10 @@ using the dedicated API ServiceAccount, TLS/Bearer Secret references, HTTPS star
 readiness/liveness probes, a bounded TMPDIR `emptyDir`, and ephemeral-storage
 requests/limits. Its Service is TLS-only ClusterIP. Attempt Jobs retain only the
 closed GPU worker selector; neither role receives a service token.
+
+The API Role can list managed Jobs and Pods only in `researchcosmos-v2`. A separate
+ClusterRole grants only `list` on Nodes for the capacity snapshot; it grants no Node,
+Pod, Job, scheduling, exec, Secret, or quota mutation.
 
 The root and conformance Containerfiles are fixed to linux/amd64 digest-pinned bases,
 pin `setuptools==80.9.0` and `wheel==0.45.1`, build with `--no-build-isolation`, and

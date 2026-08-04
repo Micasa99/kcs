@@ -21,6 +21,7 @@ from typing import Any, Literal, Protocol, overload
 from uuid import UUID
 
 from .canonical import canonical_bytes, canonical_digest
+from .cluster_feed import ClusterFeed
 from .contracts import (
     ActionSnapshot,
     ActionState,
@@ -30,6 +31,7 @@ from .contracts import (
     AgentStartRequest,
     CancelJobRequest,
     CancelSpec,
+    CapacitySnapshot,
     CleanupObservation,
     CleanupState,
     CreateJobRequest,
@@ -47,6 +49,7 @@ from .contracts import (
     LogContainer,
     OperationState,
     ProviderTerminalState,
+    QueueSnapshot,
     RoleLogs,
     RoleState,
     RunnerState,
@@ -150,6 +153,12 @@ class V2KubeAdapterProtocol(Protocol):
     def delete_job(self, job_ref: str, job_uid: str) -> None: ...
 
     def list_job_pods(self, job_ref: str, job_uid: str | None = None) -> Sequence[object]: ...
+
+    def list_nodes(self) -> Sequence[object]: ...
+
+    def list_managed_jobs(self) -> Sequence[object]: ...
+
+    def list_managed_pods(self) -> Sequence[object]: ...
 
     def read_role_logs(
         self,
@@ -314,6 +323,7 @@ class V2JobProvider:
         self._sleeper = sleeper or time.sleep
         self._transport = transport
         self._workspace_transport = workspace_transport
+        self._cluster_feed = ClusterFeed(kube, clock=self._clock)
         self._lifecycle = LifecycleGate(store)
         self._startup_reconcile = False
         self._workspace_runtime = WorkspaceRuntime(
@@ -324,6 +334,14 @@ class V2JobProvider:
             self._now,
         )
         self.reconcile_credentials()
+
+    def capacity(self) -> CapacitySnapshot:
+        """Return a fresh, read-only projection of Kubernetes Node capacity."""
+        return self._cluster_feed.capacity()
+
+    def queue(self) -> QueueSnapshot:
+        """Return managed Jobs that Kubernetes has not made ready."""
+        return self._cluster_feed.queue()
 
     def reconcile_credentials(self) -> int:
         """Reconcile retained grant intent against namespace-bound Secret reality."""

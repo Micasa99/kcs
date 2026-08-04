@@ -76,6 +76,8 @@ MUTATION_OPERATION_IDS = {
     "deleteJob",
 }
 OPERATION_AUTHORIZATION = {
+    "getCapacity": "v2-reader",
+    "getQueue": "v2-reader",
     "createJob": "v2-mutator",
     "listJobs": "v2-reader",
     "inspectJob": "v2-reader",
@@ -97,6 +99,8 @@ OPERATION_AUTHORIZATION = {
     "getCanonicalOpenApi": "v2-reader",
 }
 EXPECTED_OPERATION_LOCATIONS = {
+    "getCapacity": ("get", "/api/v2/capacity"),
+    "getQueue": ("get", "/api/v2/queue"),
     "createJob": ("post", "/api/v2/jobs"),
     "listJobs": ("get", "/api/v2/jobs"),
     "inspectJob": ("get", "/api/v2/jobs/{jobRef}"),
@@ -155,8 +159,8 @@ EXPECTED_ROOT_LIMITS = {
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "7fee71dd3250e77b57f29361615cc20941ca3c32cd54282f027322de8bab0749"
-CANONICAL_OPENAPI_SHA256 = "efcbb64fc1d96ec5f7797eda92405a4ae5c596b3a7864dad6396e423a09e193e"
+CANONICAL_X_KCS_POLICY_SHA256 = "46119ab77ba8da46decfa5ad22f165f45b8d695654e08b23d365a41aff3eeeb8"
+CANONICAL_OPENAPI_SHA256 = "14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -744,7 +748,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.0.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.1.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -2821,8 +2825,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.0.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.0.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.1.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.1.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")
