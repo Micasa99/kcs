@@ -196,15 +196,28 @@ class PayloadTooLargeError(KcsV2Error):
 class ReplacementPodError(KcsV2Error):
     code = "REPLACEMENT_POD"
     status_code = 409
-    recovery_action = "new_attempt"
+    recovery_action = "reattach"
     default_message = "The Job has multiple or replacement Pod identities"
 
 
 class StaleBindingError(KcsV2Error):
     code = "STALE_BINDING"
     status_code = 409
-    recovery_action = "new_attempt"
+    recovery_action = "inspect_job"
     default_message = "The supplied immutable Job or Pod binding is stale"
+
+
+class TerminalBusyError(KcsV2Error):
+    code = "TERMINAL_BUSY"
+    status_code = 409
+    recovery_action = "inspect_terminal"
+    default_message = "Another writable Workspace terminal already owns the single-writer lease"
+
+
+class TerminalCredentialError(KcsV2Error):
+    code = "TERMINAL_CREDENTIAL_INVALID"
+    status_code = 401
+    default_message = "The Workspace terminal credential is missing, invalid, or expired"
 
 
 class TombstonedError(KcsV2Error):

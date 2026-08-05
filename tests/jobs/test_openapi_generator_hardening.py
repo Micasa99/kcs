@@ -523,6 +523,7 @@ def test_actual_route_extensions_exclude_identity_and_bind_projected_payload() -
         "cancelTransfer": ("transfers.json", "transfer-cancel"),
         "discardTransfer": ("transfers.json", "transfer-discard"),
         "invokeWorkspace": ("workspace.json", "invoke-new"),
+        "createTerminalSession": ("terminals.json", "terminal-create"),
         "finalizeJob": ("jobs.json", "finalize-provider-quiesce"),
         "cancelJob": ("jobs.json", "cancel-output-loss"),
         "deleteJob": ("jobs.json", "delete-tombstone"),
@@ -623,6 +624,8 @@ def test_actual_route_extensions_exclude_identity_and_bind_projected_payload() -
                     payload_body["spec"]["reason"] = "changed-reason"
                 elif operation_id == "invokeWorkspace":
                     payload_body["payload"]["synthetic"] = False
+                elif operation_id == "createTerminalSession":
+                    payload_body["spec"]["ttlSeconds"] += 1
                 elif operation_id == "finalizeJob":
                     payload_body["spec"]["drainTimeoutSeconds"] += 1
                 elif operation_id == "cancelJob":
@@ -1243,7 +1246,6 @@ def test_transfer_terminal_state_requires_successful_matching_action(
     ("schema_name", "fixture_name", "mutation"),
     [
         ("JobBindingSnapshot", "job-binding.json", {"observedPodCount": 0}),
-        ("JobBindingSnapshot", "job-binding.json", {"observedPodCount": 2}),
         (
             "GenerationSnapshot",
             "generation.json",

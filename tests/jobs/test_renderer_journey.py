@@ -62,7 +62,7 @@ def test_create_contract_renders_the_fixed_dual_role_job_journey() -> None:
     )
     assert job.metadata.labels["researchcosmos.io/managed-by"] == "v2-attempt-runtime"
     assert job.spec.completions == job.spec.parallelism == 1
-    assert job.spec.backoff_limit == 0
+    assert job.spec.backoff_limit == 1
     assert pod.restart_policy == "Never"
     assert pod.automount_service_account_token is False
     assert pod.service_account_name == "kcs-v2-workload"

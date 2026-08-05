@@ -145,7 +145,10 @@ class V2JobRenderer:
                 template=template,
                 completions=1,
                 parallelism=1,
-                backoff_limit=0,
+                # One replacement Pod remains the same KCS Job / Research
+                # Attempt.  The provider records both immutable Pod UIDs and
+                # requires explicit reattach before new workspace effects.
+                backoff_limit=1,
                 active_deadline_seconds=spec.active_deadline_seconds,
             ),
         )

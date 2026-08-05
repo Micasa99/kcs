@@ -2,7 +2,7 @@
 
 The provider is deliberately limited to physical Kubernetes facts.  It reserves a
 stable create identity before dispatch, reconciles a possibly lost create response,
-and treats the first observed Pod UID as immutable binding reality.
+and keeps every Pod incarnation under the immutable Job UID.
 """
 # ruff: noqa: E501
 
@@ -13,6 +13,8 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -47,12 +49,19 @@ from .contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    NvidiaDeviceTelemetry,
+    NvidiaTelemetrySnapshot,
     OperationState,
+    PodIncarnationSnapshot,
+    PodIncarnationState,
     ProviderTerminalState,
     QueueSnapshot,
     RoleLogs,
     RoleState,
     RunnerState,
+    TerminalCreateRequest,
+    TerminalSessionSnapshot,
+    TerminalState,
     TransferCancelRequest,
     TransferObservation,
     TransferRegisterRequest,
@@ -87,6 +96,8 @@ from .errors import (
     StaleCursorError,
     StalePageTokenError,
     StateConflictError,
+    TerminalBusyError,
+    TerminalCredentialError,
     TombstonedError,
     TransferIndeterminateError,
 )
@@ -118,6 +129,8 @@ DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 DEFAULT_LOG_LIMIT_BYTES = 65536
 MAX_LOG_LIMIT_BYTES = 1048576
+TERMINAL_WRITER_KIND = "terminal-writer"
+TERMINAL_WRITER_ID = "workspace"
 DEFAULT_TOMBSTONE_TTL_SECONDS = 604800
 DEFAULT_DELETE_POLL_ATTEMPTS = 20
 DEFAULT_DELETE_POLL_INTERVAL_SECONDS = 0.25
@@ -169,11 +182,56 @@ class V2KubeAdapterProtocol(Protocol):
         limit_bytes: int,
     ) -> object: ...
 
+    def exec_workspace_readonly(
+        self,
+        binding: Mapping[str, str],
+        command: tuple[str, ...],
+        *,
+        timeout_seconds: float = 15.0,
+        output_limit_bytes: int = 65536,
+    ) -> object: ...
+
     def create_secret(self, body: object) -> object: ...
 
     def read_secret(self, name: str) -> object | None: ...
 
     def delete_secret(self, name: str, secret_uid: str) -> bool: ...
+
+    def open_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        *,
+        rows: int = 24,
+        columns: int = 80,
+    ) -> None: ...
+
+    def write_workspace_terminal(
+        self, binding: Mapping[str, str], terminal_ref: str, content: bytes
+    ) -> None: ...
+
+    def read_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        cursor: int,
+        limit_bytes: int,
+    ) -> tuple[bytes, int, bool]: ...
+
+    def resize_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        *,
+        rows: int,
+        columns: int,
+    ) -> None: ...
+
+    def close_workspace_terminal(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> bool: ...
+
+    def terminal_is_open(self, binding: Mapping[str, str], terminal_ref: str) -> bool: ...
 
 
 class V2JobStoreProtocol(Protocol):
@@ -193,7 +251,12 @@ class V2JobStoreProtocol(Protocol):
 
     def mark_created(self, provider_request_id: str, job_uid: str) -> object: ...
 
-    def bind_first_pod(self, provider_request_id: str, pod_uid: str) -> object: ...
+    def bind_pod_incarnation(
+        self,
+        provider_request_id: str,
+        pod_uid: str,
+        incarnation_json: str | None = None,
+    ) -> object: ...
 
     def mark_indeterminate(self, provider_request_id: str, reason: str) -> object: ...
 
@@ -277,6 +340,15 @@ class CredentialGrantResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalCreateResult:
+    """Public descriptor plus a private header credential for this response."""
+
+    snapshot: TerminalSessionSnapshot
+    credential: str
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class JobListQuery:
     page_token: str | None = None
     page_size: int = DEFAULT_PAGE_SIZE
@@ -333,7 +405,9 @@ class V2JobProvider:
             self._assert_accepting_workspace_work,
             self._now,
         )
+        self._terminal_lifecycle_lock = threading.RLock()
         self.reconcile_credentials()
+        self.reconcile_terminals()
 
     def capacity(self) -> CapacitySnapshot:
         """Return a fresh, read-only projection of Kubernetes Node capacity."""
@@ -342,6 +416,505 @@ class V2JobProvider:
     def queue(self) -> QueueSnapshot:
         """Return managed Jobs that Kubernetes has not made ready."""
         return self._cluster_feed.queue()
+
+    def nvidia_telemetry(self, job_ref: str) -> NvidiaTelemetrySnapshot:
+        """Read NVIDIA driver observations from the exact bound Workspace Pod.
+
+        This fixed probe is observation-only.  It neither accepts caller argv
+        nor feeds scheduling decisions, and missing driver data fails typed
+        instead of being rewritten as zero utilization.
+        """
+
+        binding = self._live_binding(job_ref)
+        if binding.pod_uid is None or binding.node_name is None:
+            raise StateConflictError("The Job has no running compute placement")
+        if binding.workspace is None or binding.workspace.requested.gpu < 1:
+            raise StateConflictError("The bound Workspace has no NVIDIA GPU allocation")
+        probe = self._kube.exec_workspace_readonly(
+            {
+                "jobRef": job_ref,
+                "jobUid": str(binding.job_uid),
+                "podUid": str(binding.pod_uid),
+            },
+            (
+                "nvidia-smi",
+                "--query-gpu=uuid,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ),
+        )
+        if int(_field(probe, "exit_code", -1)) != 0:
+            raise DependencyUnavailableError("NVIDIA telemetry probe did not succeed")
+        rows = str(_field(probe, "stdout", "")).splitlines()
+        devices: list[NvidiaDeviceTelemetry] = []
+        try:
+            for row in rows:
+                fields = [item.strip() for item in row.split(",")]
+                if len(fields) != 5 or any(not item or item == "N/A" for item in fields):
+                    raise ValueError
+                devices.append(
+                    NvidiaDeviceTelemetry(
+                        device_id=fields[0],
+                        utilization_percent=int(float(fields[1])),
+                        memory_used_mib=int(float(fields[2])),
+                        memory_total_mib=int(float(fields[3])),
+                        temperature_celsius=int(float(fields[4])),
+                    )
+                )
+        except (TypeError, ValueError) as error:
+            raise DependencyUnavailableError("NVIDIA telemetry output was malformed") from error
+        if not devices:
+            raise DependencyUnavailableError("NVIDIA telemetry returned no allocated device")
+        return NvidiaTelemetrySnapshot(
+            job_ref=job_ref,
+            job_uid=binding.job_uid,
+            pod_uid=binding.pod_uid,
+            compute_node=self._cluster_feed.display_compute_node(binding.node_name),
+            observed_at=self._now(),
+            devices=devices,
+        )
+
+    def create_terminal(
+        self,
+        job_ref: str,
+        request: TerminalCreateRequest,
+    ) -> TerminalCreateResult:
+        """Acquire the single Workspace writer and open an exact Pod PTY."""
+
+        with self._terminal_lifecycle_lock:
+            return self._create_terminal(job_ref, request)
+
+    def _create_terminal(
+        self,
+        job_ref: str,
+        request: TerminalCreateRequest,
+    ) -> TerminalCreateResult:
+        self.reconcile_terminals()
+        binding = self._live_binding(job_ref)
+        spec = request.spec
+        if (
+            binding.subject_ref != spec.subject_ref
+            or str(binding.job_uid) != str(spec.job_uid)
+            or str(binding.pod_uid) != str(spec.pod_uid)
+        ):
+            raise StaleBindingError()
+        if self._transport is None:
+            raise DependencyUnavailableError("Agent pause transport is unavailable")
+        now = self._now()
+        expires = now + timedelta(seconds=spec.ttl_seconds)
+        credential = secrets.token_urlsafe(32)
+        credential_sha = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        values = {
+            "identityDigest": request.request_digest,
+            "requestDigest": request.request_digest,
+            "subjectRef": spec.subject_ref,
+            "jobUid": str(spec.job_uid),
+            "podUid": str(spec.pod_uid),
+            "state": "opening",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires.isoformat(),
+            "observedAt": now.isoformat(),
+            "credentialSha256": credential_sha,
+            "agentPaused": "false",
+        }
+        record, created = self._store.reserve_runtime(
+            "terminal", request.terminal_ref, job_ref, values
+        )
+        retained = _runtime_values(record)
+        if retained.get("identityDigest") != request.request_digest:
+            raise IdentityDigestConflict()
+        if not created:
+            values = dict(retained)
+            expires = _as_datetime(values.get("expiresAt"), now)
+            if expires <= now or values.get("state") in {"closed", "expired", "lost"}:
+                raise StateConflictError("The retained terminal session is no longer attachable")
+            values["credentialSha256"] = credential_sha
+            values["observedAt"] = now.isoformat()
+
+        exact = {
+            "jobRef": job_ref,
+            "jobUid": str(binding.job_uid),
+            "podUid": str(binding.pod_uid),
+        }
+        claimed = False
+        try:
+            self._claim_terminal_writer(exact, request.terminal_ref)
+            claimed = True
+            paused = self._transport.pause_agent(exact)
+            if paused.state not in {"paused", "idle", "exited"}:
+                raise StateConflictError("The Agent writer did not enter a paused state")
+            self._kube.open_workspace_terminal(exact, request.terminal_ref)
+        except Exception:
+            if claimed:
+                try:
+                    self._kube.close_workspace_terminal(exact, request.terminal_ref)
+                except Exception:
+                    pass
+                try:
+                    self._transport.resume_agent(exact)
+                except Exception:
+                    pass
+            values.update(
+                {
+                    "state": "lost",
+                    "agentPaused": "false",
+                    "observedAt": self._now().isoformat(),
+                }
+            )
+            try:
+                self._store.update_runtime(
+                    "terminal", job_ref, request.terminal_ref, values
+                )
+            except Exception:
+                pass
+            if claimed:
+                self._release_terminal_writer(exact, request.terminal_ref)
+            raise
+        values.update(
+            {
+                "state": "open",
+                "agentPaused": "true",
+                "observedAt": self._now().isoformat(),
+            }
+        )
+        record = self._store.update_runtime(
+            "terminal", job_ref, request.terminal_ref, values
+        )
+        return TerminalCreateResult(
+            snapshot=self._terminal_snapshot(record),
+            credential=credential,
+            created=created,
+        )
+
+    def inspect_terminal(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        *,
+        subject_ref: str,
+        credential: str,
+    ) -> TerminalSessionSnapshot:
+        record, _binding = self._terminal_access(
+            job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+        )
+        return self._terminal_snapshot(record)
+
+    def write_terminal(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        content: bytes,
+        *,
+        subject_ref: str,
+        credential: str,
+    ) -> TerminalSessionSnapshot:
+        record, binding = self._terminal_access(
+            job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+        )
+        self._kube.write_workspace_terminal(binding, terminal_ref, content)
+        return self._touch_terminal(record)
+
+    def read_terminal(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        *,
+        cursor: int,
+        limit_bytes: int,
+        subject_ref: str,
+        credential: str,
+    ) -> tuple[bytes, int, bool, TerminalSessionSnapshot]:
+        record, binding = self._terminal_access(
+            job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+        )
+        content, next_cursor, open_state = self._kube.read_workspace_terminal(
+            binding, terminal_ref, cursor, limit_bytes
+        )
+        return content, next_cursor, open_state, self._touch_terminal(record)
+
+    def resize_terminal(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        *,
+        rows: int,
+        columns: int,
+        subject_ref: str,
+        credential: str,
+    ) -> TerminalSessionSnapshot:
+        record, binding = self._terminal_access(
+            job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+        )
+        self._kube.resize_workspace_terminal(
+            binding, terminal_ref, rows=rows, columns=columns
+        )
+        return self._touch_terminal(record)
+
+    def close_terminal(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        *,
+        subject_ref: str,
+        credential: str,
+    ) -> TerminalSessionSnapshot:
+        record, binding = self._terminal_access(
+            job_ref,
+            terminal_ref,
+            subject_ref=subject_ref,
+            credential=credential,
+            allow_closed=True,
+        )
+        values = dict(_runtime_values(record))
+        if values.get("state") == "closed":
+            return self._terminal_snapshot(record)
+        try:
+            self._kube.close_workspace_terminal(binding, terminal_ref)
+        finally:
+            if self._transport is not None:
+                self._transport.resume_agent(binding)
+        values.update(
+            {
+                "state": "closed",
+                "agentPaused": "false",
+                "observedAt": self._now().isoformat(),
+            }
+        )
+        updated = self._store.update_runtime("terminal", job_ref, terminal_ref, values)
+        self._release_terminal_writer(binding, terminal_ref)
+        return self._terminal_snapshot(updated)
+
+    def reconcile_terminals(self) -> int:
+        """Release Agent pause after expiry, API restart, or lost PTY state."""
+
+        with self._terminal_lifecycle_lock:
+            return self._reconcile_terminals()
+
+    def _reconcile_terminals(self) -> int:
+        indeterminate = 0
+        for record in self._store.list_runtime("terminal", None):
+            values = dict(_runtime_values(record))
+            if values.get("state") not in {"opening", "open"}:
+                continue
+            job_ref = str(_field(record, "job_ref"))
+            binding = {
+                "jobRef": job_ref,
+                "jobUid": values.get("jobUid", ""),
+                "podUid": values.get("podUid", ""),
+            }
+            binding_check_failed = False
+            try:
+                current = self._live_binding(job_ref)
+                stale_binding = (
+                    str(current.job_uid) != binding["jobUid"]
+                    or str(current.pod_uid) != binding["podUid"]
+                )
+            except (JobNotFoundError, StateConflictError, TombstonedError):
+                stale_binding = True
+            except Exception:
+                stale_binding = False
+                binding_check_failed = True
+            expired = _as_datetime(values.get("expiresAt"), self._now()) <= self._now()
+            alive = self._kube.terminal_is_open(binding, str(_field(record, "identity")))
+            if binding_check_failed and not expired:
+                indeterminate += 1
+                continue
+            if not expired and alive and not stale_binding:
+                continue
+            terminal_ref = str(_field(record, "identity"))
+            cleanup_failed = False
+            try:
+                self._kube.close_workspace_terminal(binding, terminal_ref)
+            except Exception:
+                cleanup_failed = True
+            try:
+                if self._transport is not None:
+                    self._transport.resume_agent(binding)
+            except Exception:
+                cleanup_failed = True
+            exact_pod_exists = False
+            try:
+                exact_pod_exists = any(
+                    _required_text(pod, "metadata", "uid") == binding["podUid"]
+                    for pod in self._list_job_pods(job_ref, binding["jobUid"])
+                )
+            except Exception:
+                if cleanup_failed:
+                    indeterminate += 1
+                    continue
+            if cleanup_failed and exact_pod_exists:
+                indeterminate += 1
+                continue
+            values.update(
+                {
+                    "state": "expired" if expired else "lost",
+                    "agentPaused": "false",
+                    "observedAt": self._now().isoformat(),
+                }
+            )
+            self._store.update_runtime("terminal", job_ref, terminal_ref, values)
+            self._release_terminal_writer(binding, terminal_ref)
+        return indeterminate
+
+    def _claim_terminal_writer(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> None:
+        identity_digest = canonical_digest(
+            {"jobRef": binding["jobRef"], "writer": "workspace"}
+        )
+        desired = {
+            "identityDigest": identity_digest,
+            "jobUid": binding["jobUid"],
+            "podUid": binding["podUid"],
+            "terminalRef": terminal_ref,
+            "state": "held",
+            "observedAt": self._now().isoformat(),
+        }
+        record, created = self._store.reserve_runtime(
+            TERMINAL_WRITER_KIND,
+            TERMINAL_WRITER_ID,
+            binding["jobRef"],
+            desired,
+        )
+        if created:
+            return
+        for _ in range(8):
+            values = _runtime_values(record)
+            if values.get("state") == "held":
+                if (
+                    values.get("terminalRef") == terminal_ref
+                    and values.get("jobUid") == binding["jobUid"]
+                    and values.get("podUid") == binding["podUid"]
+                ):
+                    return
+                raise TerminalBusyError()
+            resource_version = _field(record, "resource_version", None)
+            if not isinstance(resource_version, str) or not resource_version:
+                raise DependencyUnavailableError(
+                    "terminal writer reservation has no resource version"
+                )
+            claimed = self._store.compare_and_swap_runtime(
+                TERMINAL_WRITER_KIND,
+                binding["jobRef"],
+                TERMINAL_WRITER_ID,
+                desired,
+                expected_resource_version=resource_version,
+            )
+            if claimed is not None:
+                return
+            record = self._store.read_runtime(
+                TERMINAL_WRITER_KIND, binding["jobRef"], TERMINAL_WRITER_ID
+            )
+            if record is None:
+                raise DependencyUnavailableError(
+                    "terminal writer reservation disappeared during claim"
+                )
+        raise DependencyUnavailableError("terminal writer reservation changed concurrently")
+
+    def _release_terminal_writer(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> None:
+        for _ in range(8):
+            record = self._store.read_runtime(
+                TERMINAL_WRITER_KIND, binding["jobRef"], TERMINAL_WRITER_ID
+            )
+            if record is None:
+                return
+            values = dict(_runtime_values(record))
+            if values.get("terminalRef") != terminal_ref or values.get("state") != "held":
+                return
+            resource_version = _field(record, "resource_version", None)
+            if not isinstance(resource_version, str) or not resource_version:
+                raise DependencyUnavailableError(
+                    "terminal writer reservation has no resource version"
+                )
+            values.update({"state": "released", "observedAt": self._now().isoformat()})
+            released = self._store.compare_and_swap_runtime(
+                TERMINAL_WRITER_KIND,
+                binding["jobRef"],
+                TERMINAL_WRITER_ID,
+                values,
+                expected_resource_version=resource_version,
+            )
+            if released is not None:
+                return
+        raise DependencyUnavailableError("terminal writer release changed concurrently")
+
+    def _terminal_access(
+        self,
+        job_ref: str,
+        terminal_ref: str,
+        *,
+        subject_ref: str,
+        credential: str,
+        allow_closed: bool = False,
+    ) -> tuple[object, dict[str, str]]:
+        record = self._store.read_runtime("terminal", job_ref, terminal_ref)
+        if record is None:
+            raise JobNotFoundError()
+        values = _runtime_values(record)
+        expected = values.get("credentialSha256", "")
+        supplied = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        if (
+            values.get("subjectRef") != subject_ref
+            or not expected
+            or not hmac.compare_digest(expected, supplied)
+        ):
+            raise TerminalCredentialError()
+        if _as_datetime(values.get("expiresAt"), self._now()) <= self._now():
+            raise TerminalCredentialError()
+        state = values.get("state")
+        if state != "open" and not (allow_closed and state == "closed"):
+            raise StateConflictError("The terminal session is not open")
+        if allow_closed and state == "closed":
+            return record, {
+                "jobRef": job_ref,
+                "jobUid": values["jobUid"],
+                "podUid": values["podUid"],
+            }
+        current = self._live_binding(job_ref)
+        if (
+            current.subject_ref != subject_ref
+            or str(current.job_uid) != values.get("jobUid")
+            or str(current.pod_uid) != values.get("podUid")
+        ):
+            raise StaleBindingError()
+        binding = {
+            "jobRef": job_ref,
+            "jobUid": str(current.job_uid),
+            "podUid": str(current.pod_uid),
+        }
+        if state == "open" and not self._kube.terminal_is_open(binding, terminal_ref):
+            raise StateConflictError("The retained terminal PTY is no longer attached")
+        return record, binding
+
+    def _touch_terminal(self, record: object) -> TerminalSessionSnapshot:
+        values = dict(_runtime_values(record))
+        values["observedAt"] = self._now().isoformat()
+        updated = self._store.update_runtime(
+            "terminal",
+            str(_field(record, "job_ref")),
+            str(_field(record, "identity")),
+            values,
+        )
+        return self._terminal_snapshot(updated)
+
+    def _terminal_snapshot(self, record: object) -> TerminalSessionSnapshot:
+        values = _runtime_values(record)
+        return TerminalSessionSnapshot(
+            terminal_ref=str(_field(record, "identity")),
+            request_digest=values["requestDigest"],
+            subject_ref=values["subjectRef"],
+            job_ref=str(_field(record, "job_ref")),
+            job_uid=UUID(values["jobUid"]),
+            pod_uid=UUID(values["podUid"]),
+            container="workspace",
+            state=TerminalState(values["state"]),
+            created_at=_as_datetime(values.get("createdAt"), self._now()),
+            expires_at=_as_datetime(values.get("expiresAt"), self._now()),
+            observed_at=_as_datetime(values.get("observedAt"), self._now()),
+            writable=True,
+            agent_paused=values.get("agentPaused") == "true",
+        )
 
     def reconcile_credentials(self) -> int:
         """Reconcile retained grant intent against namespace-bound Secret reality."""
@@ -400,6 +973,7 @@ class V2JobProvider:
         self._startup_reconcile = True
         try:
             report.indeterminate += self.reconcile_credentials()
+            report.indeterminate += self.reconcile_terminals()
             for record in self._store.list_create():
                 report.scanned += 1
                 job_ref = str(_field(record, "job_ref"))
@@ -625,18 +1199,11 @@ class V2JobProvider:
         retained_job_uid = _field(record, "job_uid", None)
         if deleting:
             pods = tuple(self._list_job_pods(job_ref, actual_job_uid))
-            pod_uids = tuple(_required_text(pod, "metadata", "uid") for pod in pods)
-            unique_pod_uids = set(pod_uids)
-            retained_pod_uid = _field(record, "pod_uid", None)
             replacement_reason: str | None = None
             if retained_job_uid is not None and str(retained_job_uid) != actual_job_uid:
                 replacement_reason = "Job UID changed"
-            elif len(pods) > 1 or len(unique_pod_uids) > 1:
-                replacement_reason = "multiple Pod identities observed for one Job"
-            elif retained_pod_uid is not None and pod_uids and str(retained_pod_uid) != pod_uids[0]:
-                replacement_reason = "replacement Pod UID differs from the immutable binding"
-            elif retained_pod_uid is not None and not pods:
-                replacement_reason = "the immutable Pod is no longer observable"
+            elif _current_pod(pods)[1] is not None:
+                replacement_reason = _current_pod(pods)[1]
             snapshot = self._snapshot(record, job, pods, replacement_reason=replacement_reason)
             return self._deleting_snapshot(snapshot, record)
         if retained_job_uid is not None and str(retained_job_uid) != actual_job_uid:
@@ -649,22 +1216,21 @@ class V2JobProvider:
             )
 
         pods = tuple(self._list_job_pods(job_ref, actual_job_uid))
-        retained_pod_uid = _field(record, "pod_uid", None)
-        pod_uids = tuple(_required_text(pod, "metadata", "uid") for pod in pods)
-        unique_pod_uids = set(pod_uids)
+        current_pod, selection_reason = _current_pod(pods)
         replacement_reason = _optional_text(record, "indeterminate_reason")
         if replacement_reason is not None:
             pass
-        elif len(pods) > 1 or len(unique_pod_uids) > 1:
-            replacement_reason = "multiple Pod identities observed for one Job"
-        elif retained_pod_uid is not None and pod_uids and str(retained_pod_uid) != pod_uids[0]:
-            replacement_reason = "replacement Pod UID differs from the immutable binding"
-        elif retained_pod_uid is not None and not pods:
-            replacement_reason = "the immutable Pod is no longer observable"
-        elif retained_pod_uid is None and len(pods) == 1:
+        elif selection_reason is not None:
+            replacement_reason = selection_reason
+        elif current_pod is not None:
+            current_uid = _required_text(current_pod, "metadata", "uid")
             try:
-                record = self._store.bind_first_pod(
-                    str(_field(record, "provider_request_id")), pod_uids[0]
+                observed_at = self._now()
+                incarnation = _pod_incarnation(current_pod, observed_at)
+                record = self._store.bind_pod_incarnation(
+                    str(_field(record, "provider_request_id")),
+                    current_uid,
+                    incarnation.model_dump_json(by_alias=True),
                 )
             except ReplacementPodError:
                 replacement_reason = "Pod binding changed during reconciliation"
@@ -1927,14 +2493,19 @@ class V2JobProvider:
 
     def _roles_are_terminal(self, job_ref: str, job_uid: str, pod_uid: str) -> bool:
         pods = self._list_job_pods(job_ref, job_uid)
-        if len(pods) != 1 or _required_text(pods[0], "metadata", "uid") != pod_uid:
+        pod, selection_reason = _current_pod(pods)
+        if (
+            pod is None
+            or selection_reason is not None
+            or _required_text(pod, "metadata", "uid") != pod_uid
+        ):
             return False
         job = self._read_job(job_ref)
         if job is None or _required_text(job, "metadata", "uid") != job_uid:
             return False
         role_statuses = [
             status
-            for status in (_path(pods[0], "status", "container_statuses") or ())
+            for status in (_path(pod, "status", "container_statuses") or ())
             if _field(status, "name", None) in {"agent", "workspace"}
         ]
         roles_terminal = (
@@ -2799,7 +3370,7 @@ class V2JobProvider:
         replacement_reason: str | None,
     ) -> JobBindingSnapshot:
         observed_at = self._now()
-        pod = pods[0] if len(pods) == 1 else None
+        pod = _current_pod(pods)[0] if replacement_reason is None else None
         binding_state, binding_reason = _binding_state(job, pod, replacement_reason)
         workload_terminal = binding_state in {
             JobBindingState.SUCCEEDED,
@@ -2827,13 +3398,16 @@ class V2JobProvider:
         gpu_release_state = (
             CleanupState.PENDING if _workspace_gpu(record) > 0 else CleanupState.NOT_REQUIRED
         )
+        current_pod_uid = str(pod_uid) if pod_uid is not None else None
         grants = [
             self._grant_snapshot(item)
             for item in self._runtime_records("credential", str(_field(record, "job_ref")))
+            if _runtime_values(item).get("podUid") == current_pod_uid
         ]
         generations = [
             self._generation_snapshot(item, replayed=False)
             for item in self._runtime_records("generation", str(_field(record, "job_ref")))
+            if _runtime_values(item).get("podUid") == current_pod_uid
         ]
         runtime_job_ref = str(_field(record, "job_ref"))
         operations = [
@@ -2844,6 +3418,7 @@ class V2JobProvider:
                 )[0],
             )
             for item in self._runtime_records("operation", runtime_job_ref)
+            if _runtime_values(item).get("podUid") == current_pod_uid
         ]
         transfers = [
             (
@@ -2853,6 +3428,7 @@ class V2JobProvider:
                 ),
             )
             for item in self._runtime_records("transfer", runtime_job_ref)
+            if _runtime_values(item).get("podUid") == current_pod_uid
         ]
         finalizations = self._runtime_records("finalize", runtime_job_ref)
         cancellations = self._runtime_records("cancel", runtime_job_ref)
@@ -2910,6 +3486,7 @@ class V2JobProvider:
             binding_state=binding_state,
             binding_reason=binding_reason,
             observed_pod_count=len(pods),
+            pod_incarnations=_pod_incarnations(record, pods, observed_at),
             created_at=created_at,
             updated_at=updated_at,
             started_at=started_at,
@@ -2975,6 +3552,7 @@ class V2JobProvider:
             binding_reason=_optional_text(record, "indeterminate_reason")
             or "the retained Job is no longer observable",
             observed_pod_count=0,
+            pod_incarnations=_pod_incarnations(record, (), observed_at),
             created_at=created_at,
             updated_at=_as_datetime(_field(record, "updated_at", None), observed_at),
             started_at=None,
@@ -3200,6 +3778,87 @@ def _validate_runtime_binding(record: object, job_uid: str, pod_uid: str) -> obj
     if values.get("jobUid") != job_uid or values.get("podUid") != pod_uid:
         raise DependencyUnavailableError("runtime observation binding is inconsistent")
     return record
+
+
+def _current_pod(pods: Sequence[object]) -> tuple[object | None, str | None]:
+    """Select the one writable incarnation while retaining terminal history."""
+
+    active = [
+        pod
+        for pod in pods
+        if str(_path(pod, "status", "phase") or "") not in {"Succeeded", "Failed"}
+        and _path(pod, "metadata", "deletion_timestamp") is None
+    ]
+    if len(active) > 1:
+        return None, "multiple active Pod identities observed for one Job"
+    if len(active) == 1:
+        return active[0], None
+    if not pods:
+        return None, None
+
+    def order(pod: object) -> tuple[str, str]:
+        created = _path(pod, "metadata", "creation_timestamp")
+        return (str(created or ""), _required_text(pod, "metadata", "uid"))
+
+    return max(pods, key=order), None
+
+
+def _pod_incarnation(pod: object, observed_at: datetime) -> PodIncarnationSnapshot:
+    phase = str(_path(pod, "status", "phase") or "")
+    state = {
+        "Pending": PodIncarnationState.PENDING,
+        "Running": PodIncarnationState.RUNNING,
+        "Succeeded": PodIncarnationState.SUCCEEDED,
+        "Failed": PodIncarnationState.FAILED,
+    }.get(phase, PodIncarnationState.UNKNOWN)
+    reason = _optional_path_text(pod, "status", "reason")
+    finished: list[datetime] = []
+    for status in _path(pod, "status", "container_statuses") or ():
+        value = _path(status, "state", "terminated", "finished_at")
+        parsed = _as_optional_datetime(value)
+        if parsed is not None:
+            finished.append(parsed)
+    return PodIncarnationSnapshot(
+        pod_name=_required_text(pod, "metadata", "name"),
+        pod_uid=UUID(_required_text(pod, "metadata", "uid")),
+        node_name=_optional_path_text(pod, "spec", "node_name"),
+        state=state,
+        reason=reason,
+        started_at=_as_optional_datetime(_path(pod, "status", "start_time")),
+        finished_at=max(finished) if finished else None,
+        observed_at=observed_at,
+    )
+
+
+def _pod_incarnations(
+    record: object,
+    pods: Sequence[object],
+    observed_at: datetime,
+) -> list[PodIncarnationSnapshot]:
+    retained: dict[str, PodIncarnationSnapshot] = {}
+    encoded = _field(record, "pod_incarnations_json", None)
+    if isinstance(encoded, str):
+        try:
+            values = json.loads(encoded)
+            if not isinstance(values, list):
+                raise ValueError
+            for value in values:
+                if isinstance(value, dict) and set(value) == {"podUid"}:
+                    continue  # legacy/store-only binding; live Pod fills the observation
+                snapshot = PodIncarnationSnapshot.model_validate(value)
+                retained[str(snapshot.pod_uid)] = snapshot
+        except (TypeError, ValueError):
+            raise DependencyUnavailableError("Pod incarnation history is malformed") from None
+    for pod in pods:
+        snapshot = _pod_incarnation(pod, observed_at)
+        retained[str(snapshot.pod_uid)] = snapshot
+    return sorted(
+        retained.values(),
+        key=lambda item: (
+            item.started_at.isoformat() if item.started_at is not None else "",
+            str(item.pod_uid),
+        ),
+    )
 
 
 def _finalize_action(records: Sequence[object]) -> ActionSnapshot:

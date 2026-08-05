@@ -128,7 +128,7 @@ class _Kube:
             )
         return [
             {
-                "metadata": {"uid": str(POD_UID)},
+                "metadata": {"name": "job-1-pod-1", "uid": str(POD_UID)},
                 "status": {"container_statuses": statuses},
             }
         ]

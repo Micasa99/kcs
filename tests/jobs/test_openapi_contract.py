@@ -17,6 +17,7 @@ EXPECTED_PATHS = {
     "/api/v2/jobs",
     "/api/v2/jobs/{jobRef}",
     "/api/v2/jobs/{jobRef}/logs",
+    "/api/v2/jobs/{jobRef}/telemetry/nvidia",
     "/api/v2/jobs/{jobRef}/agent/credential-grants",
     "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",
     "/api/v2/jobs/{jobRef}/agent/start",
@@ -25,6 +26,11 @@ EXPECTED_PATHS = {
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel",
     "/api/v2/jobs/{jobRef}/workspace/invoke",
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions",
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input",
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output",
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize",
     "/api/v2/jobs/{jobRef}/operations/{operationRef}",
     "/api/v2/jobs/{jobRef}/finalize",
     "/api/v2/jobs/{jobRef}/cancel",
@@ -36,6 +42,7 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs": {"get", "post"},
     "/api/v2/jobs/{jobRef}": {"get", "delete"},
     "/api/v2/jobs/{jobRef}/logs": {"get"},
+    "/api/v2/jobs/{jobRef}/telemetry/nvidia": {"get"},
     "/api/v2/jobs/{jobRef}/agent/credential-grants": {"post"},
     "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}": {"get"},
     "/api/v2/jobs/{jobRef}/agent/start": {"post"},
@@ -44,6 +51,11 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content": {"get", "put"},
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel": {"post"},
     "/api/v2/jobs/{jobRef}/workspace/invoke": {"post"},
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions": {"post"},
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}": {"get", "delete"},
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input": {"post"},
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output": {"get"},
+    "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize": {"post"},
     "/api/v2/jobs/{jobRef}/operations/{operationRef}": {"get"},
     "/api/v2/jobs/{jobRef}/finalize": {"post"},
     "/api/v2/jobs/{jobRef}/cancel": {"post"},
@@ -83,7 +95,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.1.0"
+    assert openapi["info"]["version"] == "2.2.0"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {
         path: {method for method in item if method in {"get", "post", "put", "delete"}}

@@ -61,6 +61,13 @@ NO_STORE_OPERATION_IDS = {
     "putTransferContent",
     "getTransferContent",
     "getCanonicalOpenApi",
+    "getNvidiaTelemetry",
+    "createTerminalSession",
+    "inspectTerminalSession",
+    "writeTerminalInput",
+    "readTerminalOutput",
+    "resizeTerminalSession",
+    "closeTerminalSession",
 }
 MUTATION_OPERATION_IDS = {
     "createJob",
@@ -74,6 +81,7 @@ MUTATION_OPERATION_IDS = {
     "finalizeJob",
     "cancelJob",
     "deleteJob",
+    "createTerminalSession",
 }
 OPERATION_AUTHORIZATION = {
     "getCapacity": "v2-reader",
@@ -97,6 +105,13 @@ OPERATION_AUTHORIZATION = {
     "finalizeJob": "v2-mutator",
     "cancelJob": "v2-mutator",
     "getCanonicalOpenApi": "v2-reader",
+    "getNvidiaTelemetry": "v2-reader",
+    "createTerminalSession": "v2-mutator",
+    "inspectTerminalSession": "v2-reader",
+    "writeTerminalInput": "v2-mutator",
+    "readTerminalOutput": "v2-reader",
+    "resizeTerminalSession": "v2-mutator",
+    "closeTerminalSession": "v2-mutator",
 }
 EXPECTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
@@ -135,6 +150,31 @@ EXPECTED_OPERATION_LOCATIONS = {
     "finalizeJob": ("post", "/api/v2/jobs/{jobRef}/finalize"),
     "cancelJob": ("post", "/api/v2/jobs/{jobRef}/cancel"),
     "getCanonicalOpenApi": ("get", "/api/v2/openapi.json"),
+    "getNvidiaTelemetry": ("get", "/api/v2/jobs/{jobRef}/telemetry/nvidia"),
+    "createTerminalSession": (
+        "post",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions",
+    ),
+    "inspectTerminalSession": (
+        "get",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
+    ),
+    "writeTerminalInput": (
+        "post",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input",
+    ),
+    "readTerminalOutput": (
+        "get",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output",
+    ),
+    "resizeTerminalSession": (
+        "post",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize",
+    ),
+    "closeTerminalSession": (
+        "delete",
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
+    ),
 }
 EXPECTED_ROOT_FEATURES = {
     "transferModes": ["direct"],
@@ -159,8 +199,8 @@ EXPECTED_ROOT_LIMITS = {
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "46119ab77ba8da46decfa5ad22f165f45b8d695654e08b23d365a41aff3eeeb8"
-CANONICAL_OPENAPI_SHA256 = "14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229"
+CANONICAL_X_KCS_POLICY_SHA256 = "a2d0a4ed8bbaec9ba0eb8504bf969db21a578080ab623cd8a0d67dc765fbf314"
+CANONICAL_OPENAPI_SHA256 = "8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -194,6 +234,7 @@ REQUIRED_SCENARIOS = {
     "finalize-provider-quiesce",
     "cancel-output-loss",
     "delete-tombstone",
+    "terminal-create",
     "typed-error",
 }
 SECRET_VALUE = re.compile(
@@ -748,7 +789,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.1.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.2.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -2117,6 +2158,7 @@ def _validate_scenario_semantics(
         "finalize-provider-quiesce": "202",
         "cancel-output-loss": "202",
         "delete-tombstone": "200",
+        "terminal-create": "201",
         "typed-error": "404",
     }
     if set(expected_status) != REQUIRED_SCENARIOS:
@@ -2825,8 +2867,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.1.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.1.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.2.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.2.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")

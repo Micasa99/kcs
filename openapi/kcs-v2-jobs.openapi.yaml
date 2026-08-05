@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KCS V2 Hosted Attempt API
-  version: 2.1.0
+  version: 2.2.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -43,6 +43,7 @@ tags:
   - {name: Credentials}
   - {name: Transfers}
   - {name: Workspace}
+  - {name: Workspace terminal}
   - {name: Cluster observations}
   - {name: Contract}
 paths:
@@ -213,7 +214,7 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         DIGEST_MISMATCH: {status: 422, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -283,6 +284,44 @@ paths:
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
+  /api/v2/jobs/{jobRef}/telemetry/nvidia:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    get:
+      tags: [Cluster observations]
+      operationId: getNvidiaTelemetry
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: Fresh NVIDIA driver observations from the exact bound Workspace Pod.
+          x-kcs-required-headers: [Cache-Control]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/NvidiaTelemetrySnapshot'}}}
+        '401': &NoStoreError
+          description: Sanitized no-store route error; sensitive bytes are not returned.
+          x-kcs-required-headers: [Cache-Control]
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
   /api/v2/jobs/{jobRef}/agent/credential-grants:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -303,8 +342,8 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_grant}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
         CREDENTIAL_ACTIVE: {status: 409, recoveryAction: inspect_grant}
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
@@ -367,12 +406,7 @@ paths:
           headers:
             Cache-Control: {schema: {type: string, const: no-store}}
           content: {application/json: {schema: {$ref: '#/components/schemas/CredentialGrantSnapshot'}}}
-        '400': &NoStoreError
-          description: Sanitized no-store route error; sensitive bytes are not returned.
-          x-kcs-required-headers: [Cache-Control]
-          headers:
-            Cache-Control: {schema: {type: string, const: no-store}}
-          content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
+        '400': *NoStoreError
         '401': *NoStoreError
         '403': *NoStoreError
         '404': *NoStoreError
@@ -395,7 +429,7 @@ paths:
         UNAUTHENTICATED: {status: 401, recoveryAction: none}
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       responses:
@@ -425,8 +459,8 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
         ILLEGAL_GENERATION: {status: 409, recoveryAction: inspect_job}
         CREDENTIAL_EXPIRED: {status: 409, recoveryAction: inspect_grant}
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
@@ -488,8 +522,8 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
         OVERWRITE_FORBIDDEN: {status: 409, recoveryAction: inspect_transfer}
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
@@ -549,7 +583,7 @@ paths:
         UNAUTHENTICATED: {status: 401, recoveryAction: none}
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         GONE: {status: 410, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -627,7 +661,7 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         OVERWRITE_FORBIDDEN: {status: 409, recoveryAction: inspect_transfer}
         TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
@@ -688,7 +722,7 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_transfer}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         TRANSFER_BYTES_MISMATCH: {status: 409, recoveryAction: inspect_transfer}
         TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
         GONE: {status: 410, recoveryAction: none}
@@ -786,8 +820,8 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_operation}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_operation}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
         OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
@@ -842,6 +876,235 @@ paths:
         '500': *Error500
         '503': *Error503
         '504': *Error504
+  /api/v2/jobs/{jobRef}/workspace/terminal-sessions:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Workspace terminal]
+      operationId: createTerminalSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: [{in: body, name: terminalRef}]
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_terminal
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        TERMINAL_BUSY: {status: 409, recoveryAction: inspect_terminal}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TerminalCreateRequest'}
+      responses:
+        '201':
+          description: New exact Workspace PTY session; credential is returned only in a header.
+          x-kcs-required-headers: [Cache-Control, KCS-Terminal-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Terminal-Credential: {$ref: '#/components/headers/TerminalCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+        '200':
+          description: Stable first-wins replay with a rotated short-lived header credential.
+          x-kcs-required-headers: [Cache-Control, KCS-Terminal-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Terminal-Credential: {$ref: '#/components/headers/TerminalCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
+  /api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TerminalRef'}
+      - {$ref: '#/components/parameters/TerminalSubject'}
+      - {$ref: '#/components/parameters/TerminalCredential'}
+    get:
+      tags: [Workspace terminal]
+      operationId: inspectTerminalSession
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-error-codes: &TerminalErrors
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        TERMINAL_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses: &TerminalSnapshotResponses
+        '200':
+          description: Exact non-secret terminal descriptor.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+    delete:
+      tags: [Workspace terminal]
+      operationId: closeTerminalSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-error-codes: *TerminalErrors
+      responses: *TerminalSnapshotResponses
+  /api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TerminalRef'}
+      - {$ref: '#/components/parameters/TerminalSubject'}
+      - {$ref: '#/components/parameters/TerminalCredential'}
+    post:
+      tags: [Workspace terminal]
+      operationId: writeTerminalInput
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-no-request-body-log: true
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        TERMINAL_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, contentMediaType: application/octet-stream, maxLength: 65536}
+      responses:
+        '200':
+          description: Input accepted by the exact PTY.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TerminalRef'}
+      - {$ref: '#/components/parameters/TerminalSubject'}
+      - {$ref: '#/components/parameters/TerminalCredential'}
+    get:
+      tags: [Workspace terminal]
+      operationId: readTerminalOutput
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-error-codes: *TerminalErrors
+      parameters:
+        - {name: cursor, in: query, required: false, schema: {type: integer, minimum: 0, default: 0}}
+        - {name: limitBytes, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 65536, default: 65536}}
+      responses:
+        '200':
+          description: Bounded PTY output bytes.
+          x-kcs-required-headers: [Cache-Control, KCS-Terminal-Next-Cursor, KCS-Terminal-Open]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Terminal-Next-Cursor: {schema: {type: integer, minimum: 0}}
+            KCS-Terminal-Open: {schema: {type: boolean}}
+          content: {application/octet-stream: {schema: {type: string, contentMediaType: application/octet-stream, maxLength: 65536}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/TerminalRef'}
+      - {$ref: '#/components/parameters/TerminalSubject'}
+      - {$ref: '#/components/parameters/TerminalCredential'}
+    post:
+      tags: [Workspace terminal]
+      operationId: resizeTerminalSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        TERMINAL_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TerminalResizeRequest'}}}
+      responses:
+        '200':
+          description: PTY size updated.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/operations/{operationRef}:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -854,7 +1117,7 @@ paths:
         UNAUTHENTICATED: {status: 401, recoveryAction: none}
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         GONE: {status: 410, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -886,8 +1149,8 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
-        REPLACEMENT_POD: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
         TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
         OPERATION_INDETERMINATE: {status: 409, recoveryAction: inspect_operation}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
@@ -944,7 +1207,7 @@ paths:
         NOT_FOUND: {status: 404, recoveryAction: none}
         IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
         STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
-        STALE_BINDING: {status: 409, recoveryAction: new_attempt}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
         TRANSFER_INDETERMINATE: {status: 409, recoveryAction: inspect_transfer}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
         DIGEST_MISMATCH: {status: 422, recoveryAction: none}
@@ -1046,7 +1309,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.1.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.2.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -1099,6 +1362,12 @@ components:
     ContentSha256Header: {name: KCS-Content-SHA256, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
     ContentLengthHeader: {name: Content-Length, in: header, required: true, schema: {type: integer, minimum: 0, maximum: 107374182400}}
     OperationRefHeader: {name: KCS-Operation-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    TerminalRef: {name: terminalRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    TerminalSubject: {name: KCS-Subject-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    TerminalCredential: {name: KCS-Terminal-Credential, in: header, required: true, schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
+  headers:
+    NoStore: {schema: {type: string, const: no-store}}
+    TerminalCredential: {schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
   responses:
     BadRequest: *Error400
     Unauthorized: *Error401
@@ -1255,6 +1524,27 @@ components:
         pending:
           type: array
           items: {$ref: '#/components/schemas/PendingJobSnapshot'}
+    NvidiaDeviceTelemetry:
+      type: object
+      additionalProperties: false
+      required: [deviceId, utilizationPercent, memoryUsedMiB, memoryTotalMiB, temperatureCelsius]
+      properties:
+        deviceId: {type: string, minLength: 1, maxLength: 128}
+        utilizationPercent: {type: integer, minimum: 0, maximum: 100}
+        memoryUsedMiB: {type: integer, minimum: 0}
+        memoryTotalMiB: {type: integer, minimum: 1}
+        temperatureCelsius: {type: integer, minimum: -100, maximum: 250}
+    NvidiaTelemetrySnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, jobUid, podUid, computeNode, observedAt, devices]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        computeNode: {type: string, minLength: 1, maxLength: 128}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        devices: {type: array, minItems: 1, items: {$ref: '#/components/schemas/NvidiaDeviceTelemetry'}}
     AgentResources:
       type: object
       additionalProperties: false
@@ -1392,6 +1682,20 @@ components:
         finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         requested: {$ref: '#/components/schemas/WorkspaceRequestedResources'}
         observed: {$ref: '#/components/schemas/WorkspaceObservedResources'}
+    PodIncarnationState: {type: string, enum: [pending, running, succeeded, failed, unknown]}
+    PodIncarnationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [podName, podUid, nodeName, state, reason, startedAt, finishedAt, observedAt]
+      properties:
+        podName: {type: string, minLength: 1, maxLength: 253}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        nodeName: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/PodIncarnationState'}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     BindingIdentity:
       type: object
       additionalProperties: false
@@ -1495,6 +1799,49 @@ components:
         transferRef: {$ref: '#/components/schemas/OpaqueRef'}
         state: {$ref: '#/components/schemas/TransferState'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+    TerminalState: {type: string, enum: [opening, open, closed, expired, lost]}
+    TerminalCreateSpec:
+      type: object
+      additionalProperties: false
+      required: [subjectRef, jobUid, podUid, ttlSeconds]
+      properties:
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        ttlSeconds: {type: integer, minimum: 1, maximum: 900, default: 300}
+    TerminalCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [terminalRef, requestDigest, spec]
+      properties:
+        terminalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/TerminalCreateSpec'}
+    TerminalResizeRequest:
+      type: object
+      additionalProperties: false
+      required: [rows, columns]
+      properties:
+        rows: {type: integer, minimum: 1, maximum: 1000}
+        columns: {type: integer, minimum: 1, maximum: 1000}
+    TerminalSessionSnapshot:
+      type: object
+      additionalProperties: false
+      required: [terminalRef, requestDigest, subjectRef, jobRef, jobUid, podUid, container, state, createdAt, expiresAt, observedAt, writable, agentPaused]
+      properties:
+        terminalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        container: {type: string, const: workspace}
+        state: {$ref: '#/components/schemas/TerminalState'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        writable: {type: boolean, const: true}
+        agentPaused: {type: boolean}
     JobBindingSnapshot:
       type: object
       additionalProperties: false
@@ -1504,13 +1851,8 @@ components:
             properties: {bindingState: {const: running}}
           then:
             properties:
-              observedPodCount: {const: 1}
+              observedPodCount: {type: integer, minimum: 1}
               podUid: {$ref: '#/components/schemas/KubernetesUid'}
-        - if:
-            required: [observedPodCount]
-            properties: {observedPodCount: {type: integer, minimum: 2}}
-          then:
-            properties: {bindingState: {const: indeterminate}}
         - if:
             required: [bindingState]
             properties: {bindingState: {const: finalizing}}
@@ -1532,7 +1874,7 @@ components:
             properties:
               deleteAction:
                 properties: {state: {not: {const: not_requested}}}
-      required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, createdAt, updatedAt, startedAt, finishedAt, observedAt, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
+      required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
       properties:
         jobRef: {$ref: '#/components/schemas/OpaqueRef'}
         providerHandle: {$ref: '#/components/schemas/OpaqueRef'}
@@ -1548,6 +1890,7 @@ components:
         bindingState: {$ref: '#/components/schemas/JobBindingState'}
         bindingReason: {$ref: '#/components/schemas/NullableString'}
         observedPodCount: {type: integer, minimum: 0}
+        podIncarnations: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/PodIncarnationSnapshot'}}
         createdAt: {$ref: '#/components/schemas/Timestamp'}
         updatedAt: {$ref: '#/components/schemas/Timestamp'}
         startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
@@ -1914,10 +2257,10 @@ components:
         expiresAt: {$ref: '#/components/schemas/Timestamp'}
     ErrorCode:
       type: string
-      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
+      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
     RecoveryAction:
       type: string
-      enum: [retry_same, inspect_job, inspect_grant, inspect_transfer, inspect_operation, reconcile, new_attempt, none]
+      enum: [retry_same, inspect_job, inspect_grant, inspect_transfer, inspect_operation, inspect_terminal, reattach, reconcile, new_attempt, none]
     ErrorDetail:
       type: object
       additionalProperties: false

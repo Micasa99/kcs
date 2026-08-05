@@ -624,6 +624,8 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "inspect_grant",
         "inspect_transfer",
         "inspect_operation",
+        "inspect_terminal",
+        "reattach",
         "reconcile",
         "new_attempt",
         "none",
@@ -639,9 +641,12 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
     expected_authorization = {
         "createJob": "v2-mutator",
         "listJobs": "v2-reader",
+        "getCapacity": "v2-reader",
+        "getQueue": "v2-reader",
         "inspectJob": "v2-reader",
         "deleteJob": "v2-mutator",
         "getRoleLogs": "v2-reader",
+        "getNvidiaTelemetry": "v2-reader",
         "grantCredential": "v2-private-credential-writer",
         "inspectCredentialGrant": "v2-reader",
         "startAgent": "v2-mutator",
@@ -652,6 +657,12 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "getTransferContent": "v2-reader",
         "cancelTransfer": "v2-mutator",
         "invokeWorkspace": "v2-mutator",
+        "createTerminalSession": "v2-mutator",
+        "inspectTerminalSession": "v2-reader",
+        "writeTerminalInput": "v2-mutator",
+        "readTerminalOutput": "v2-reader",
+        "resizeTerminalSession": "v2-mutator",
+        "closeTerminalSession": "v2-mutator",
         "inspectWorkspaceOperation": "v2-reader",
         "finalizeJob": "v2-mutator",
         "cancelJob": "v2-mutator",
@@ -703,7 +714,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "source": "exact-response-bytes",
         "encoding": "lowercase-hex",
     }
-    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.1.0"
+    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.2.0"
     assert discovery["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
     assert document["x-kcs-legacy-authorization"] == {
         "v2NamespaceAccess": "denied",

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -98,6 +99,24 @@ class LogRead:
     container_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecRead:
+    """Bounded output from one fixed, non-interactive Workspace probe."""
+
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+@dataclass(slots=True)
+class _TerminalProcess:
+    binding: tuple[str, str, str]
+    websocket: Any
+    output: bytearray
+    base_cursor: int
+    lock: threading.Lock
+
+
 class V2KubeAdapter:
     """A fixed-namespace façade over the BatchV1 and CoreV1 clients."""
 
@@ -117,6 +136,8 @@ class V2KubeAdapter:
         self._core = core_api
         self._exec_core_api_factory = exec_core_api_factory or (lambda: self._core)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._terminals: dict[str, _TerminalProcess] = {}
+        self._terminals_lock = threading.Lock()
 
     def create_job(self, body: Any) -> Any:
         """Create a rendered Job in the adapter namespace."""
@@ -484,6 +505,227 @@ class V2KubeAdapter:
         finally:
             websocket.close()
 
+    def exec_workspace_readonly(
+        self,
+        binding: Mapping[str, str],
+        command: tuple[str, ...],
+        *,
+        timeout_seconds: float = 15.0,
+        output_limit_bytes: int = 65536,
+    ) -> ExecRead:
+        """Run one provider-owned read probe in the exact Workspace container.
+
+        The command is supplied only by trusted provider code, never by an API
+        request.  Exact Job/Pod UID lookup is repeated immediately before exec,
+        so a stale binding cannot drift to a replacement Pod.
+        """
+
+        from kubernetes.stream import stream  # type: ignore[import-untyped]
+
+        if not command or timeout_seconds <= 0 or output_limit_bytes < 1:
+            raise ValueError("readonly Workspace exec parameters are invalid")
+        pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        pod_name = str(_value(_value(pod, "metadata"), "name"))
+        websocket: Any = stream(
+            self._exec_core_api_factory().connect_get_namespaced_pod_exec,
+            pod_name,
+            self.namespace,
+            container="workspace",
+            command=list(command),
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
+        )
+        stdout: list[str] = []
+        stderr: list[str] = []
+        observed_bytes = 0
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while websocket.is_open() and time.monotonic() < deadline:
+                websocket.update(timeout=1)
+                while websocket.peek_stdout():
+                    chunk = str(websocket.read_stdout())
+                    observed_bytes += len(chunk.encode("utf-8"))
+                    if observed_bytes > output_limit_bytes:
+                        raise DependencyUnavailableError(
+                            "readonly Workspace probe exceeded its output bound"
+                        )
+                    stdout.append(chunk)
+                while websocket.peek_stderr():
+                    chunk = str(websocket.read_stderr())
+                    observed_bytes += len(chunk.encode("utf-8"))
+                    if observed_bytes > output_limit_bytes:
+                        raise DependencyUnavailableError(
+                            "readonly Workspace probe exceeded its output bound"
+                        )
+                    stderr.append(chunk)
+            if websocket.is_open():
+                raise DependencyTimeoutError("readonly Workspace probe did not complete")
+            return ExecRead(
+                stdout="".join(stdout),
+                stderr="".join(stderr),
+                exit_code=_exec_status(websocket.read_channel(3)),
+            )
+        except (DependencyTimeoutError, DependencyUnavailableError):
+            raise
+        except Exception as error:
+            raise DependencyUnavailableError("readonly Workspace probe failed") from error
+        finally:
+            websocket.close()
+
+    def open_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        *,
+        rows: int = 24,
+        columns: int = 80,
+    ) -> None:
+        """Open one PTY in the exact Workspace container, never the Agent."""
+
+        from kubernetes.stream import stream  # type: ignore[import-untyped]
+
+        if not terminal_ref or not 1 <= rows <= 1000 or not 1 <= columns <= 1000:
+            raise ValueError("terminal parameters are invalid")
+        pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        pod_name = str(_value(_value(pod, "metadata"), "name"))
+        identity = (binding["jobRef"], binding["jobUid"], binding["podUid"])
+        with self._terminals_lock:
+            if terminal_ref in self._terminals:
+                retained = self._terminals[terminal_ref]
+                if retained.binding != identity:
+                    raise StaleCursorError()
+                return
+            websocket: Any = stream(
+                self._exec_core_api_factory().connect_get_namespaced_pod_exec,
+                pod_name,
+                self.namespace,
+                container="workspace",
+                command=["/bin/sh"],
+                stderr=True,
+                stdin=True,
+                stdout=True,
+                tty=True,
+                _preload_content=False,
+            )
+            websocket.write_channel(
+                4,
+                json.dumps({"Height": rows, "Width": columns}, separators=(",", ":")),
+            )
+            self._terminals[terminal_ref] = _TerminalProcess(
+                binding=identity,
+                websocket=websocket,
+                output=bytearray(),
+                base_cursor=0,
+                lock=threading.Lock(),
+            )
+
+    def write_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        content: bytes,
+    ) -> None:
+        if len(content) > 65536:
+            raise ValueError("terminal input exceeds its bound")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("terminal input must be UTF-8") from error
+        session = self._terminal(binding, terminal_ref)
+        with session.lock:
+            if not session.websocket.is_open():
+                raise StaleCursorError()
+            session.websocket.write_stdin(text)
+
+    def read_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        cursor: int,
+        limit_bytes: int,
+    ) -> tuple[bytes, int, bool]:
+        if cursor < 0 or not 1 <= limit_bytes <= 65536:
+            raise ValueError("terminal output cursor or limit is invalid")
+        session = self._terminal(binding, terminal_ref)
+        with session.lock:
+            if session.websocket.is_open():
+                session.websocket.update(timeout=0)
+                while session.websocket.peek_stdout():
+                    session.output.extend(_terminal_bytes(session.websocket.read_stdout()))
+                while session.websocket.peek_stderr():
+                    session.output.extend(_terminal_bytes(session.websocket.read_stderr()))
+                if len(session.output) > 1048576:
+                    drop = len(session.output) - 1048576
+                    del session.output[:drop]
+                    session.base_cursor += drop
+            if cursor < session.base_cursor:
+                raise StaleCursorError()
+            offset = cursor - session.base_cursor
+            content = bytes(session.output[offset : offset + limit_bytes])
+            next_cursor = cursor + len(content)
+            return content, next_cursor, bool(session.websocket.is_open())
+
+    def resize_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        *,
+        rows: int,
+        columns: int,
+    ) -> None:
+        session = self._terminal(binding, terminal_ref)
+        with session.lock:
+            if not session.websocket.is_open():
+                raise StaleCursorError()
+            session.websocket.write_channel(
+                4,
+                json.dumps({"Height": rows, "Width": columns}, separators=(",", ":")),
+            )
+
+    def close_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+    ) -> bool:
+        identity = (binding["jobRef"], binding["jobUid"], binding["podUid"])
+        with self._terminals_lock:
+            session = self._terminals.get(terminal_ref)
+            if session is None:
+                return False
+            if session.binding != identity:
+                raise StaleCursorError()
+            del self._terminals[terminal_ref]
+        with session.lock:
+            try:
+                if session.websocket.is_open():
+                    session.websocket.write_stdin("exit\n")
+            finally:
+                session.websocket.close()
+        return True
+
+    def terminal_is_open(self, binding: Mapping[str, str], terminal_ref: str) -> bool:
+        try:
+            return bool(self._terminal(binding, terminal_ref).websocket.is_open())
+        except StaleCursorError:
+            return False
+
+    def _terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+    ) -> _TerminalProcess:
+        identity = (binding["jobRef"], binding["jobUid"], binding["podUid"])
+        with self._terminals_lock:
+            session = self._terminals.get(terminal_ref)
+        if session is None or session.binding != identity:
+            raise StaleCursorError()
+        # A deleted/replaced immutable Pod invalidates the PTY immediately.
+        self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        return session
+
     def _pod_with_uid(self, job_ref: str, pod_uid: str) -> Any:
         matches = [
             pod
@@ -588,6 +830,14 @@ def _exec_status(raw: object) -> int:
     if str(code) != exit_codes[0] or code <= 0:
         raise DependencyUnavailableError("supervisor exec status was invalid")
     return code
+
+
+def _terminal_bytes(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise DependencyUnavailableError("Workspace terminal output was invalid")
 
 
 def _value(value: Any, name: str) -> Any:

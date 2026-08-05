@@ -56,6 +56,7 @@ class CreateRecord:
     spec_payload: Mapping[str, Any] | None = None
     job_uid: str | None = None
     pod_uid: str | None = None
+    pod_incarnations_json: str | None = None
     final_state: str | None = None
     delete_ref: str | None = None
     delete_request_digest: str | None = None
@@ -250,22 +251,62 @@ class V2JobStore:
 
         return self._update(provider_request_id, mutate)
 
-    def bind_first_pod(self, provider_request_id: str, pod_uid: str) -> CreateRecord:
-        """Persist the first Pod UID and reject replacement Pod rebinding."""
+    def bind_pod_incarnation(
+        self,
+        provider_request_id: str,
+        pod_uid: str,
+        incarnation_json: str | None = None,
+    ) -> CreateRecord:
+        """Append and select one exact Pod UID under the retained Job UID.
+
+        Kubernetes may replace a failed/deleted Job Pod without changing the
+        Job or Research Attempt.  Selection is made by provider reconciliation;
+        this store only makes the resulting incarnation lineage durable and
+        replay-idempotent.
+        """
 
         def mutate(current: CreateRecord) -> CreateRecord:
             _require_live(current)
             if current.job_uid is None:
                 raise StateConflictError("A Pod cannot be bound before the Job UID")
-            if current.pod_uid is not None:
-                if current.pod_uid != pod_uid:
-                    raise ReplacementPodError()
+            try:
+                incarnations = list(json.loads(current.pod_incarnations_json or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DependencyUnavailableError("Pod incarnation history is malformed") from error
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("podUid"), str)
+                or not item["podUid"]
+                for item in incarnations
+            ):
+                raise DependencyUnavailableError("Pod incarnation history is malformed")
+            if incarnation_json is None:
+                incarnation = {"podUid": pod_uid}
+            else:
+                try:
+                    incarnation = json.loads(incarnation_json)
+                except json.JSONDecodeError as error:
+                    raise ValueError("Pod incarnation JSON is malformed") from error
+                if not isinstance(incarnation, dict) or incarnation.get("podUid") != pod_uid:
+                    raise ValueError("Pod incarnation identity differs from its binding")
+            retained = next(
+                (item for item in incarnations if item.get("podUid") == pod_uid), None
+            )
+            if current.pod_uid == pod_uid and retained == incarnation:
                 return current
             if current.state == "indeterminate":
                 raise ReplacementPodError()
+            if retained is None:
+                incarnations.append(pod_uid)
+                incarnations[-1] = incarnation
+            else:
+                incarnations[incarnations.index(retained)] = incarnation
             return replace(
                 current,
                 pod_uid=pod_uid,
+                pod_incarnations_json=json.dumps(
+                    incarnations, sort_keys=True, separators=(",", ":")
+                ),
                 state="bound",
                 updated_at=_timestamp(self._clock()),
             )
@@ -576,7 +617,8 @@ class V2JobStore:
 
     # Clear aliases used by some provider call sites.
     bind_job = mark_created
-    bind_pod = bind_first_pod
+    bind_first_pod = bind_pod_incarnation
+    bind_pod = bind_pod_incarnation
     list_records = list_create
 
     def purge_expired(self, now: datetime | str) -> int:
@@ -699,6 +741,7 @@ def _config_map_body(
     optional = {
         "jobUid": record.job_uid,
         "podUid": record.pod_uid,
+        "podIncarnations": record.pod_incarnations_json or "[]",
         "finalState": record.final_state,
         "deleteRef": record.delete_ref,
         "deleteRequestDigest": record.delete_request_digest,
@@ -748,6 +791,7 @@ def _record_from_config_map(config_map: Any) -> CreateRecord:
         spec_payload=spec_payload,
         job_uid=data.get("jobUid"),
         pod_uid=data.get("podUid"),
+        pod_incarnations_json=data.get("podIncarnations", "[]"),
         final_state=data.get("finalState"),
         delete_ref=data.get("deleteRef"),
         delete_request_digest=data.get("deleteRequestDigest"),

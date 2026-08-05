@@ -155,6 +155,23 @@ class ClusterFeed:
                 "Kubernetes capacity observation is unavailable"
             ) from exc
 
+    def display_compute_node(self, node_name: str) -> str:
+        """Return the same redacted node identity used by capacity snapshots."""
+
+        try:
+            for node in self._kube.list_nodes():
+                observed_name = _required_text(node, "metadata", "name")
+                if observed_name == node_name:
+                    labels = _mapping(_path(node, "metadata", "labels"))
+                    return _display_node(observed_name, labels)
+        except Exception as exc:
+            raise DependencyUnavailableError(
+                "Kubernetes compute-node observation is unavailable"
+            ) from exc
+        raise DependencyUnavailableError(
+            "Kubernetes compute-node observation is unavailable"
+        )
+
     def queue(self) -> QueueSnapshot:
         try:
             jobs = list(self._kube.list_managed_jobs())

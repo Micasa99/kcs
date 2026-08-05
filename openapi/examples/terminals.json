@@ -1,0 +1,22 @@
+{
+  "exchanges": [
+    {
+      "scenario": "terminal-create",
+      "operationId": "createTerminalSession",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001"},
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/terminal-create-request.json"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Cache-Control": "no-store",
+          "KCS-Terminal-Credential": "synthetic-terminal-credential-000001"
+        },
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/terminal-open.json"
+      }
+    }
+  ]
+}

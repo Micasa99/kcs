@@ -1,4 +1,4 @@
-# KCS V2 Hosted Attempt API 2.1.0
+# KCS V2 Hosted Attempt API 2.2.0
 
 The wire authority is `openapi/kcs-v2-jobs.openapi.yaml` (OpenAPI 3.1.0). KCS owns
 provider workload reality only: it accepts opaque owner references, does not import
@@ -10,17 +10,19 @@ Generated component schemas and the checksum file are deterministic review artif
 the YAML remains the source of truth. The committed
 [canonical compact JSON](../openapi/generated/kcs-v2-jobs.openapi.json) and
 [checksum](../openapi/generated/kcs-v2-jobs.openapi.sha256) currently have digest
-`14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229`.
+`8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a`.
 
 ## Runtime boundary and topology
 
 The formal namespace is `researchcosmos-v2`; the formal node selector is exactly
 `researchcosmos.io/pool=gpu`. A development machine is never a formal KCS host.
 
-One `providerRequestId` creates one `batch/v1 Job`. Its first Pod UID is immutable for
-the attempt. The Pod has exactly two containers, `agent` and `workspace`, which share
-the ephemeral `/workspace` volume. A replacement Pod or more than one observed Pod
-makes the binding `indeterminate`; KCS must not silently adopt a new Pod identity.
+One `providerRequestId` creates one `batch/v1 Job`. The Job UID stays immutable while
+Kubernetes may replace a failed Pod under that same Job. KCS selects at most one
+current nonterminal Pod, appends every observed Pod UID to `podIncarnations`, and
+never turns a replacement into a new provider request. More than one active Pod is
+still `indeterminate`. Every Pod has exactly two containers, `agent` and `workspace`,
+which share the ephemeral `/workspace` volume.
 
 The container PID 1 commands are fixed to the single-element argv arrays
 `["/opt/kcs/agent-supervisor"]` and `["/opt/kcs/workspace-sidecar"]`. KCS later
@@ -40,23 +42,26 @@ forbidden request-body logging, sensitive-header redaction, and
 | Create/list | `POST /api/v2/jobs`; `GET /api/v2/jobs` |
 | Inspect/delete | `GET /api/v2/jobs/{jobRef}`; `DELETE /api/v2/jobs/{jobRef}` |
 | Role logs | `GET /api/v2/jobs/{jobRef}/logs` |
+| NVIDIA observation | `GET /api/v2/jobs/{jobRef}/telemetry/nvidia` |
 | Grant/inspect credential | `POST /api/v2/jobs/{jobRef}/agent/credential-grants`; `GET /api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}` |
 | Start agent generation | `POST /api/v2/jobs/{jobRef}/agent/start` |
 | Register/inspect transfer | `POST /api/v2/jobs/{jobRef}/transfers`; `GET /api/v2/jobs/{jobRef}/transfers/{transferRef}` |
 | Transfer content | `PUT /api/v2/jobs/{jobRef}/transfers/{transferRef}/content`; `GET /api/v2/jobs/{jobRef}/transfers/{transferRef}/content` |
 | Cancel/discard transfer | `POST /api/v2/jobs/{jobRef}/transfers/{transferRef}/cancel`; `DELETE /api/v2/jobs/{jobRef}/transfers/{transferRef}` |
 | Invoke/inspect workspace | `POST /api/v2/jobs/{jobRef}/workspace/invoke`; `GET /api/v2/jobs/{jobRef}/operations/{operationRef}` |
+| Workspace terminal | `POST /api/v2/jobs/{jobRef}/workspace/terminal-sessions`; inspect/input/output/resize/delete beneath its `terminalRef` |
 | Finalize/cancel | `POST /api/v2/jobs/{jobRef}/finalize`; `POST /api/v2/jobs/{jobRef}/cancel` |
 | Capacity observation | `GET /api/v2/capacity` |
 | Pending managed Jobs | `GET /api/v2/queue` |
 | Canonical OpenAPI | `GET /api/v2/openapi.json` |
 
 The OpenAPI endpoint returns the exact committed canonical JSON with `ETag` equal to
-its SHA-256, `X-KCS-API-Version: 2.1.0`, and `Cache-Control: no-store`. Required wire
+its SHA-256, `X-KCS-API-Version: 2.2.0`, and `Cache-Control: no-store`. Required wire
 headers are declared per response with `x-kcs-required-headers`; the generator checks
 that declaration for every status, including statuses without a route example. Every
-response from credential grant/inspect, transfer content PUT/GET, and canonical
-OpenAPI discovery carries the declared `Cache-Control: no-store` policy.
+response from credential grant/inspect, transfer content PUT/GET, NVIDIA telemetry,
+Workspace terminal, and canonical OpenAPI discovery carries the declared
+`Cache-Control: no-store` policy.
 
 ## Capacity and queue observations
 
@@ -78,6 +83,25 @@ and bounded to 512 UTF-8 bytes. Requested GPU, CPU, and memory come from the sam
 or Job template requests Kubernetes schedules. Neither endpoint exposes Secrets,
 kubeconfig, internal node identity, billing, balance, tenant quota negotiation, or a
 mutation surface.
+
+## NVIDIA telemetry and Workspace terminal
+
+`GET /api/v2/jobs/{jobRef}/telemetry/nvidia` performs one fixed read-only
+`nvidia-smi` probe inside the exact current Workspace container. It returns the
+current Job UID, Pod UID, display compute node, observation time, device UUID,
+utilization, memory used/total, and temperature. Missing driver data, a non-GPU
+Workspace, malformed output, or an unavailable exact Pod is a typed error; KCS never
+turns a missing observation into zero and never uses this route for scheduling.
+
+A Workspace terminal is a real Kubernetes exec PTY, not a renamed one-shot invoke.
+Creation binds `terminalRef`, subject, Job UID, current Pod UID, and the `workspace`
+container. Before opening the PTY, KCS acquires one durable per-Job writer slot and
+pauses the Agent supervisor; another writable session receives `TERMINAL_BUSY`.
+Close, expiry, API restart, cancel, or Pod replacement closes the old PTY, resumes
+the exact Agent when it still exists, releases the writer slot, and retains a
+non-secret terminal descriptor. The short terminal credential is returned only in
+the `KCS-Terminal-Credential` response header, stored only as a SHA-256 digest, and
+must accompany the subject header on every subsequent operation.
 
 ## Identity, digest, replay, and recovery
 
@@ -105,6 +129,7 @@ Every retained response echoes its stable identity and applicable digest or dige
 | Finalize job | `(jobRef, finalizeRef)` | `requestDigest = SHA-256(JCS(spec))` | `202` | `200` | `409 IDENTITY_CONFLICT` | `inspect_job` |
 | Cancel job | `(jobRef, cancelRef)` | `requestDigest = SHA-256(JCS(spec))` | `202` | `200` | `409 IDENTITY_CONFLICT` | `inspect_job` |
 | Delete job | `(jobRef, deleteRef)` | `requestDigest = SHA-256(JCS({}))` | `200` | `200` | `409 IDENTITY_CONFLICT` | `inspect_job` |
+| Create terminal | `(jobRef, terminalRef)` | `requestDigest = SHA-256(JCS(spec))` | `201` | `200` with a newly scoped short credential | `409 IDENTITY_CONFLICT` | `inspect_terminal` |
 
 The constant empty-object digest used by discard and delete is
 `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`.
@@ -164,8 +189,9 @@ replay instead return `JobTombstone`. A binding snapshot includes:
 
 - `jobRef`, the recoverable `providerHandle`, `providerRequestId`, `subjectRef`,
   `runtimePlanDigest`, and `specDigest`;
-- Job UID, nullable first Pod UID, resource version, node, binding state/reason,
-  observed Pod count, and created/updated/started/finished/observed timestamps;
+- Job UID, nullable current Pod UID, resource version, node, binding state/reason,
+  observed Pod count, append-only Pod incarnations, and
+  created/updated/started/finished/observed timestamps;
 - closed `agent` and `workspace` role snapshots with container/image IDs, ready state,
   waiting/running/terminated observation, restart count, exit code/reason,
   start/finish timestamps, and requested resources;
@@ -179,21 +205,24 @@ replay instead return `JobTombstone`. A binding snapshot includes:
 
 During provisioning, the schema explicitly permits unresolved Pod, resource version,
 node, role, generation, start, and finish observations to be `null`. Absence is not
-converted to an invented value. A `running` binding, however, requires exactly one
-observed Pod and a non-null immutable Pod UID; two or more observed Pods require an
-`indeterminate` binding. An action in `not_requested` has null identity, digest, and
-observation fields, while every requested action state carries all three.
+converted to an invented value. A `running` binding requires a non-null current Pod
+UID present in `podIncarnations`; historical terminated Pods may coexist with it.
+More than one active Pod remains indeterminate. An action in `not_requested` has null
+identity, digest, and observation fields, while every requested action state carries
+all three.
 
 Job binding states are `provisioning | bound | running | finalizing | succeeded |
 failed | canceling | canceled | indeterminate | deleting | deleted`. Role states are
-`waiting | running | terminated | unknown | indeterminate`. Replacement or multiple
-Pod identity is always visible as `indeterminate`.
+`waiting | running | terminated | unknown | indeterminate`. Replacement is visible
+as another incarnation under the same Job; multiple active Pod identities are always
+`indeterminate`.
 
 | Provider event | Binding transition/observation |
 |---|---|
 | Create accepted, no immutable Pod yet | `provisioning` |
-| First and only Pod identity bound and topology checked | `bound`, then `running` when usable |
-| Replacement/multiple Pod or unknowable side effect | `indeterminate` |
+| Current Pod identity bound and topology checked | `bound`, then `running` when usable |
+| Failed Pod replaced under the same Job | append incarnation, bind the new current Pod, require client reattach |
+| Multiple active Pods or unknowable side effect | `indeterminate` |
 | Finalize accepted | `finalizing`, then provider `succeeded`, `failed`, or `indeterminate` |
 | Cancel accepted | `canceling`, then `canceled`, `failed`, or `indeterminate`; report output-loss possibility |
 | Delete in progress/completed | `deleting`, then workload removed and a `deleted` tombstone retained |
@@ -270,7 +299,7 @@ suite uses only an explicitly synthetic binary fixture, never a credential JSON
 field. The request is
 service-to-service only over TLS/private ingress, requires the private credential
 writer authorization role, forbids body logging, redacts sensitive headers, and
-returns `Cache-Control: no-store`. Bearer service auth is the V2.1.0 wire mechanism;
+returns `Cache-Control: no-store`. Bearer service auth is the V2.2.0 wire mechanism;
 mTLS is not mandatory.
 
 The request metadata is carried by these typed headers:
@@ -407,7 +436,7 @@ be NFC and may not contain Unicode general categories `Cc`, `Cf`, `Cs`, `Co`, `C
 `Zl`, or `Zp`. It preserves path case but rejects registration when the requested
 path case-folds to an existing workspace path.
 
-V2.1.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
+V2.2.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
 It exposes no signed URL or transfer token and implements no `Range` request mode.
 Clients must use the OpenAPI feature declaration (`transferModes: [direct]`,
 `rangeRequests: false`, `signedTransfers: false`) to negotiate or fail closed.
@@ -547,7 +576,7 @@ Bearer service authentication, TLS, and private ingress are required globally fo
 all V2 routes. Raw credential upload additionally requires the private
 credential-writer role, forbidden body logging, sensitive-header redaction, and
 `Cache-Control: no-store`. mTLS may be deployed as an infrastructure
-control but is not a V2.1.0 wire requirement. Routes additionally require the
+control but is not a V2.2.0 wire requirement. Routes additionally require the
 declared service authorization role: `v2-reader`, `v2-mutator`, or, for raw
 credential upload, `v2-private-credential-writer`.
 
@@ -633,7 +662,7 @@ The same generation/check command owns the byte-identical
 `kcs.openapi/kcs-v2-jobs.openapi.json` package resource. The V2 route reads that
 resource through Python package-resource APIs, so an installed wheel never reaches
 back into a source checkout. Its digest remains
-`14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229`.
+`8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a`.
 
 ## Fixed conformance actions
 

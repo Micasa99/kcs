@@ -41,8 +41,12 @@ from kcs.jobs.contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    NvidiaTelemetrySnapshot,
     QueueSnapshot,
     RoleLogs,
+    TerminalCreateRequest,
+    TerminalResizeRequest,
+    TerminalSessionSnapshot,
     TransferCancelRequest,
     TransferRegisterRequest,
     TransferSnapshot,
@@ -67,7 +71,7 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.1.0"
+API_VERSION = "2.2.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -114,6 +118,10 @@ class _CredentialMediaTypeError(_UnsupportedMediaTypeError):
 
 
 class _TransferMediaTypeError(_UnsupportedMediaTypeError):
+    default_message = "Content-Type must be application/octet-stream"
+
+
+class _TerminalMediaTypeError(_UnsupportedMediaTypeError):
     default_message = "Content-Type must be application/octet-stream"
 
 
@@ -214,6 +222,10 @@ def _require_json_media_type(request: Request) -> None:
         if media_type.lower() != "application/octet-stream":
             raise _TransferMediaTypeError
         return
+    if request.method == "POST" and request.url.path.endswith("/input"):
+        if media_type.lower() != "application/octet-stream":
+            raise _TerminalMediaTypeError
+        return
     if media_type.lower() != "application/json":
         raise _UnsupportedMediaTypeError
 
@@ -226,6 +238,15 @@ def _json_model(model: BaseModel, *, status_code: int = 200) -> JSONResponse:
 
 
 async def _credential_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 65536:
+            raise PayloadTooLargeError()
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _terminal_input_body(request: Request) -> bytes:
     body = bytearray()
     async for chunk in request.stream():
         if len(body) + len(chunk) > 65536:
@@ -444,6 +465,168 @@ def create_jobs_router(
         ] = DEFAULT_LOG_LIMIT_BYTES,
     ) -> Response:
         return _json_model(provider.logs(job_ref, container, cursor, limit_bytes))
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/telemetry/nvidia",
+        operation_id="getNvidiaTelemetry",
+        tags=["Cluster observations"],
+        response_model=NvidiaTelemetrySnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503, 504),
+    )
+    def get_nvidia_telemetry(
+        job_ref: Annotated[
+            str,
+            ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+    ) -> Response:
+        return _json_model(provider.nvidia_telemetry(job_ref))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions",
+        operation_id="createTerminalSession",
+        tags=["Workspace terminal"],
+        status_code=201,
+        response_model=TerminalSessionSnapshot,
+        responses={
+            200: {"model": TerminalSessionSnapshot, "description": "Stable session replay."},
+            **_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503, 504),
+        },
+    )
+    def create_terminal_session(
+        job_ref: Annotated[
+            str,
+            ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        payload: TerminalCreateRequest,
+    ) -> Response:
+        result = provider.create_terminal(job_ref, payload)
+        response = _json_model(result.snapshot, status_code=201 if result.created else 200)
+        response.headers["KCS-Terminal-Credential"] = result.credential
+        return response
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
+        operation_id="inspectTerminalSession",
+        tags=["Workspace terminal"],
+        response_model=TerminalSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_terminal_session(
+        job_ref: Annotated[
+            str,
+            ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        terminal_ref: Annotated[
+            str,
+            ApiPath(alias="terminalRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
+        ],
+        subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
+        credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
+    ) -> Response:
+        return _json_model(
+            provider.inspect_terminal(
+                job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+            )
+        )
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input",
+        operation_id="writeTerminalInput",
+        tags=["Workspace terminal"],
+        response_model=TerminalSessionSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 413, 415, 500, 503),
+    )
+    async def write_terminal_input(
+        request: Request,
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        terminal_ref: Annotated[str, ApiPath(alias="terminalRef")],
+        subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
+        credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
+    ) -> Response:
+        return _json_model(
+            provider.write_terminal(
+                job_ref,
+                terminal_ref,
+                await _terminal_input_body(request),
+                subject_ref=subject_ref,
+                credential=credential,
+            )
+        )
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output",
+        operation_id="readTerminalOutput",
+        tags=["Workspace terminal"],
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 500, 503),
+    )
+    def read_terminal_output(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        terminal_ref: Annotated[str, ApiPath(alias="terminalRef")],
+        subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
+        credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
+        cursor: Annotated[int, Query(ge=0)] = 0,
+        limit_bytes: Annotated[int, Query(alias="limitBytes", ge=1, le=65536)] = 65536,
+    ) -> Response:
+        content, next_cursor, open_state, _snapshot = provider.read_terminal(
+            job_ref,
+            terminal_ref,
+            cursor=cursor,
+            limit_bytes=limit_bytes,
+            subject_ref=subject_ref,
+            credential=credential,
+        )
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={
+                "KCS-Terminal-Next-Cursor": str(next_cursor),
+                "KCS-Terminal-Open": "true" if open_state else "false",
+            },
+        )
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize",
+        operation_id="resizeTerminalSession",
+        tags=["Workspace terminal"],
+        response_model=TerminalSessionSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503),
+    )
+    def resize_terminal_session(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        terminal_ref: Annotated[str, ApiPath(alias="terminalRef")],
+        subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
+        credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
+        payload: TerminalResizeRequest,
+    ) -> Response:
+        return _json_model(
+            provider.resize_terminal(
+                job_ref,
+                terminal_ref,
+                rows=payload.rows,
+                columns=payload.columns,
+                subject_ref=subject_ref,
+                credential=credential,
+            )
+        )
+
+    @router.delete(
+        "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
+        operation_id="closeTerminalSession",
+        tags=["Workspace terminal"],
+        response_model=TerminalSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def close_terminal_session(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        terminal_ref: Annotated[str, ApiPath(alias="terminalRef")],
+        subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
+        credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
+    ) -> Response:
+        return _json_model(
+            provider.close_terminal(
+                job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
+            )
+        )
 
     @router.post(
         "/api/v2/jobs/{jobRef}/agent/credential-grants",

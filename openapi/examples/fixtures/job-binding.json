@@ -12,6 +12,18 @@
   "bindingState": "running",
   "bindingReason": null,
   "observedPodCount": 1,
+  "podIncarnations": [
+    {
+      "podName": "pod-synthetic-001",
+      "podUid": "22222222-2222-4222-8222-222222222222",
+      "nodeName": "worker-synthetic",
+      "state": "running",
+      "reason": null,
+      "startedAt": "2026-08-01T00:00:30Z",
+      "finishedAt": null,
+      "observedAt": "2026-08-01T00:01:00Z"
+    }
+  ],
   "createdAt": "2026-08-01T00:00:00Z",
   "updatedAt": "2026-08-01T00:01:00Z",
   "startedAt": "2026-08-01T00:00:30Z",

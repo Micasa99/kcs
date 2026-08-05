@@ -51,6 +51,10 @@ class AgentRpcTransportProtocol(Protocol):
 
     def stop_supervisor(self, binding: Mapping[str, str], container: str) -> AgentRpcResponse: ...
 
+    def pause_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse: ...
+
+    def resume_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse: ...
+
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceRpcReply:
@@ -181,6 +185,24 @@ class ExecRpcTransport:
             "agent",
             ["/opt/kcs/agent-supervisor", "rpc"],
             b'{"protocolVersion":1,"action":"inspect"}',
+        )
+        return _response(output)
+
+    def pause_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse:
+        output = self._execute(
+            binding,
+            "agent",
+            ["/opt/kcs/agent-supervisor", "rpc"],
+            b'{"protocolVersion":1,"action":"pause"}',
+        )
+        return _response(output)
+
+    def resume_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse:
+        output = self._execute(
+            binding,
+            "agent",
+            ["/opt/kcs/agent-supervisor", "rpc"],
+            b'{"protocolVersion":1,"action":"resume"}',
         )
         return _response(output)
 

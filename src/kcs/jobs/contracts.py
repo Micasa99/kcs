@@ -329,6 +329,31 @@ class QueueSnapshot(ContractModel):
     pending: list[PendingJobSnapshot]
 
 
+class NvidiaDeviceTelemetry(ContractModel):
+    """One observation reported by the NVIDIA driver in the bound Workspace."""
+
+    device_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    utilization_percent: Annotated[StrictInt, Field(ge=0, le=100)]
+    memory_used_mib: Annotated[StrictInt, Field(ge=0)]
+    memory_total_mib: Annotated[StrictInt, Field(ge=1)]
+    temperature_celsius: Annotated[StrictInt, Field(ge=-100, le=250)]
+
+    @model_validator(mode="after")
+    def validate_memory(self) -> NvidiaDeviceTelemetry:
+        if self.memory_used_mib > self.memory_total_mib:
+            raise ValueError("NVIDIA used memory cannot exceed total memory")
+        return self
+
+
+class NvidiaTelemetrySnapshot(ContractModel):
+    job_ref: OpaqueRef
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    compute_node: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    observed_at: Timestamp
+    devices: list[NvidiaDeviceTelemetry]
+
+
 class AgentRequestedResources(ContractModel):
     cpu_millis: Annotated[StrictInt, Field(ge=1, le=8000)]
     memory_mib: Annotated[StrictInt, Field(ge=1, le=32768)]
@@ -383,6 +408,25 @@ class WorkspaceRoleSnapshot(ContractModel):
     finished_at: Timestamp | None
     requested: WorkspaceRequestedResources
     observed: WorkspaceObservedResources
+
+
+class PodIncarnationState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class PodIncarnationSnapshot(ContractModel):
+    pod_name: Annotated[StrictStr, Field(min_length=1, max_length=253)]
+    pod_uid: KubernetesUid
+    node_name: StrictStr | None
+    state: PodIncarnationState
+    reason: StrictStr | None
+    started_at: Timestamp | None
+    finished_at: Timestamp | None
+    observed_at: Timestamp
 
 
 class ActionSnapshot(ContractModel):
@@ -714,6 +758,53 @@ class CancelJobRequest(ContractModel):
     spec: CancelSpec
 
 
+class TerminalState(StrEnum):
+    OPENING = "opening"
+    OPEN = "open"
+    CLOSED = "closed"
+    EXPIRED = "expired"
+    LOST = "lost"
+
+
+class TerminalCreateSpec(ContractModel):
+    subject_ref: OpaqueRef
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    ttl_seconds: Annotated[StrictInt, Field(ge=1, le=900)] = 300
+
+
+class TerminalCreateRequest(ContractModel):
+    terminal_ref: OpaqueRef
+    request_digest: Sha256
+    spec: TerminalCreateSpec
+
+    @model_validator(mode="after")
+    def validate_spec_digest(self) -> TerminalCreateRequest:
+        validate_request_digest(self.terminal_ref, self.request_digest, self.spec)
+        return self
+
+
+class TerminalResizeRequest(ContractModel):
+    rows: Annotated[StrictInt, Field(ge=1, le=1000)]
+    columns: Annotated[StrictInt, Field(ge=1, le=1000)]
+
+
+class TerminalSessionSnapshot(ContractModel):
+    terminal_ref: OpaqueRef
+    request_digest: Sha256
+    subject_ref: OpaqueRef
+    job_ref: OpaqueRef
+    job_uid: KubernetesUid
+    pod_uid: KubernetesUid
+    container: Literal["workspace"]
+    state: TerminalState
+    created_at: Timestamp
+    expires_at: Timestamp
+    observed_at: Timestamp
+    writable: Literal[True]
+    agent_paused: StrictBool
+
+
 class JobBindingSnapshot(ContractModel):
     job_ref: OpaqueRef
     provider_handle: OpaqueRef
@@ -728,6 +819,7 @@ class JobBindingSnapshot(ContractModel):
     binding_state: JobBindingState
     binding_reason: StrictStr | None
     observed_pod_count: Annotated[StrictInt, Field(ge=0)]
+    pod_incarnations: list[PodIncarnationSnapshot]
     created_at: Timestamp
     updated_at: Timestamp
     started_at: Timestamp | None
@@ -750,11 +842,14 @@ class JobBindingSnapshot(ContractModel):
     @model_validator(mode="after")
     def validate_binding_coherence(self) -> JobBindingSnapshot:
         if self.binding_state is JobBindingState.RUNNING and (
-            self.pod_uid is None or self.observed_pod_count != 1
+            self.pod_uid is None or self.observed_pod_count < 1
         ):
-            raise ValueError("running binding requires one immutable Pod UID")
-        if self.observed_pod_count >= 2 and self.binding_state is not JobBindingState.INDETERMINATE:
-            raise ValueError("multiple observed Pods require an indeterminate binding")
+            raise ValueError("running binding requires a current immutable Pod UID")
+        incarnation_uids = [str(item.pod_uid) for item in self.pod_incarnations]
+        if len(incarnation_uids) != len(set(incarnation_uids)):
+            raise ValueError("Pod incarnations must be unique by UID")
+        if self.pod_uid is not None and str(self.pod_uid) not in incarnation_uids:
+            raise ValueError("current Pod UID must be present in incarnation history")
         action_by_state = {
             JobBindingState.FINALIZING: self.finalize_action,
             JobBindingState.CANCELING: self.cancel_action,

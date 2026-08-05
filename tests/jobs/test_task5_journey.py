@@ -29,6 +29,8 @@ from kcs.jobs.contracts import (
     FinalizeJobRequest,
     FinalizeSpec,
     RunnerState,
+    TerminalCreateRequest,
+    TerminalCreateSpec,
     TransferDirection,
     TransferRegisterRequest,
     TransferSpec,
@@ -39,6 +41,7 @@ from kcs.jobs.errors import (
     DependencyUnavailableError,
     IdentityDigestConflict,
     StateConflictError,
+    TerminalBusyError,
 )
 from kcs.jobs.kube import V2KubeAdapter, _decode_log_body
 from kcs.jobs.provider import V2JobProvider
@@ -87,6 +90,8 @@ class _Kube:
         self.secret_delete_failures = 0
         self.terminated: set[str] = set()
         self.fail_next_finalize_replace = False
+        self.terminals: set[str] = set()
+        self.terminal_input = bytearray()
 
     def create_config_map(self, body: object) -> object:
         value = json.loads(json.dumps(body))
@@ -201,13 +206,57 @@ class _Kube:
             statuses.append({"name": role, "ready": ready, "restart_count": 0, "state": state})
         return [
             {
-                "metadata": {"uid": str(POD_UID)},
+                "metadata": {"name": "job-1-pod-1", "uid": str(POD_UID)},
                 "status": {"container_statuses": statuses},
             }
         ]
 
     def read_role_logs(self, *args: object) -> object:
         raise AssertionError("not part of this Journey")
+
+    def open_workspace_terminal(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> None:
+        self.terminals.add(terminal_ref)
+
+    def write_workspace_terminal(
+        self, binding: Mapping[str, str], terminal_ref: str, content: bytes
+    ) -> None:
+        assert terminal_ref in self.terminals
+        self.terminal_input.extend(content)
+
+    def read_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        cursor: int,
+        limit_bytes: int,
+    ) -> tuple[bytes, int, bool]:
+        assert terminal_ref in self.terminals
+        content = bytes(self.terminal_input[cursor : cursor + limit_bytes])
+        return content, cursor + len(content), True
+
+    def resize_workspace_terminal(
+        self,
+        binding: Mapping[str, str],
+        terminal_ref: str,
+        *,
+        rows: int,
+        columns: int,
+    ) -> None:
+        assert terminal_ref in self.terminals
+
+    def close_workspace_terminal(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> bool:
+        existed = terminal_ref in self.terminals
+        self.terminals.discard(terminal_ref)
+        return existed
+
+    def terminal_is_open(
+        self, binding: Mapping[str, str], terminal_ref: str
+    ) -> bool:
+        return terminal_ref in self.terminals
 
 
 class _Renderer:
@@ -225,6 +274,8 @@ class _Transport:
         self.start_frames: list[Mapping[str, object]] = []
         self.stops: list[str] = []
         self.lose_agent_phase = False
+        self.pauses = 0
+        self.resumes = 0
 
     def agent_rpc(
         self, binding: Mapping[str, str], request: Mapping[str, object]
@@ -253,6 +304,14 @@ class _Transport:
             self.kube.fail_next_finalize_replace = True
         return AgentRpcResponse(1, 0, "", "", "stopped", False)
 
+    def pause_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse:
+        self.pauses += 1
+        return AgentRpcResponse(1, 0, "", "", "paused", True)
+
+    def resume_agent(self, binding: Mapping[str, str]) -> AgentRpcResponse:
+        self.resumes += 1
+        return AgentRpcResponse(1, 0, "", "", "running", True)
+
 
 def _setup(
     *, sleeper: Callable[[float], None] | None = None
@@ -277,6 +336,64 @@ def _setup(
         transport=transport,
     )
     return kube, store, transport, provider
+
+
+def test_workspace_terminal_has_one_writer_and_releases_agent_pause() -> None:
+    kube, store, transport, provider = _setup()
+
+    def request(ref: str) -> TerminalCreateRequest:
+        spec = TerminalCreateSpec(
+            subject_ref="s",
+            job_uid=JOB_UID,
+            pod_uid=POD_UID,
+            ttl_seconds=300,
+        )
+        return TerminalCreateRequest(
+            terminal_ref=ref,
+            request_digest=canonical_digest(spec),
+            spec=spec,
+        )
+
+    opened = provider.create_terminal("job-1", request("terminal-1"))
+    assert opened.created is True
+    assert opened.snapshot.state == "open"
+    assert opened.snapshot.agent_paused is True
+    retained = store.read_runtime("terminal", "job-1", "terminal-1")
+    assert retained is not None
+    assert opened.credential not in json.dumps(dict(retained.values))
+
+    with pytest.raises(TerminalBusyError):
+        provider.create_terminal("job-1", request("terminal-2"))
+
+    provider.write_terminal(
+        "job-1",
+        "terminal-1",
+        b"pwd\n",
+        subject_ref="s",
+        credential=opened.credential,
+    )
+    content, cursor, alive, _snapshot = provider.read_terminal(
+        "job-1",
+        "terminal-1",
+        cursor=0,
+        limit_bytes=64,
+        subject_ref="s",
+        credential=opened.credential,
+    )
+    assert (content, cursor, alive) == (b"pwd\n", 4, True)
+    closed = provider.close_terminal(
+        "job-1",
+        "terminal-1",
+        subject_ref="s",
+        credential=opened.credential,
+    )
+    assert closed.state == "closed"
+    assert closed.agent_paused is False
+
+    next_session = provider.create_terminal("job-1", request("terminal-3"))
+    assert next_session.snapshot.state == "open"
+    assert transport.pauses == 2
+    assert transport.resumes == 1
 
 
 def _credential(

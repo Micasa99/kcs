@@ -77,7 +77,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     )
     digest = hashlib.sha256(packaged).hexdigest()
     assert packaged == canonical
-    assert digest == "14f24196105c4c98097fa2553114105f7ee2b57f9ece62ec76ac68aff241f229"
+    assert digest == "8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a"
     events.append({"event": "canonical_package_resource", "sha256": digest})
 
     namespace = _documents("deploy/v2/namespace.yaml")[0]
