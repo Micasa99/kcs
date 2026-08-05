@@ -593,9 +593,21 @@ class V2JobProvider:
         subject_ref: str,
         credential: str,
     ) -> TerminalSessionSnapshot:
-        record, _binding = self._terminal_access(
-            job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
-        )
+        self.reconcile_terminals()
+        record = self._store.read_runtime("terminal", job_ref, terminal_ref)
+        if record is None:
+            raise JobNotFoundError()
+        values = _runtime_values(record)
+        expected = values.get("credentialSha256", "")
+        supplied = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        if (
+            values.get("subjectRef") != subject_ref
+            or not expected
+            or not hmac.compare_digest(expected, supplied)
+        ):
+            raise TerminalCredentialError()
+        if _as_datetime(values.get("expiresAt"), self._now()) <= self._now():
+            raise TerminalCredentialError()
         return self._terminal_snapshot(record)
 
     def write_terminal(

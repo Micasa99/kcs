@@ -389,6 +389,12 @@ def test_workspace_terminal_has_one_writer_and_releases_agent_pause() -> None:
     )
     assert closed.state == "closed"
     assert closed.agent_paused is False
+    assert provider.inspect_terminal(
+        "job-1",
+        "terminal-1",
+        subject_ref="s",
+        credential=opened.credential,
+    ) == closed
 
     next_session = provider.create_terminal("job-1", request("terminal-3"))
     assert next_session.snapshot.state == "open"
