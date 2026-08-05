@@ -3988,11 +3988,13 @@ def _binding_state(
 ) -> tuple[JobBindingState, str | None]:
     if replacement_reason is not None:
         return JobBindingState.INDETERMINATE, replacement_reason
-    if _job_condition_true(job, "Failed") or int(_path(job, "status", "failed") or 0) > 0:
+    if _job_condition_true(job, "Failed"):
         return JobBindingState.FAILED, _job_condition_reason(job, "Failed")
     if _job_condition_true(job, "Complete") or int(_path(job, "status", "succeeded") or 0) > 0:
         return JobBindingState.SUCCEEDED, None
     if pod is None:
+        if int(_path(job, "status", "failed") or 0) > 0:
+            return JobBindingState.FAILED, None
         return JobBindingState.PROVISIONING, None
     statuses = tuple(_path(pod, "status", "container_statuses") or ())
     statuses_by_name = {
@@ -4004,6 +4006,11 @@ def _binding_state(
         bool(_field(status, "ready", False)) for status in statuses_by_name.values()
     ):
         return JobBindingState.RUNNING, None
+    if (
+        int(_path(job, "status", "failed") or 0) > 0
+        and int(_path(job, "status", "active") or 0) == 0
+    ):
+        return JobBindingState.FAILED, None
     return JobBindingState.BOUND, None
 
 
