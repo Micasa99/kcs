@@ -272,6 +272,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         "KCS_TLS_SAN": "kcs-v2.internal.example",
         "KCS_K3S_VERSION": "v1.33.3+k3s1",
         "KCS_NVIDIA_TOOLKIT_VERSION": "1.17.8-1",
+        "KCS_WORKER_WORKSPACE_ROOT": "/scratch/kcs-workspaces",
         "KCS_API_IMAGE": SYNTHETIC_API_IMAGE,
         "KCS_TLS_CERT_FILE": str(cert),
         "KCS_TLS_KEY_FILE": str(key),

@@ -38,6 +38,8 @@ spec:
               value: researchcosmos-v2
             - name: KCS_V2_NODE_SELECTOR
               value: researchcosmos.io/pool=gpu
+            - name: KCS_V2_WORKSPACE_STORAGE_CLASS
+              value: kcs-workspace
             - name: KCS_V2_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:

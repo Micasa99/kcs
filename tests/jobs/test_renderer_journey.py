@@ -72,7 +72,10 @@ def test_create_contract_renders_the_fixed_dual_role_job_journey() -> None:
 
     workspace_volume = next(volume for volume in pod.volumes if volume.name == "workspace")
     credential_volume = next(volume for volume in pod.volumes if volume.name == "agent-credential")
-    assert workspace_volume.empty_dir.size_limit == "20Gi"
+    workspace_claim = workspace_volume.ephemeral.volume_claim_template.spec
+    assert workspace_claim.storage_class_name == "kcs-workspace"
+    assert workspace_claim.access_modes == ["ReadWriteOnce"]
+    assert workspace_claim.resources.requests == {"storage": "20Gi"}
     assert credential_volume.secret.optional is True
     assert credential_volume.secret.secret_name == credential_secret_name(job.metadata.name)
     assert [mount.mount_path for mount in agent.volume_mounts] == [

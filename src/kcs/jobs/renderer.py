@@ -102,8 +102,23 @@ class V2JobRenderer:
         volumes = [
             client.V1Volume(
                 name=WORKSPACE_VOLUME,
-                empty_dir=client.V1EmptyDirVolumeSource(
-                    size_limit=f"{spec.shared_workspace.size_limit_gib}Gi"
+                ephemeral=client.V1EphemeralVolumeSource(
+                    volume_claim_template=client.V1PersistentVolumeClaimTemplate(
+                        metadata=client.V1ObjectMeta(labels=dict(labels)),
+                        spec=client.V1PersistentVolumeClaimSpec(
+                            access_modes=["ReadWriteOnce"],
+                            storage_class_name=(
+                                self._settings.workspace_storage_class
+                            ),
+                            resources=client.V1VolumeResourceRequirements(
+                                requests={
+                                    "storage": (
+                                        f"{spec.shared_workspace.size_limit_gib}Gi"
+                                    )
+                                }
+                            ),
+                        ),
+                    )
                 ),
             ),
             client.V1Volume(

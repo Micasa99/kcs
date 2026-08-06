@@ -13,6 +13,7 @@ _SELECTOR_VALUE = re.compile(r"^(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?)?$
 
 DEFAULT_NAMESPACE = "researchcosmos-v2"
 DEFAULT_NODE_SELECTOR = "researchcosmos.io/pool=gpu"
+DEFAULT_WORKSPACE_STORAGE_CLASS = "kcs-workspace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +24,7 @@ class V2RuntimeSettings:
     node_selector: Mapping[str, str]
     api_mode: str
     service_token: str | None = field(repr=False)
+    workspace_storage_class: str = DEFAULT_WORKSPACE_STORAGE_CLASS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> V2RuntimeSettings:
@@ -38,6 +40,16 @@ class V2RuntimeSettings:
             raise ValueError("KCS_V2_NAMESPACE must be a Kubernetes DNS label")
 
         selector = _parse_selector(environ.get("KCS_V2_NODE_SELECTOR", DEFAULT_NODE_SELECTOR))
+        workspace_storage_class = environ.get(
+            "KCS_V2_WORKSPACE_STORAGE_CLASS", DEFAULT_WORKSPACE_STORAGE_CLASS
+        )
+        if (
+            len(workspace_storage_class) > 63
+            or _DNS_LABEL.fullmatch(workspace_storage_class) is None
+        ):
+            raise ValueError(
+                "KCS_V2_WORKSPACE_STORAGE_CLASS must be a Kubernetes DNS label"
+            )
         service_token = environ.get("KCS_V2_SERVICE_TOKEN") or None
         if environ.get("KCS_ENV") != "test" and service_token is None:
             raise ValueError("KCS_V2_SERVICE_TOKEN is required outside tests")
@@ -47,6 +59,7 @@ class V2RuntimeSettings:
             node_selector=MappingProxyType(selector),
             api_mode=api_mode,
             service_token=service_token,
+            workspace_storage_class=workspace_storage_class,
         )
 
 

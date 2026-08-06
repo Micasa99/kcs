@@ -10,6 +10,7 @@ environment:
   KCS_TLS_SAN: <required-dns-san-or-private-address>
   KCS_K3S_VERSION: <required-pinned-k3s-version>
   KCS_NVIDIA_TOOLKIT_VERSION: <required-exact-package-version>
+  KCS_WORKER_WORKSPACE_ROOT: <required-path-on-dedicated-worker-data-disk>
   KCS_API_IMAGE: registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000
   KCS_TLS_CERT_FILE: <required-untracked-path>
   KCS_TLS_KEY_FILE: <required-untracked-path>

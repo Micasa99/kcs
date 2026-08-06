@@ -171,6 +171,11 @@ can change the rendered Job:
 - the closed `nodeSelector`; and
 - `activeDeadlineSeconds`.
 
+The shared workspace is rendered as a generic ephemeral PVC using the configured
+`kcs-workspace` StorageClass. Both role containers mount the same claim at
+`/workspace`; the Pod owns the claim, so Pod deletion drives volume and data cleanup.
+The requested claim size is the exact `sizeLimitGiB` value.
+
 Images must match `name@sha256:<64 lowercase hex>`. Mutable images, arbitrary
 commands, arbitrary selectors, secret injection, or physical provider facts outside
 `spec` are invalid. `spec` has `additionalProperties: false` throughout its semantic
@@ -717,9 +722,14 @@ files with no trailing newline. `--check` validates locally and performs no SSH 
 mutation. The deploy path has no local fallback: control scope is k3s server/V2 API;
 worker scope is k3s agent/NVIDIA runtime/plugin/node label. Neither script supplies a
 host, user, or identity-file default. The control services bind to the declared
-nonpublic address. The worker kubelet binds only to loopback so that pod logs flow
-through the authenticated k3s remotedialer instead of a host-exposed listener; its
-node identity and flannel traffic still use the declared worker address. The selected
+nonpublic address. The worker kubelet binds only to its declared nonpublic overlay
+address so Metrics Server can collect Pod CPU and memory without exposing kubelet
+publicly; pod logs remain available through the authenticated k3s API.
+`KCS_WORKER_WORKSPACE_ROOT` must be backed by a non-root filesystem. KCS uses a
+dedicated `kcs-workspace` StorageClass and generic ephemeral claims, so every
+Attempt receives an isolated, Pod-owned workspace under that root; deleting the Pod
+also deletes its claim and data. Kubelet and NVIDIA retain their standard host paths.
+The selected
 flannel interface must route between the declared addresses; k3s, kubelet, and VXLAN
 listeners are rejected unless bound to loopback or the declared role address.
 `allowedPeerCidrs` is validated topology input; these scripts
@@ -821,7 +831,7 @@ operator instructions.
 | Phase | Checkpoint result files and operator responsibility |
 |---|---|
 | O0 | `o0-deployment-baseline.result.json`: Ready control/GPU nodes, worker label and GPU allocatable, exact image IDs, legacy RBAC and debug-proxy denial, private listener/firewall/overlay proof, initial resource baseline, and Secret metadata only. |
-| O1 | `o1-api-restart.result.json`: set `facts.oldApiPodUid` and `facts.newApiPodUid` to the exact UID strings and make them differ; the Attempt Pod UID must stay unchanged; retain old/new API logs plus Attempt Job/Pod YAML; prove one Pod/two roles/shared `emptyDir`, GPU only on workspace, tokenless workload identity, exact image IDs, and actual legacy debug-proxy denial for that Pod. |
+| O1 | `o1-api-restart.result.json`: set `facts.oldApiPodUid` and `facts.newApiPodUid` to the exact UID strings and make them differ; the Attempt Pod UID must stay unchanged; retain old/new API logs plus Attempt Job/Pod YAML; prove one Pod/two roles/one shared generic-ephemeral claim, GPU only on workspace, tokenless workload identity, exact image IDs, and actual legacy debug-proxy denial for that Pod. |
 | O2 | `o2-attempt-a-finalized.result.json` and `o2-attempt-b-canceled.result.json`: terminal resources, owner references, role termination, credential Secret absence, and GPU release. `o2-final-resource-baseline.result.json`: deleted refs, recovered runtime/GPU baseline, healthy API, only expected tombstones, and an operator assertion made only after actually reading the raw agent/workspace/API logs. |
 | O3 | `o3-attempt-c-pod-delete.result.json`: raw UID-precondition deletion and missing/replacement Pod reality; `facts.preconditionUid` must equal `observed.podUid`, and the retained binding must not adopt a replacement. |
 

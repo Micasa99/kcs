@@ -14,6 +14,7 @@ required=(
   KCS_CONTROL_SSH_ALIAS KCS_WORKER_SSH_ALIAS KCS_CONTROL_PRIVATE_ADDRESS
   KCS_WORKER_PRIVATE_ADDRESS KCS_ALLOWED_PEER_CIDRS KCS_K3S_VERSION
   KCS_K3S_TOKEN_FILE KCS_WORKER_NODE_NAME KCS_NVIDIA_TOOLKIT_VERSION
+  KCS_WORKER_WORKSPACE_ROOT
 )
 for name in "${required[@]}"; do
   if [[ -z ${!name:-} ]]; then
@@ -37,6 +38,15 @@ done
 }
 [[ $KCS_NVIDIA_TOOLKIT_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || {
   echo "KCS_NVIDIA_TOOLKIT_VERSION must be an exact package version" >&2
+  exit 2
+}
+[[ $KCS_WORKER_WORKSPACE_ROOT =~ ^/[A-Za-z0-9_./-]+$ && \
+   $KCS_WORKER_WORKSPACE_ROOT != / && \
+   $KCS_WORKER_WORKSPACE_ROOT != /var && \
+   $KCS_WORKER_WORKSPACE_ROOT != /home && \
+   $KCS_WORKER_WORKSPACE_ROOT != *'/../'* && \
+   $KCS_WORKER_WORKSPACE_ROOT != */.. ]] || {
+  echo "KCS_WORKER_WORKSPACE_ROOT must be a dedicated absolute data-disk path" >&2
   exit 2
 }
 [[ -f $KCS_K3S_TOKEN_FILE && -s $KCS_K3S_TOKEN_FILE ]] || {
@@ -108,7 +118,8 @@ ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" "umask 077; cat >'$remote_token_
 
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" sudo bash -s -- \
   "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_K3S_VERSION" \
-  "$KCS_WORKER_NODE_NAME" "$remote_token_path" "$KCS_NVIDIA_TOOLKIT_VERSION" <<'REMOTE'
+  "$KCS_WORKER_NODE_NAME" "$remote_token_path" "$KCS_NVIDIA_TOOLKIT_VERSION" \
+  "$KCS_WORKER_WORKSPACE_ROOT" <<'REMOTE'
 set -euo pipefail
 control_address=$1
 worker_address=$2
@@ -116,6 +127,7 @@ k3s_version=$3
 node_name=$4
 token_path=$5
 toolkit_version=$6
+workspace_root=$7
 trap 'rm -f -- "$token_path"' EXIT
 
 ip -o address show | grep -F -- " $worker_address/" >/dev/null || {
@@ -135,6 +147,16 @@ if [[ $installed_toolkit != "$toolkit_version" ]]; then
 fi
 command -v nvidia-container-runtime >/dev/null
 
+# KCS workspaces are dynamically provisioned under this directory.  Require a
+# separate filesystem so a large experiment cannot consume the OS disk.
+install -d -m 0710 "$workspace_root"
+root_device=$(findmnt -n -o SOURCE -T /)
+workspace_device=$(findmnt -n -o SOURCE -T "$workspace_root")
+[[ -n $root_device && -n $workspace_device && $root_device != "$workspace_device" ]] || {
+  echo "worker workspace root must be backed by a non-root filesystem" >&2
+  exit 1
+}
+
 validate_k3s_install() {
   local installed_version
   installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
@@ -143,16 +165,18 @@ validate_k3s_install() {
     /usr/local/libexec/kcs-v2-validate-k3s-exec \
       worker "$control_address" "$worker_address" "$node_name" "$interface" || return 1
 }
-if command -v k3s >/dev/null && ! validate_k3s_install; then
-  echo "existing k3s version or private service configuration mismatch" >&2
-  exit 1
+if command -v k3s >/dev/null; then
+  installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
+  [[ $installed_version == "$k3s_version" ]] || {
+    echo "existing k3s version mismatch" >&2
+    exit 1
+  }
 fi
-
-if ! command -v k3s >/dev/null; then
+if ! validate_k3s_install; then
   token=$(cat "$token_path")
   curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
     K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=127.0.0.1 --default-runtime=nvidia" sh -
+    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address --default-runtime=nvidia" sh -
 fi
 systemctl enable --now k3s-agent >/dev/null
 systemctl restart k3s-agent
@@ -182,13 +206,15 @@ fi
 
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" sudo bash -s -- \
   "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_K3S_VERSION" \
-  "$KCS_WORKER_NODE_NAME" "$KCS_NVIDIA_TOOLKIT_VERSION" <<'REMOTE'
+  "$KCS_WORKER_NODE_NAME" "$KCS_NVIDIA_TOOLKIT_VERSION" \
+  "$KCS_WORKER_WORKSPACE_ROOT" <<'REMOTE'
 set -euo pipefail
 control_address=$1
 worker_address=$2
 k3s_version=$3
 node_name=$4
 toolkit_version=$5
+workspace_root=$6
 interface=$(ip route get "$control_address" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
 [[ -n $interface && $interface =~ ^[A-Za-z0-9_.:@-]+$ ]] || {
   echo "private/overlay interface is invalid" >&2
@@ -199,6 +225,11 @@ nvidia-smi >/dev/null
 installed_toolkit=$(dpkg-query -W -f='${Version}' nvidia-container-toolkit 2>/dev/null || true)
 [[ $installed_toolkit == "$toolkit_version" ]]
 command -v nvidia-container-runtime >/dev/null
+[[ $(findmnt -n -o SOURCE -T "$workspace_root") != \
+   $(findmnt -n -o SOURCE -T /) ]] || {
+  echo "dedicated workspace storage is not active" >&2
+  exit 1
+}
 installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
 [[ $installed_version == "$k3s_version" ]] || {
   echo "started k3s version mismatch" >&2
@@ -260,6 +291,19 @@ REMOTE
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl label node '$KCS_WORKER_NODE_NAME' researchcosmos.io/pool=gpu --overwrite >/dev/null"
+workspace_config_patch=$(
+  ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+    "sudo k3s kubectl -n kube-system get configmap local-path-config -o json" | \
+    python3 "$ROOT/scripts/configure_v2_workspace_storage.py" \
+      "$KCS_WORKER_NODE_NAME" "$KCS_WORKER_WORKSPACE_ROOT"
+)
+printf '%s' "$workspace_config_patch" | \
+  ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+    'patch=$(cat); sudo k3s kubectl -n kube-system patch configmap local-path-config --type=merge -p "$patch" >/dev/null'
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
+  <"$ROOT/deploy/v2/workspace-storage-class.yaml" >/dev/null
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl -n kube-system rollout restart deployment/local-path-provisioner >/dev/null && sudo k3s kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=180s >/dev/null"
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
   <"$ROOT/deploy/v2/nvidia-device-plugin.yaml" >/dev/null
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
