@@ -732,8 +732,11 @@ nonpublic address. The worker kubelet remains loopback-only for K3s exec/log tun
 semantics. A systemd socket relay listens only on the declared nonpublic overlay
 address and forwards port 10250 to that loopback listener, allowing Metrics Server to
 collect Pod CPU and memory without exposing kubelet publicly.
-`KCS_WORKER_WORKSPACE_ROOT` must be backed by a non-root filesystem. KCS uses a
-dedicated `kcs-workspace` StorageClass and generic ephemeral claims, so every
+`KCS_WORKSPACE_STORAGE_ROOT` configures K3s' persistent local-provisioner root and
+must equal the worker-side `KCS_WORKER_WORKSPACE_ROOT`; the latter must be backed
+by a non-root filesystem. Keeping the root in the K3s service argv makes the
+mapping survive server restarts instead of relying on a transient ConfigMap patch.
+KCS uses a dedicated `kcs-workspace` StorageClass and generic ephemeral claims, so every
 Attempt receives an isolated, Pod-owned workspace under that root; deleting the Pod
 also deletes its claim and data. Kubelet and NVIDIA retain their standard host paths.
 The selected

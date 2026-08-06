@@ -10,6 +10,7 @@ from collections import defaultdict
 _CRITICAL_SINGLETONS = {
     "advertise-address",
     "bind-address",
+    "default-local-storage-path",
     "default-runtime",
     "flannel-iface",
     "node-ip",
@@ -76,13 +77,14 @@ def _validate(raw: str, arguments: list[str]) -> None:
     if argv[1] != ("server" if role == "control" else "agent"):
         raise ValueError
     options = _options(argv)
-    if role == "control" and len(arguments) == 4:
-        address, tls_san, interface = arguments[1:]
+    if role == "control" and len(arguments) == 5:
+        address, tls_san, interface, workspace_storage_root = arguments[1:]
         _exact_singletons(
             options,
             {
                 "advertise-address": address,
                 "bind-address": address,
+                "default-local-storage-path": workspace_storage_root,
                 "flannel-iface": interface,
                 "node-ip": address,
                 "tls-san": tls_san,

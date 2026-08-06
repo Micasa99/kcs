@@ -112,6 +112,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         ("", "pods/exec"): {"get", "create"},
         ("", "configmaps"): {"create", "get", "list", "update", "delete"},
         ("", "secrets"): {"create", "get", "delete"},
+        ("metrics.k8s.io", "pods"): {"get", "list"},
     }
     actual_verbs = {
         (rule["apiGroups"][0], resource): set(rule["verbs"])
@@ -273,6 +274,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         "KCS_K3S_VERSION": "v1.33.3+k3s1",
         "KCS_NVIDIA_TOOLKIT_VERSION": "1.17.8-1",
         "KCS_WORKER_WORKSPACE_ROOT": "/scratch/kcs-workspaces",
+        "KCS_WORKSPACE_STORAGE_ROOT": "/scratch/kcs-workspaces",
         "KCS_API_IMAGE": SYNTHETIC_API_IMAGE,
         "KCS_TLS_CERT_FILE": str(cert),
         "KCS_TLS_KEY_FILE": str(key),
@@ -351,7 +353,8 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         "--bind-address=10.77.0.10 --advertise-address=10.77.0.10 "
         "--node-ip=10.77.0.10 --tls-san=kcs-v2.internal.example "
         "--node-label=researchcosmos.io/role=control --flannel-iface=eth0 "
-        "--kubelet-arg=address=10.77.0.10 ; ignore_errors=no ; }"
+        "--kubelet-arg=address=10.77.0.10 "
+        "--default-local-storage-path=/scratch/kcs-workspaces ; ignore_errors=no ; }"
     )
     subprocess.run(
         [
@@ -361,6 +364,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
             "10.77.0.10",
             "kcs-v2.internal.example",
             "eth0",
+            "/scratch/kcs-workspaces",
         ],
         input=effective_exec,
         text=True,
@@ -377,6 +381,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
             "10.77.0.10",
             "kcs-v2.internal.example",
             "eth0",
+            "/scratch/kcs-workspaces",
         ],
         input=conflicting_exec,
         capture_output=True,

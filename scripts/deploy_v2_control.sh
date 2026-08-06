@@ -14,7 +14,7 @@ required=(
   KCS_CONTROL_SSH_ALIAS KCS_CONTROL_PRIVATE_ADDRESS KCS_WORKER_PRIVATE_ADDRESS
   KCS_ALLOWED_PEER_CIDRS KCS_PORT_FORWARD_ADDRESS KCS_TLS_SAN KCS_K3S_VERSION
   KCS_API_IMAGE KCS_TLS_CERT_FILE KCS_TLS_KEY_FILE KCS_SERVICE_TOKEN_FILE
-  KCS_LEGACY_DEBUG_UNITS KCS_LEGACY_SERVICE_ACCOUNT
+  KCS_LEGACY_DEBUG_UNITS KCS_LEGACY_SERVICE_ACCOUNT KCS_WORKSPACE_STORAGE_ROOT
 )
 for name in "${required[@]}"; do
   if [[ -z ${!name:-} ]]; then
@@ -49,6 +49,15 @@ validate_alias "$KCS_CONTROL_SSH_ALIAS"
 }
 [[ $KCS_K3S_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]] || {
   echo "KCS_K3S_VERSION must be an exact k3s release" >&2
+  exit 2
+}
+[[ $KCS_WORKSPACE_STORAGE_ROOT =~ ^/[A-Za-z0-9_./-]+$ && \
+   $KCS_WORKSPACE_STORAGE_ROOT != / && \
+   $KCS_WORKSPACE_STORAGE_ROOT != /var && \
+   $KCS_WORKSPACE_STORAGE_ROOT != /home && \
+   $KCS_WORKSPACE_STORAGE_ROOT != *'/../'* && \
+   $KCS_WORKSPACE_STORAGE_ROOT != */.. ]] || {
+  echo "KCS_WORKSPACE_STORAGE_ROOT must be a dedicated absolute data-disk path" >&2
   exit 2
 }
 [[ -f $KCS_TLS_CERT_FILE && -s $KCS_TLS_CERT_FILE ]]
@@ -131,7 +140,8 @@ fi
 
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo bash -s -- \
   "$KCS_CONTROL_PRIVATE_ADDRESS" "$KCS_WORKER_PRIVATE_ADDRESS" "$KCS_TLS_SAN" \
-  "$KCS_K3S_VERSION" "$KCS_LEGACY_DEBUG_UNITS" "$KCS_LEGACY_SERVICE_ACCOUNT" <<'REMOTE'
+  "$KCS_K3S_VERSION" "$KCS_LEGACY_DEBUG_UNITS" "$KCS_LEGACY_SERVICE_ACCOUNT" \
+  "$KCS_WORKSPACE_STORAGE_ROOT" <<'REMOTE'
 set -euo pipefail
 control_address=$1
 worker_address=$2
@@ -139,6 +149,7 @@ tls_san=$3
 k3s_version=$4
 legacy_units=$5
 legacy_service_account=$6
+workspace_storage_root=$7
 
 ip -o address show | grep -F -- " $control_address/" >/dev/null || {
   echo "control private/overlay address is not configured" >&2
@@ -167,7 +178,7 @@ validate_k3s_install() {
   [[ $installed_version == "$k3s_version" ]] || return 1
   systemctl show --property=ExecStart --value k3s 2>/dev/null | \
     /usr/local/libexec/kcs-v2-validate-k3s-exec \
-      control "$control_address" "$tls_san" "$interface" || return 1
+      control "$control_address" "$tls_san" "$interface" "$workspace_storage_root" || return 1
   if systemctl is-active --quiet k3s && ! validate_control_node; then
     return 1
   fi
@@ -188,7 +199,7 @@ done
 
 if ! command -v k3s >/dev/null; then
   curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="server --bind-address=$control_address --advertise-address=$control_address --node-ip=$control_address --tls-san=$tls_san --node-label=researchcosmos.io/role=control --flannel-iface=$interface --kubelet-arg=address=$control_address" sh -
+    INSTALL_K3S_EXEC="server --bind-address=$control_address --advertise-address=$control_address --node-ip=$control_address --tls-san=$tls_san --node-label=researchcosmos.io/role=control --flannel-iface=$interface --kubelet-arg=address=$control_address --default-local-storage-path=$workspace_storage_root" sh -
 fi
 systemctl enable --now k3s >/dev/null
 if ! validate_k3s_install; then
