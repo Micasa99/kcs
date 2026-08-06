@@ -208,6 +208,12 @@ replay instead return `JobTombstone`. A binding snapshot includes:
 - finalize, cancel, and delete action snapshots, `outputLossPossible`, general
   cleanup, and GPU-release observations.
 
+For a live Pod, KCS fills the agent/workspace CPU and memory observations from
+`metrics.k8s.io` by exact Pod and container identity. Metrics Server warm-up or
+failure leaves those fields `null` without making Job inspection fail. NVIDIA
+utilization remains the separate fixed, exact-Workspace probe above; neither
+observation is used as a scheduling request.
+
 During provisioning, the schema explicitly permits unresolved Pod, resource version,
 node, role, generation, start, and finish observations to be `null`. Absence is not
 converted to an invented value. A `running` binding requires a non-null current Pod

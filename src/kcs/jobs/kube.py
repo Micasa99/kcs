@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+from kubernetes.utils.quantity import parse_quantity  # type: ignore[import-untyped]
+
 from .errors import (
     DependencyTimeoutError,
     DependencyUnavailableError,
@@ -87,6 +89,20 @@ class CoreV1Api(Protocol):
     def connect_get_namespaced_pod_exec(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
 
 
+class CustomObjectsApi(Protocol):
+    """The metrics.k8s.io read used for one bound Pod observation."""
+
+    def get_namespaced_custom_object(
+        self,
+        *,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class LogRead:
     """One bounded page of a single immutable Pod/container log stream."""
@@ -126,6 +142,7 @@ class V2KubeAdapter:
         batch_api: BatchV1Api,
         core_api: CoreV1Api,
         *,
+        metrics_api: CustomObjectsApi | None = None,
         exec_core_api_factory: Callable[[], CoreV1Api] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -134,6 +151,7 @@ class V2KubeAdapter:
         self.namespace = namespace
         self._batch = batch_api
         self._core = core_api
+        self._metrics = metrics_api
         self._exec_core_api_factory = exec_core_api_factory or (lambda: self._core)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._terminals: dict[str, _TerminalProcess] = {}
@@ -166,6 +184,46 @@ class V2KubeAdapter:
             label_selector=MANAGED_SELECTOR,
         )
         return list(_value(result, "items") or ())
+
+    def read_pod_usage(self, pod_name: str) -> dict[str, dict[str, int]]:
+        """Return per-container CPU/memory usage from Metrics Server.
+
+        Absence remains an error at this adapter boundary; the provider turns
+        it into nullable observation fields so Job inspection stays usable
+        while Metrics Server is warming up.
+        """
+
+        if self._metrics is None:
+            raise RuntimeError("metrics.k8s.io client is not configured")
+        payload = self._metrics.get_namespaced_custom_object(
+            group="metrics.k8s.io",
+            version="v1beta1",
+            namespace=self.namespace,
+            plural="pods",
+            name=pod_name,
+        )
+        containers = payload.get("containers") if isinstance(payload, Mapping) else None
+        if not isinstance(containers, list):
+            raise ValueError("PodMetrics has no containers")
+        result: dict[str, dict[str, int]] = {}
+        for container in containers:
+            if not isinstance(container, Mapping):
+                continue
+            name = container.get("name")
+            usage = container.get("usage")
+            if not isinstance(name, str) or not isinstance(usage, Mapping):
+                continue
+            cpu = parse_quantity(str(usage.get("cpu", ""))) * 1000
+            memory = parse_quantity(str(usage.get("memory", ""))) / (1024 * 1024)
+            if cpu < 0 or memory < 0:
+                raise ValueError("PodMetrics contains a negative quantity")
+            result[name] = {
+                "cpuMillis": math.ceil(cpu),
+                "memoryMiB": math.ceil(memory),
+            }
+        if not result:
+            raise ValueError("PodMetrics contains no usable container observations")
+        return result
 
     def read_job(self, job_ref: str) -> Any | None:
         """Read a Job by its deterministic job ref, returning ``None`` for 404."""

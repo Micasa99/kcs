@@ -173,6 +173,8 @@ class V2KubeAdapterProtocol(Protocol):
 
     def list_managed_pods(self) -> Sequence[object]: ...
 
+    def read_pod_usage(self, pod_name: str) -> Mapping[str, Mapping[str, int]]: ...
+
     def read_role_logs(
         self,
         job_ref: str,
@@ -227,9 +229,7 @@ class V2KubeAdapterProtocol(Protocol):
         columns: int,
     ) -> None: ...
 
-    def close_workspace_terminal(
-        self, binding: Mapping[str, str], terminal_ref: str
-    ) -> bool: ...
+    def close_workspace_terminal(self, binding: Mapping[str, str], terminal_ref: str) -> bool: ...
 
     def terminal_is_open(self, binding: Mapping[str, str], terminal_ref: str) -> bool: ...
 
@@ -561,9 +561,7 @@ class V2JobProvider:
                 }
             )
             try:
-                self._store.update_runtime(
-                    "terminal", job_ref, request.terminal_ref, values
-                )
+                self._store.update_runtime("terminal", job_ref, request.terminal_ref, values)
             except Exception:
                 pass
             if claimed:
@@ -576,9 +574,7 @@ class V2JobProvider:
                 "observedAt": self._now().isoformat(),
             }
         )
-        record = self._store.update_runtime(
-            "terminal", job_ref, request.terminal_ref, values
-        )
+        record = self._store.update_runtime("terminal", job_ref, request.terminal_ref, values)
         return TerminalCreateResult(
             snapshot=self._terminal_snapshot(record),
             credential=credential,
@@ -656,9 +652,7 @@ class V2JobProvider:
         record, binding = self._terminal_access(
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
-        self._kube.resize_workspace_terminal(
-            binding, terminal_ref, rows=rows, columns=columns
-        )
+        self._kube.resize_workspace_terminal(binding, terminal_ref, rows=rows, columns=columns)
         return self._touch_terminal(record)
 
     def close_terminal(
@@ -767,12 +761,8 @@ class V2JobProvider:
             self._release_terminal_writer(binding, terminal_ref)
         return indeterminate
 
-    def _claim_terminal_writer(
-        self, binding: Mapping[str, str], terminal_ref: str
-    ) -> None:
-        identity_digest = canonical_digest(
-            {"jobRef": binding["jobRef"], "writer": "workspace"}
-        )
+    def _claim_terminal_writer(self, binding: Mapping[str, str], terminal_ref: str) -> None:
+        identity_digest = canonical_digest({"jobRef": binding["jobRef"], "writer": "workspace"})
         desired = {
             "identityDigest": identity_digest,
             "jobUid": binding["jobUid"],
@@ -822,9 +812,7 @@ class V2JobProvider:
                 )
         raise DependencyUnavailableError("terminal writer reservation changed concurrently")
 
-    def _release_terminal_writer(
-        self, binding: Mapping[str, str], terminal_ref: str
-    ) -> None:
+    def _release_terminal_writer(self, binding: Mapping[str, str], terminal_ref: str) -> None:
         for _ in range(8):
             record = self._store.read_runtime(
                 TERMINAL_WRITER_KIND, binding["jobRef"], TERMINAL_WRITER_ID
@@ -1305,9 +1293,7 @@ class V2JobProvider:
         if observed.state == "running":
             return False
         if type(observed.exit_code) is not int:
-            raise StateConflictError(
-                "The terminal supervisor inspection has no integer exit code"
-            )
+            raise StateConflictError("The terminal supervisor inspection has no integer exit code")
         record = self._store.read_runtime(
             "generation",
             binding.job_ref,
@@ -1321,9 +1307,7 @@ class V2JobProvider:
         if current.runner_state is RunnerState.EXITED:
             return False
         if current.runner_state is not RunnerState.RUNNING:
-            raise StateConflictError(
-                "The retained generation changed during supervisor inspection"
-            )
+            raise StateConflictError("The retained generation changed during supervisor inspection")
         now = self._now()
         terminal = current.model_copy(
             update={
@@ -3358,6 +3342,22 @@ class V2JobProvider:
         except Exception as error:
             raise DependencyUnavailableError from error
 
+    def _pod_usage(self, pod: object) -> Mapping[str, Mapping[str, int]]:
+        """Best-effort Metrics Server observation for the exact current Pod."""
+
+        reader = getattr(self._kube, "read_pod_usage", None)
+        if not callable(reader):
+            return {}
+        pod_name = _required_text(pod, "metadata", "name")
+        try:
+            value = reader(pod_name)
+        except Exception:
+            # Metrics are observational and can legitimately be absent while
+            # the Pod or Metrics Server warms up.  Keep nullable fields rather
+            # than turning a healthy Job inspection into a 503.
+            return {}
+        return value if isinstance(value, Mapping) else {}
+
     def _delete_job(self, job_ref: str, job_uid: str) -> None:
         try:
             self._kube.delete_job(job_ref, job_uid)
@@ -3389,8 +3389,17 @@ class V2JobProvider:
             JobBindingState.FAILED,
         }
         spec_payload = _field(record, "spec_payload", {})
-        agent = _role_snapshot(spec_payload, pod, "agent") if pod is not None else None
-        workspace = _role_snapshot(spec_payload, pod, "workspace") if pod is not None else None
+        usage = self._pod_usage(pod) if pod is not None else {}
+        agent = (
+            _role_snapshot(spec_payload, pod, "agent", usage.get("agent"))
+            if pod is not None
+            else None
+        )
+        workspace = (
+            _role_snapshot(spec_payload, pod, "workspace", usage.get("workspace"))
+            if pod is not None
+            else None
+        )
         job_uid = str(_field(record, "job_uid", None) or _required_text(job, "metadata", "uid"))
         pod_uid = _field(record, "pod_uid", None)
         if pod_uid is None and pod is not None and replacement_reason is None:
@@ -4046,6 +4055,7 @@ def _role_snapshot(
     spec_payload: object,
     pod: object,
     role: Literal["agent"],
+    observed: Mapping[str, int] | None = None,
 ) -> AgentRoleSnapshot | None: ...
 
 
@@ -4054,6 +4064,7 @@ def _role_snapshot(
     spec_payload: object,
     pod: object,
     role: Literal["workspace"],
+    observed: Mapping[str, int] | None = None,
 ) -> WorkspaceRoleSnapshot | None: ...
 
 
@@ -4061,6 +4072,7 @@ def _role_snapshot(
     spec_payload: object,
     pod: object,
     role: Literal["agent", "workspace"],
+    observed: Mapping[str, int] | None = None,
 ) -> AgentRoleSnapshot | WorkspaceRoleSnapshot | None:
     status = next(
         (
@@ -4099,8 +4111,8 @@ def _role_snapshot(
                 storage_gib=storage_gib,
             ),
             observed=AgentObservedResources(
-                cpu_millis=None,
-                memory_mib=None,
+                cpu_millis=(None if observed is None else observed.get("cpuMillis")),
+                memory_mib=(None if observed is None else observed.get("memoryMiB")),
                 gpu=None,
                 storage_gib=None,
             ),
@@ -4122,8 +4134,8 @@ def _role_snapshot(
             storage_gib=storage_gib,
         ),
         observed=WorkspaceObservedResources(
-            cpu_millis=None,
-            memory_mib=None,
+            cpu_millis=(None if observed is None else observed.get("cpuMillis")),
+            memory_mib=(None if observed is None else observed.get("memoryMiB")),
             gpu=None,
             storage_gib=None,
         ),
