@@ -103,7 +103,7 @@ def _validate(raw: str, arguments: list[str]) -> None:
                 "server": f"https://{control_address}:6443",
             },
         )
-        _exact_keyed(options, "kubelet-arg", "address", worker_address)
+        _exact_keyed(options, "kubelet-arg", "address", "127.0.0.1")
         return
     raise ValueError
 

@@ -722,9 +722,10 @@ files with no trailing newline. `--check` validates locally and performs no SSH 
 mutation. The deploy path has no local fallback: control scope is k3s server/V2 API;
 worker scope is k3s agent/NVIDIA runtime/plugin/node label. Neither script supplies a
 host, user, or identity-file default. The control services bind to the declared
-nonpublic address. The worker kubelet binds only to its declared nonpublic overlay
-address so Metrics Server can collect Pod CPU and memory without exposing kubelet
-publicly; pod logs remain available through the authenticated k3s API.
+nonpublic address. The worker kubelet remains loopback-only for K3s exec/log tunnel
+semantics. A systemd socket relay listens only on the declared nonpublic overlay
+address and forwards port 10250 to that loopback listener, allowing Metrics Server to
+collect Pod CPU and memory without exposing kubelet publicly.
 `KCS_WORKER_WORKSPACE_ROOT` must be backed by a non-root filesystem. KCS uses a
 dedicated `kcs-workspace` StorageClass and generic ephemeral claims, so every
 Attempt receives an isolated, Pod-owned workspace under that root; deleting the Pod

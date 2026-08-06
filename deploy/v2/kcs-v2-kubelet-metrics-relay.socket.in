@@ -1,0 +1,10 @@
+[Unit]
+Description=KCS private kubelet metrics relay socket
+
+[Socket]
+ListenStream=@WORKER_PRIVATE_ADDRESS@:10250
+Accept=no
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=KCS private kubelet metrics relay
+Requires=k3s-agent.service
+After=k3s-agent.service
+
+[Service]
+ExecStart=/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min 127.0.0.1:10250
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

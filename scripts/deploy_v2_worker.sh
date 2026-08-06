@@ -104,6 +104,13 @@ ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" true
 ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
   'sudo install -d -m 0755 /usr/local/libexec && sudo tee /usr/local/libexec/kcs-v2-validate-k3s-exec >/dev/null && sudo chmod 0755 /usr/local/libexec/kcs-v2-validate-k3s-exec' \
   <"$ROOT/deploy/v2/kcs-v2-validate-k3s-exec.py"
+ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+  'sudo tee /etc/systemd/system/kcs-v2-kubelet-metrics-relay.service >/dev/null' \
+  <"$ROOT/deploy/v2/kcs-v2-kubelet-metrics-relay.service"
+sed "s/@WORKER_PRIVATE_ADDRESS@/$KCS_WORKER_PRIVATE_ADDRESS/g" \
+  "$ROOT/deploy/v2/kcs-v2-kubelet-metrics-relay.socket.in" | \
+  ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+    'sudo tee /etc/systemd/system/kcs-v2-kubelet-metrics-relay.socket >/dev/null'
 
 remote_token_path=$(ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
   'umask 077; tmp=$(mktemp); printf "%s" "$tmp"')
@@ -176,10 +183,12 @@ if ! validate_k3s_install; then
   token=$(cat "$token_path")
   curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
     K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
-    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=$worker_address --default-runtime=nvidia" sh -
+    INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=127.0.0.1 --default-runtime=nvidia" sh -
 fi
 systemctl enable --now k3s-agent >/dev/null
 systemctl restart k3s-agent
+systemctl daemon-reload
+systemctl enable --now kcs-v2-kubelet-metrics-relay.socket >/dev/null
 if ! validate_k3s_install; then
   echo "started k3s version or private service configuration mismatch" >&2
   exit 1
