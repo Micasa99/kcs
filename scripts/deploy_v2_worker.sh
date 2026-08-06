@@ -311,6 +311,11 @@ printf '%s' "$workspace_config_patch" | \
     'patch=$(cat); sudo k3s kubectl -n kube-system patch configmap local-path-config --type=merge -p "$patch" >/dev/null'
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
   <"$ROOT/deploy/v2/workspace-storage-class.yaml" >/dev/null
+# The local-path provisioner is a storage control-plane component.  Keep it off
+# GPU workers so a provisioner restart never waits on a worker-only image pull
+# or consumes experiment capacity.
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  "sudo k3s kubectl -n kube-system patch deployment local-path-provisioner --type=merge -p='{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/os\":\"linux\",\"researchcosmos.io/role\":\"control\"}}}}}' >/dev/null"
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s kubectl -n kube-system rollout restart deployment/local-path-provisioner >/dev/null && sudo k3s kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=180s >/dev/null"
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
