@@ -37,3 +37,10 @@ sudo k3s kubectl -n kube-system get service traefik \
 Clients then use `https://<certificate-covered-host>:<node-port>`. This is a
 temporary transport address; the KCS API, bearer authentication and Product
 callback contracts are unchanged.
+
+Some hosting platforms acknowledge a custom NodePort rule but do not deliver
+payload bytes to the host. In that case, use an already-permitted high port on
+the KCS control host and terminate TLS with Nginx (or an equivalent reverse
+proxy), forwarding only `/api/v2/*` to the private KCS API with backend CA
+verification enabled. The current hosted deployment uses port 8888 for this
+reason. Do not bind the private API itself to the public interface.
