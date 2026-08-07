@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kcs-dcgm-exporter-metrics
+  namespace: kcs-monitoring
+data:
+  counters.csv: |
+    DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization in percent.
+    DCGM_FI_DEV_FB_USED, gauge, GPU framebuffer memory used in MiB.
+    DCGM_FI_DEV_FB_FREE, gauge, GPU framebuffer memory free in MiB.
+    DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature in Celsius.
+    DCGM_FI_DEV_POWER_USAGE, gauge, GPU power usage in watts.
+    DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile double-bit ECC errors.
+    DCGM_FI_DEV_XID_ERRORS, gauge, Last NVIDIA XID error code.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kcs-dcgm-exporter
+  namespace: kcs-monitoring
+automountServiceAccountToken: true
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kcs-dcgm-exporter
+  namespace: kcs-monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kcs-dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcs-dcgm-exporter
+    spec:
+      serviceAccountName: kcs-dcgm-exporter
+      runtimeClassName: nvidia
+      nodeSelector:
+        researchcosmos.io/pool: gpu
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: dcgm-exporter
+          image: 10.255.250.1:5000/researchcosmos/dcgm-exporter@sha256:a2a7f33ca47d8a5a88245be929dc80f1605d9888bae2b4819fc9900eb869c781
+          imagePullPolicy: IfNotPresent
+          args: ["-f", "/etc/dcgm-exporter/counters.csv"]
+          env:
+            - {name: DCGM_EXPORTER_KUBERNETES, value: "true"}
+            - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
+            - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+          ports:
+            - {name: metrics, containerPort: 9400}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["SYS_ADMIN"]
+              drop: ["ALL"]
+            runAsNonRoot: false
+            runAsUser: 0
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - name: counters
+              mountPath: /etc/dcgm-exporter/counters.csv
+              subPath: counters.csv
+              readOnly: true
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+      volumes:
+        - name: counters
+          configMap:
+            name: kcs-dcgm-exporter-metrics
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kcs-dcgm-exporter
+  namespace: kcs-monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: kcs-dcgm-exporter
+  ports:
+    - {name: metrics, port: 9400, targetPort: metrics}

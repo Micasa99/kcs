@@ -53,6 +53,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         from kubernetes import client, config  # type: ignore[import-untyped]
 
         from kcs.jobs.kube import V2KubeAdapter
+        from kcs.jobs.observability import EventStore, PrometheusClient, V2Observability
         from kcs.jobs.provider import V2JobProvider
         from kcs.jobs.renderer import V2JobRenderer
         from kcs.jobs.settings import V2RuntimeSettings
@@ -74,6 +75,14 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             # and from every other exec call.
             exec_core_api_factory=lambda: client.CoreV1Api(api_client=client.ApiClient()),
         )
+        observability = V2Observability(
+            kube,
+            PrometheusClient(
+                settings.prometheus_url,
+                timeout_seconds=settings.prometheus_timeout_seconds,
+            ),
+            EventStore(settings.event_db_path),
+        )
         _v2_provider = V2JobProvider(
             kube,
             V2JobStore(kube),
@@ -81,6 +90,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             namespace=settings.namespace,
             transport=ExecRpcTransport(kube.exec_supervisor_rpc),
             workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
+            observability=observability,
         )
     return _v2_provider
 

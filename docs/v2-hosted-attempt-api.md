@@ -1,4 +1,4 @@
-# KCS V2 Hosted Attempt API 2.2.0
+# KCS V2 Hosted Attempt API 2.3.0
 
 The wire authority is `openapi/kcs-v2-jobs.openapi.yaml` (OpenAPI 3.1.0). KCS owns
 provider workload reality only: it accepts opaque owner references, does not import
@@ -10,7 +10,7 @@ Generated component schemas and the checksum file are deterministic review artif
 the YAML remains the source of truth. The committed
 [canonical compact JSON](../openapi/generated/kcs-v2-jobs.openapi.json) and
 [checksum](../openapi/generated/kcs-v2-jobs.openapi.sha256) currently have digest
-`8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a`.
+`965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526`.
 
 ## Runtime boundary and topology
 
@@ -53,10 +53,13 @@ forbidden request-body logging, sensitive-header redaction, and
 | Finalize/cancel | `POST /api/v2/jobs/{jobRef}/finalize`; `POST /api/v2/jobs/{jobRef}/cancel` |
 | Capacity observation | `GET /api/v2/capacity` |
 | Pending managed Jobs | `GET /api/v2/queue` |
+| Node utilization | `GET /api/v2/telemetry/nodes` |
+| Ordered runtime events | `GET /api/v2/events` |
+| Monitoring self-health | `GET /api/v2/healthz` |
 | Canonical OpenAPI | `GET /api/v2/openapi.json` |
 
 The OpenAPI endpoint returns the exact committed canonical JSON with `ETag` equal to
-its SHA-256, `X-KCS-API-Version: 2.2.0`, and `Cache-Control: no-store`. Required wire
+its SHA-256, `X-KCS-API-Version: 2.3.0`, and `Cache-Control: no-store`. Required wire
 headers are declared per response with `x-kcs-required-headers`; the generator checks
 that declaration for every status, including statuses without a route example. Every
 response from credential grant/inspect, transfer content PUT/GET, NVIDIA telemetry,
@@ -83,6 +86,31 @@ and bounded to 512 UTF-8 bytes. Requested GPU, CPU, and memory come from the sam
 or Job template requests Kubernetes schedules. Neither endpoint exposes Secrets,
 kubeconfig, internal node identity, billing, balance, tenant quota negotiation, or a
 mutation surface.
+
+## Cluster telemetry, events, and monitoring health
+
+KCS keeps raw time series inside `kcs-monitoring`. Prometheus scrapes kubelet/cAdvisor,
+kube-state-metrics, and one dcgm-exporter Pod per GPU node every 15 seconds and retains
+at most 15 days/15 GiB. The public service reads only bounded recording rules; it never
+returns raw Prometheus series.
+
+`GET /api/v2/telemetry/nodes` returns every current Kubernetes node under the same
+redacted `computeNode` identity used by capacity. CPU, memory, and per-GPU utilization,
+VRAM, temperature, power, ECC, XID, and optional `podRef` are observations rather than
+scheduler reservations. Missing source segments are omitted (or `gpus: []`), never
+invented as zero. Prometheus unavailability is a typed `503`.
+
+`GET /api/v2/events` projects managed Job phase, Node condition, image-pull,
+scheduling, and OOM transitions into a persistent SQLite ring. Sequence numbers remain
+monotonic across API restarts. The ring retains the smaller of 10,000 events or 24
+hours; a clipped cursor resumes at the earliest retained event with `truncated: true`.
+Event detail is sanitized and limited to 1 KiB, and one page is limited to 200 events.
+
+`GET /api/v2/healthz` always returns HTTP 200 and self-reports Prometheus,
+dcgm-exporter, and kube-state-metrics as `up` or `down`, plus oldest scrape age. All
+three endpoints use the same Bearer authentication and reader role as other V2
+observation routes. Normal/degraded fixtures and the operator runbook live under
+`deploy/v2/monitoring/`.
 
 ## NVIDIA telemetry and Workspace terminal
 
@@ -310,7 +338,7 @@ suite uses only an explicitly synthetic binary fixture, never a credential JSON
 field. The request is
 service-to-service only over TLS/private ingress, requires the private credential
 writer authorization role, forbids body logging, redacts sensitive headers, and
-returns `Cache-Control: no-store`. Bearer service auth is the V2.2.0 wire mechanism;
+returns `Cache-Control: no-store`. Bearer service auth is the V2.3.0 wire mechanism;
 mTLS is not mandatory.
 
 The request metadata is carried by these typed headers:
@@ -447,7 +475,7 @@ be NFC and may not contain Unicode general categories `Cc`, `Cf`, `Cs`, `Co`, `C
 `Zl`, or `Zp`. It preserves path case but rejects registration when the requested
 path case-folds to an existing workspace path.
 
-V2.2.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
+V2.3.0 supports authenticated direct `application/octet-stream` only, up to 100 GiB.
 It exposes no signed URL or transfer token and implements no `Range` request mode.
 Clients must use the OpenAPI feature declaration (`transferModes: [direct]`,
 `rangeRequests: false`, `signedTransfers: false`) to negotiate or fail closed.
@@ -587,7 +615,7 @@ Bearer service authentication, TLS, and private ingress are required globally fo
 all V2 routes. Raw credential upload additionally requires the private
 credential-writer role, forbidden body logging, sensitive-header redaction, and
 `Cache-Control: no-store`. mTLS may be deployed as an infrastructure
-control but is not a V2.2.0 wire requirement. Routes additionally require the
+control but is not a V2.3.0 wire requirement. Routes additionally require the
 declared service authorization role: `v2-reader`, `v2-mutator`, or, for raw
 credential upload, `v2-private-credential-writer`.
 
@@ -673,7 +701,7 @@ The same generation/check command owns the byte-identical
 `kcs.openapi/kcs-v2-jobs.openapi.json` package resource. The V2 route reads that
 resource through Python package-resource APIs, so an installed wheel never reaches
 back into a source checkout. Its digest remains
-`8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a`.
+`965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526`.
 
 ## Fixed conformance actions
 

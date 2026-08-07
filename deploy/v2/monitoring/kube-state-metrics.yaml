@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kcs-kube-state-metrics
+  namespace: kcs-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kcs-kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "nodes", "pods", "resourcequotas", "services"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["persistentvolumeclaims", "storageclasses", "volumeattachments"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kcs-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kcs-kube-state-metrics
+    namespace: kcs-monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kcs-kube-state-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kcs-kube-state-metrics
+  namespace: kcs-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kcs-kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcs-kube-state-metrics
+    spec:
+      serviceAccountName: kcs-kube-state-metrics
+      nodeSelector:
+        researchcosmos.io/role: control
+      containers:
+        - name: kube-state-metrics
+          image: 10.255.250.1:5000/researchcosmos/kube-state-metrics@sha256:7661da8c99b733d43117e4cba12bd9865d335e5777191d0af3d789807aded9f4
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8080
+            - --telemetry-port=8081
+            - --metric-labels-allowlist=pods=[researchcosmos.io/managed-by],jobs=[researchcosmos.io/managed-by]
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: telemetry, containerPort: 8081}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile: {type: RuntimeDefault}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kcs-kube-state-metrics
+  namespace: kcs-monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: kcs-kube-state-metrics
+  ports:
+    - {name: metrics, port: 8080, targetPort: metrics}

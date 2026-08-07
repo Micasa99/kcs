@@ -49,8 +49,10 @@ from .contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    NodeTelemetryList,
     NvidiaDeviceTelemetry,
     NvidiaTelemetrySnapshot,
+    ObservabilityHealth,
     OperationState,
     PodIncarnationSnapshot,
     PodIncarnationState,
@@ -59,6 +61,7 @@ from .contracts import (
     RoleLogs,
     RoleState,
     RunnerState,
+    RuntimeEventPage,
     TerminalCreateRequest,
     TerminalSessionSnapshot,
     TerminalState,
@@ -154,6 +157,18 @@ class V2JobRendererProtocol(Protocol):
     def job_ref(self, request: CreateJobRequest) -> str: ...
 
     def render(self, request: CreateJobRequest) -> object: ...
+
+
+class V2ObservabilityProtocol(Protocol):
+    """Additive cluster-observation service kept outside scheduling authority."""
+
+    def telemetry_nodes(self) -> NodeTelemetryList: ...
+
+    def events(self, cursor: str | None, limit: int) -> RuntimeEventPage: ...
+
+    def healthz(self) -> ObservabilityHealth: ...
+
+    def collect(self) -> int: ...
 
 
 class V2KubeAdapterProtocol(Protocol):
@@ -376,6 +391,7 @@ class V2JobProvider:
         sleeper: Callable[[float], None] | None = None,
         transport: AgentRpcTransportProtocol | None = None,
         workspace_transport: WorkspaceRpcTransportProtocol | None = None,
+        observability: V2ObservabilityProtocol | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -395,6 +411,7 @@ class V2JobProvider:
         self._sleeper = sleeper or time.sleep
         self._transport = transport
         self._workspace_transport = workspace_transport
+        self._observability = observability
         self._cluster_feed = ClusterFeed(kube, clock=self._clock)
         self._lifecycle = LifecycleGate(store)
         self._startup_reconcile = False
@@ -416,6 +433,39 @@ class V2JobProvider:
     def queue(self) -> QueueSnapshot:
         """Return managed Jobs that Kubernetes has not made ready."""
         return self._cluster_feed.queue()
+
+    def telemetry_nodes(self) -> NodeTelemetryList:
+        """Return cluster telemetry without promoting observations to scheduler facts."""
+
+        if self._observability is None:
+            raise DependencyUnavailableError("KCS observability is not configured")
+        return self._observability.telemetry_nodes()
+
+    def runtime_events(self, cursor: str | None, limit: int) -> RuntimeEventPage:
+        """Read the durable, cursor-addressed event ring."""
+
+        if self._observability is None:
+            raise DependencyUnavailableError("KCS runtime events are not configured")
+        return self._observability.events(cursor, limit)
+
+    def observability_health(self) -> ObservabilityHealth:
+        """Self-report observability dependencies; this surface never raises for outage."""
+
+        if self._observability is None:
+            return ObservabilityHealth(
+                prometheus="down",
+                dcgm="down",
+                kube_state_metrics="down",
+                oldest_scrape_age_seconds=None,
+            )
+        return self._observability.healthz()
+
+    def collect_runtime_events(self) -> int:
+        """Capture managed Kubernetes transitions into the persistent event ring."""
+
+        if self._observability is None:
+            return 0
+        return self._observability.collect()
 
     def nvidia_telemetry(self, job_ref: str) -> NvidiaTelemetrySnapshot:
         """Read NVIDIA driver observations from the exact bound Workspace Pod.

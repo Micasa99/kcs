@@ -121,7 +121,7 @@ class ClusterFeed:
                 )
                 snapshots.append(
                     CapacityNodeSnapshot(
-                        display_compute_node=_display_node(node_name, labels),
+                        display_compute_node=display_compute_node(node_name, labels),
                         pool=_text(labels.get(POOL_LABEL)) or "unlabeled",
                         ready="Ready" in true_conditions,
                         conditions=true_conditions,
@@ -163,7 +163,7 @@ class ClusterFeed:
                 observed_name = _required_text(node, "metadata", "name")
                 if observed_name == node_name:
                     labels = _mapping(_path(node, "metadata", "labels"))
-                    return _display_node(observed_name, labels)
+                    return display_compute_node(observed_name, labels)
         except Exception as exc:
             raise DependencyUnavailableError(
                 "Kubernetes compute-node observation is unavailable"
@@ -235,7 +235,9 @@ class ClusterFeed:
         return value
 
 
-def _display_node(node_name: str, labels: Mapping[str, object]) -> str:
+def display_compute_node(node_name: str, labels: Mapping[str, object]) -> str:
+    """Return the stable public identity shared by every KCS cluster feed."""
+
     explicit = _text(labels.get(DISPLAY_NODE_LABEL))
     if explicit is not None:
         return explicit

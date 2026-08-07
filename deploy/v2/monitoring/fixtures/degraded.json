@@ -1,0 +1,33 @@
+{
+  "telemetry": {
+    "observedAt": "2026-08-07T15:05:00Z",
+    "kcsNow": "2026-08-07T15:05:01Z",
+    "nodes": [
+      {
+        "computeNode": "compute-b8e28c379fab",
+        "gpus": [
+          {
+            "deviceId": "GPU-00000000-0000-0000-0000-000000000001",
+            "podRef": null
+          }
+        ]
+      }
+    ]
+  },
+  "events": {
+    "events": [],
+    "nextCursor": "djE6ODEy",
+    "truncated": true
+  },
+  "health": {
+    "prometheus": "down",
+    "dcgm": "down",
+    "kubeStateMetrics": "down",
+    "oldestScrapeAgeSeconds": null
+  },
+  "telemetryFailure": {
+    "status": 503,
+    "code": "DEPENDENCY_UNAVAILABLE"
+  }
+}
+

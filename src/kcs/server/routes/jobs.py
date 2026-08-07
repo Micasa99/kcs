@@ -41,9 +41,12 @@ from kcs.jobs.contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    NodeTelemetryList,
     NvidiaTelemetrySnapshot,
+    ObservabilityHealth,
     QueueSnapshot,
     RoleLogs,
+    RuntimeEventPage,
     TerminalCreateRequest,
     TerminalResizeRequest,
     TerminalSessionSnapshot,
@@ -71,7 +74,7 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.2.0"
+API_VERSION = "2.3.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -230,10 +233,15 @@ def _require_json_media_type(request: Request) -> None:
         raise _UnsupportedMediaTypeError
 
 
-def _json_model(model: BaseModel, *, status_code: int = 200) -> JSONResponse:
+def _json_model(
+    model: BaseModel,
+    *,
+    status_code: int = 200,
+    exclude_unset: bool = False,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content=model.model_dump(mode="json", by_alias=True),
+        content=model.model_dump(mode="json", by_alias=True, exclude_unset=exclude_unset),
     )
 
 
@@ -331,6 +339,42 @@ def create_jobs_router(
         route_class=_V2Route,
         dependencies=[Depends(require_v2_caller), Depends(_require_json_media_type)],
     )
+
+    @router.get(
+        "/api/v2/telemetry/nodes",
+        operation_id="getNodeTelemetry",
+        tags=["Cluster observations"],
+        response_model=NodeTelemetryList,
+        responses=_error_responses(401, 403, 500, 503),
+    )
+    def get_node_telemetry() -> Response:
+        return _json_model(provider.telemetry_nodes(), exclude_unset=True)
+
+    @router.get(
+        "/api/v2/events",
+        operation_id="getRuntimeEvents",
+        tags=["Cluster observations"],
+        response_model=RuntimeEventPage,
+        responses=_error_responses(400, 401, 403, 500, 503),
+    )
+    def get_runtime_events(
+        cursor: Annotated[
+            str | None,
+            Query(pattern=_OPAQUE_TOKEN_PATTERN),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    ) -> Response:
+        return _json_model(provider.runtime_events(cursor, limit))
+
+    @router.get(
+        "/api/v2/healthz",
+        operation_id="getObservabilityHealth",
+        tags=["Cluster observations"],
+        response_model=ObservabilityHealth,
+        responses=_error_responses(401, 403, 500),
+    )
+    def get_observability_health() -> Response:
+        return _json_model(provider.observability_health())
 
     @router.get(
         "/api/v2/capacity",

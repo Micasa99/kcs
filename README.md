@@ -100,9 +100,11 @@ scripts/deploy_v2_worker.sh --check
 
 Without `--check`, the scripts require explicit SSH-config aliases. The control
 script changes only the dedicated k3s server, V2 API namespace/RBAC/TLS Secrets, and
-the private TLS Service port-forward. The worker script changes only the separate
-k3s agent, NVIDIA container runtime/device plugin, and GPU node label. There is no
-localhost or local-k3s fallback.
+the KCS-internal monitoring namespace and TLS Service port-forward. The worker script
+changes only the separate k3s agent, NVIDIA container runtime/device plugin, GPU node
+label, and the KCS internal-registry trust/auth copied from the control node over the
+authenticated deployment channel. Registry credentials remain untracked and are
+never rendered by the script. There is no localhost or local-k3s fallback.
 
 The control/worker addresses and allowed CIDRs must be wholly inside IPv4 RFC1918,
 CGNAT `100.64.0.0/10`, or IPv6 ULA `fc00::/7` topology. k3s, kubelet, and VXLAN must
@@ -121,6 +123,14 @@ The exact `KCS_NVIDIA_TOOLKIT_VERSION` package must be available from an already
 configured trusted NVIDIA apt repository. Both nodes must already reach and
 authenticate to the immutable image registry; configure node-level k3s
 `registries.yaml` for a private registry. Task 10 proves the real image pulls.
+
+V2.3 deploys Prometheus, Alertmanager, kube-state-metrics, and dcgm-exporter only
+inside `kcs-monitoring`. Their Services are ClusterIP-only; raw time series never
+leave KCS. Authenticated consumers use `/api/v2/telemetry/nodes`, `/api/v2/events`,
+and `/api/v2/healthz`. Operational checks and failure recovery are documented in
+`deploy/v2/monitoring/RUNBOOK.md`. SSH is an operator deployment transport, not a
+runtime API dependency: Product and developer clients connect to the configured KCS
+HTTPS endpoint with its CA and Bearer token.
 
 `scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation
 drives the normal, cancel, and UID-precondition Pod-loss branches and retains raw API,

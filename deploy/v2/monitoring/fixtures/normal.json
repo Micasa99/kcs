@@ -1,0 +1,47 @@
+{
+  "telemetry": {
+    "observedAt": "2026-08-07T15:00:00Z",
+    "kcsNow": "2026-08-07T15:00:01Z",
+    "nodes": [
+      {
+        "computeNode": "compute-b8e28c379fab",
+        "cpu": {"utilizationPercent": 31.2},
+        "memory": {"usedBytes": 68719476736, "totalBytes": 228707008512},
+        "gpus": [
+          {
+            "deviceId": "GPU-00000000-0000-0000-0000-000000000001",
+            "utilizationPercent": 72.0,
+            "memoryUsedMiB": 8192,
+            "memoryTotalMiB": 24564,
+            "temperatureCelsius": 61.0,
+            "powerWatts": 214.0,
+            "eccVolatileErrors": 0,
+            "xidLastCode": 0,
+            "podRef": null
+          }
+        ]
+      }
+    ]
+  },
+  "events": {
+    "events": [
+      {
+        "sequence": 812,
+        "occurredAt": "2026-08-07T15:00:00Z",
+        "kind": "job_phase",
+        "jobRef": "kcs-v2-job-example",
+        "computeNode": null,
+        "detail": {"phase": "running"}
+      }
+    ],
+    "nextCursor": "djE6ODEy",
+    "truncated": false
+  },
+  "health": {
+    "prometheus": "up",
+    "dcgm": "up",
+    "kubeStateMetrics": "up",
+    "oldestScrapeAgeSeconds": 12
+  }
+}
+

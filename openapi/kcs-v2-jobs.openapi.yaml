@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KCS V2 Hosted Attempt API
-  version: 2.2.0
+  version: 2.3.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -1289,6 +1289,69 @@ paths:
         '403': *Error403
         '500': *Error500
         '503': *Error503
+  /api/v2/telemetry/nodes:
+    get:
+      tags: [Cluster observations]
+      operationId: getNodeTelemetry
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: >-
+            Prometheus-recorded node and GPU utilization. Missing source segments are
+            omitted and requested resources are never represented as utilization.
+          content: {application/json: {schema: {$ref: '#/components/schemas/NodeTelemetryList'}}}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+        '503': *Error503
+  /api/v2/events:
+    get:
+      tags: [Cluster observations]
+      operationId: getRuntimeEvents
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        INVALID_CURSOR: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      parameters:
+        - {$ref: '#/components/parameters/EventCursor'}
+        - {$ref: '#/components/parameters/EventLimit'}
+      responses:
+        '200':
+          description: >-
+            Restart-stable runtime events after the opaque cursor. A clipped cursor
+            resumes at the earliest retained event and sets truncated=true.
+          content: {application/json: {schema: {$ref: '#/components/schemas/RuntimeEventPage'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
+        '503': *Error503
+  /api/v2/healthz:
+    get:
+      tags: [Cluster observations]
+      operationId: getObservabilityHealth
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+      responses:
+        '200':
+          description: >-
+            Observability dependency self-report. Dependency outage is represented in
+            the body while this endpoint remains HTTP 200.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ObservabilityHealth'}}}
+        '401': *Error401
+        '403': *Error403
+        '500': *Error500
   /api/v2/openapi.json:
     get:
       tags: [Contract]
@@ -1309,7 +1372,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.2.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.3.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -1333,6 +1396,8 @@ components:
     OperationRef: {name: operationRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     Container: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace]}}
     Cursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
+    EventCursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
+    EventLimit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 200}}
     LogLimit: {name: limitBytes, in: query, schema: {type: integer, minimum: 1, maximum: 1048576, default: 65536}}
     PageToken: {name: pageToken, in: query, schema: {$ref: '#/components/schemas/OpaquePageToken'}}
     PageSize: {name: pageSize, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
@@ -1545,6 +1610,100 @@ components:
         computeNode: {type: string, minLength: 1, maxLength: 128}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
         devices: {type: array, minItems: 1, items: {$ref: '#/components/schemas/NvidiaDeviceTelemetry'}}
+    NodeCpuTelemetry:
+      type: object
+      additionalProperties: false
+      required: [utilizationPercent]
+      properties:
+        utilizationPercent: {type: number, minimum: 0, maximum: 100}
+    NodeMemoryTelemetry:
+      type: object
+      additionalProperties: false
+      required: [usedBytes, totalBytes]
+      properties:
+        usedBytes: {type: integer, minimum: 0}
+        totalBytes: {type: integer, minimum: 1}
+    ClusterGpuTelemetry:
+      type: object
+      additionalProperties: false
+      required: [deviceId, podRef]
+      properties:
+        deviceId: {type: string, minLength: 1, maxLength: 128}
+        utilizationPercent: {type: number, minimum: 0, maximum: 100}
+        memoryUsedMiB: {type: integer, minimum: 0}
+        memoryTotalMiB: {type: integer, minimum: 1}
+        temperatureCelsius: {type: number, minimum: -100, maximum: 250}
+        powerWatts: {type: number, minimum: 0}
+        eccVolatileErrors: {type: integer, minimum: 0}
+        xidLastCode: {type: integer, minimum: 0}
+        podRef: {oneOf: [{$ref: '#/components/schemas/OpaqueRef'}, {type: 'null'}]}
+    NodeTelemetrySnapshot:
+      type: object
+      additionalProperties: false
+      required: [computeNode, gpus]
+      properties:
+        computeNode: {type: string, minLength: 1, maxLength: 128}
+        cpu: {$ref: '#/components/schemas/NodeCpuTelemetry'}
+        memory: {$ref: '#/components/schemas/NodeMemoryTelemetry'}
+        gpus:
+          type: array
+          maxItems: 16
+          items: {$ref: '#/components/schemas/ClusterGpuTelemetry'}
+    NodeTelemetryList:
+      type: object
+      additionalProperties: false
+      required: [observedAt, kcsNow, nodes]
+      properties:
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        kcsNow: {$ref: '#/components/schemas/Timestamp'}
+        nodes:
+          type: array
+          maxItems: 64
+          items: {$ref: '#/components/schemas/NodeTelemetrySnapshot'}
+    RuntimeEventKind:
+      type: string
+      enum: [job_phase, node_condition, image_pull, scheduling, oom]
+    RuntimeEvent:
+      type: object
+      additionalProperties: false
+      required: [sequence, occurredAt, kind, jobRef, computeNode, detail]
+      properties:
+        sequence: {type: integer, minimum: 1}
+        occurredAt: {$ref: '#/components/schemas/Timestamp'}
+        kind: {$ref: '#/components/schemas/RuntimeEventKind'}
+        jobRef: {oneOf: [{$ref: '#/components/schemas/OpaqueRef'}, {type: 'null'}]}
+        computeNode: {oneOf: [{type: string, minLength: 1, maxLength: 128}, {type: 'null'}]}
+        detail:
+          type: object
+          x-kcs-maxCanonicalBytes: 1024
+          additionalProperties:
+            oneOf:
+              - {type: string}
+              - {type: integer}
+              - {type: boolean}
+              - {type: 'null'}
+              - {type: array, items: {type: string}}
+    RuntimeEventPage:
+      type: object
+      additionalProperties: false
+      required: [events, nextCursor, truncated]
+      properties:
+        events:
+          type: array
+          maxItems: 200
+          items: {$ref: '#/components/schemas/RuntimeEvent'}
+        nextCursor: {$ref: '#/components/schemas/OpaqueCursor'}
+        truncated: {type: boolean}
+      x-kcs-maxCanonicalBytes: 262144
+    ObservabilityHealth:
+      type: object
+      additionalProperties: false
+      required: [prometheus, dcgm, kubeStateMetrics, oldestScrapeAgeSeconds]
+      properties:
+        prometheus: {type: string, enum: [up, down]}
+        dcgm: {type: string, enum: [up, down]}
+        kubeStateMetrics: {type: string, enum: [up, down]}
+        oldestScrapeAgeSeconds: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
     AgentResources:
       type: object
       additionalProperties: false

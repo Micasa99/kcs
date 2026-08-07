@@ -213,7 +213,7 @@ def _create_v2_app(
     app = FastAPI(
         title="kcs V2 Attempt Runtime API",
         description="Isolated physical attempt runtime for ResearchCosmos.",
-        version="2.2.0",
+        version="2.3.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -232,15 +232,31 @@ def _create_v2_app(
             except TimeoutError:
                 pass
 
+    async def observation_loop() -> None:
+        collector = getattr(provider, "collect_runtime_events", None)
+        if not callable(collector):
+            return
+        while not reconcile_stop.is_set():
+            try:
+                await asyncio.to_thread(collector)
+            except Exception:
+                log.warning("V2 runtime-event collection failed; retrying", exc_info=True)
+            try:
+                await asyncio.wait_for(reconcile_stop.wait(), timeout=15)
+            except TimeoutError:
+                pass
+
     @app.on_event("startup")
     async def start_reconciliation() -> None:
         await asyncio.to_thread(provider.reconcile_all)
         app.state.kcs_reconcile_task = asyncio.create_task(reconcile_loop())
+        app.state.kcs_observation_task = asyncio.create_task(observation_loop())
 
     @app.on_event("shutdown")
     async def stop_reconciliation() -> None:
         reconcile_stop.set()
         await app.state.kcs_reconcile_task
+        await app.state.kcs_observation_task
 
     @app.get("/api/v1/health", include_in_schema=False)
     def health() -> dict[str, str]:

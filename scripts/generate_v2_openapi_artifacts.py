@@ -86,6 +86,9 @@ MUTATION_OPERATION_IDS = {
 OPERATION_AUTHORIZATION = {
     "getCapacity": "v2-reader",
     "getQueue": "v2-reader",
+    "getNodeTelemetry": "v2-reader",
+    "getRuntimeEvents": "v2-reader",
+    "getObservabilityHealth": "v2-reader",
     "createJob": "v2-mutator",
     "listJobs": "v2-reader",
     "inspectJob": "v2-reader",
@@ -116,6 +119,9 @@ OPERATION_AUTHORIZATION = {
 EXPECTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
     "getQueue": ("get", "/api/v2/queue"),
+    "getNodeTelemetry": ("get", "/api/v2/telemetry/nodes"),
+    "getRuntimeEvents": ("get", "/api/v2/events"),
+    "getObservabilityHealth": ("get", "/api/v2/healthz"),
     "createJob": ("post", "/api/v2/jobs"),
     "listJobs": ("get", "/api/v2/jobs"),
     "inspectJob": ("get", "/api/v2/jobs/{jobRef}"),
@@ -199,8 +205,8 @@ EXPECTED_ROOT_LIMITS = {
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "a2d0a4ed8bbaec9ba0eb8504bf969db21a578080ab623cd8a0d67dc765fbf314"
-CANONICAL_OPENAPI_SHA256 = "8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a"
+CANONICAL_X_KCS_POLICY_SHA256 = "40996905f9caf8bb67125b376de6564255623d70be09dec871772d413409deec"
+CANONICAL_OPENAPI_SHA256 = "965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -789,7 +795,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.2.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.3.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -2867,8 +2873,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.2.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.2.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.3.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.3.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")

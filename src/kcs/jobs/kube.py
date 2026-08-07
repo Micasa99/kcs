@@ -62,6 +62,8 @@ class CoreV1Api(Protocol):
 
     def list_node(self) -> Any: ...
 
+    def list_namespaced_event(self, *, namespace: str) -> Any: ...
+
     def read_namespaced_pod(self, *, name: str, namespace: str) -> Any: ...
 
     def read_namespaced_pod_log(self, *, name: str, namespace: str, **kwargs: Any) -> Any: ...
@@ -183,6 +185,12 @@ class V2KubeAdapter:
             namespace=self.namespace,
             label_selector=MANAGED_SELECTOR,
         )
+        return list(_value(result, "items") or ())
+
+    def list_runtime_events(self) -> list[Any]:
+        """List namespace Events; the collector applies managed-object filtering."""
+
+        result = self._core.list_namespaced_event(namespace=self.namespace)
         return list(_value(result, "items") or ())
 
     def read_pod_usage(self, pod_name: str) -> dict[str, dict[str, int]]:

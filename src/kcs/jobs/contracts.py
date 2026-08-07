@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -352,6 +353,101 @@ class NvidiaTelemetrySnapshot(ContractModel):
     compute_node: Annotated[StrictStr, Field(min_length=1, max_length=128)]
     observed_at: Timestamp
     devices: list[NvidiaDeviceTelemetry]
+
+
+class NodeCpuTelemetry(ContractModel):
+    utilization_percent: Annotated[float, Field(strict=True, ge=0, le=100)]
+
+
+class NodeMemoryTelemetry(ContractModel):
+    used_bytes: Annotated[StrictInt, Field(ge=0)]
+    total_bytes: Annotated[StrictInt, Field(ge=1)]
+
+    @model_validator(mode="after")
+    def validate_memory(self) -> NodeMemoryTelemetry:
+        if self.used_bytes > self.total_bytes:
+            raise ValueError("node used memory cannot exceed total memory")
+        return self
+
+
+class ClusterGpuTelemetry(ContractModel):
+    device_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    utilization_percent: Annotated[float, Field(strict=True, ge=0, le=100)] | None = None
+    memory_used_mib: Annotated[StrictInt, Field(ge=0)] | None = None
+    memory_total_mib: Annotated[StrictInt, Field(ge=1)] | None = None
+    temperature_celsius: Annotated[float, Field(strict=True, ge=-100, le=250)] | None = None
+    power_watts: Annotated[float, Field(strict=True, ge=0)] | None = None
+    ecc_volatile_errors: Annotated[StrictInt, Field(ge=0)] | None = None
+    xid_last_code: Annotated[StrictInt, Field(ge=0)] | None = None
+    pod_ref: OpaqueRef | None
+
+    @model_validator(mode="after")
+    def validate_memory(self) -> ClusterGpuTelemetry:
+        if (
+            self.memory_used_mib is not None
+            and self.memory_total_mib is not None
+            and self.memory_used_mib > self.memory_total_mib
+        ):
+            raise ValueError("GPU used memory cannot exceed total memory")
+        return self
+
+
+class NodeTelemetrySnapshot(ContractModel):
+    compute_node: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    cpu: NodeCpuTelemetry | None = None
+    memory: NodeMemoryTelemetry | None = None
+    gpus: Annotated[list[ClusterGpuTelemetry], Field(max_length=16)]
+
+
+class NodeTelemetryList(ContractModel):
+    observed_at: Timestamp
+    kcs_now: Timestamp
+    nodes: Annotated[list[NodeTelemetrySnapshot], Field(max_length=64)]
+
+
+class RuntimeEventKind(StrEnum):
+    JOB_PHASE = "job_phase"
+    NODE_CONDITION = "node_condition"
+    IMAGE_PULL = "image_pull"
+    SCHEDULING = "scheduling"
+    OOM = "oom"
+
+
+EventDetailValue = StrictStr | StrictInt | StrictBool | None | list[StrictStr]
+
+
+class RuntimeEvent(ContractModel):
+    sequence: Annotated[StrictInt, Field(ge=1)]
+    occurred_at: Timestamp
+    kind: RuntimeEventKind
+    job_ref: OpaqueRef | None
+    compute_node: Annotated[StrictStr, Field(min_length=1, max_length=128)] | None
+    detail: dict[StrictStr, EventDetailValue]
+
+    @model_validator(mode="after")
+    def validate_detail_bytes(self) -> RuntimeEvent:
+        encoded = json.dumps(
+            self.detail,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 1024:
+            raise ValueError("event detail exceeds 1 KiB")
+        return self
+
+
+class RuntimeEventPage(ContractModel):
+    events: Annotated[list[RuntimeEvent], Field(max_length=200)]
+    next_cursor: OpaqueCursor
+    truncated: StrictBool
+
+
+class ObservabilityHealth(ContractModel):
+    prometheus: Literal["up", "down"]
+    dcgm: Literal["up", "down"]
+    kube_state_metrics: Literal["up", "down"]
+    oldest_scrape_age_seconds: Annotated[StrictInt, Field(ge=0)] | None
 
 
 class AgentRequestedResources(ContractModel):

@@ -264,6 +264,13 @@ for manifest in namespace.yaml rbac.yaml network-policy.yaml; do
     <"$ROOT/deploy/v2/$manifest" >/dev/null
 done
 
+for manifest in \
+  namespace.yaml kube-state-metrics.yaml dcgm-exporter.yaml \
+  alertmanager.yaml prometheus.yaml; do
+  ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
+    <"$ROOT/deploy/v2/monitoring/$manifest" >/dev/null
+done
+
 sed "s|registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000|$KCS_API_IMAGE|" \
   "$ROOT/deploy/v2/kcs-api.yaml" | \
   ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - >/dev/null
@@ -311,7 +318,7 @@ printf 'KCS_PORT_FORWARD_ADDRESS=%s\nKCS_CONTROL_PRIVATE_ADDRESS=%s\n' \
   ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
     'sudo install -d -m 0750 /etc/kcs-v2 && sudo tee /etc/kcs-v2/port-forward.env >/dev/null'
 ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
-  'sudo systemctl daemon-reload && sudo systemctl enable kcs-v2.service >/dev/null && sudo k3s kubectl -n researchcosmos-v2 rollout status deployment/kcs-v2-api --timeout=180s && sudo systemctl restart kcs-v2.service && sudo systemctl is-active --quiet kcs-v2.service'
+  'sudo systemctl daemon-reload && sudo systemctl enable kcs-v2.service >/dev/null && sudo k3s kubectl -n researchcosmos-v2 rollout status deployment/kcs-v2-api --timeout=180s && sudo k3s kubectl -n kcs-monitoring rollout status deployment/kcs-kube-state-metrics --timeout=180s && sudo k3s kubectl -n kcs-monitoring rollout status deployment/kcs-prometheus --timeout=180s && sudo k3s kubectl -n kcs-monitoring rollout status deployment/kcs-alertmanager --timeout=180s && sudo k3s kubectl -n kcs-monitoring rollout status daemonset/kcs-dcgm-exporter --timeout=180s && sudo systemctl restart kcs-v2.service && sudo systemctl is-active --quiet kcs-v2.service'
 observed_k3s_version=$(ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
   "sudo k3s --version 2>/dev/null | awk 'NR == 1 {print \$3}'")
 [[ $observed_k3s_version == "$KCS_K3S_VERSION" ]] || {

@@ -77,7 +77,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     )
     digest = hashlib.sha256(packaged).hexdigest()
     assert packaged == canonical
-    assert digest == "8dda70e2eafdd48bb0b45948cc77640115f1fb2501822289085cb9061037dc8a"
+    assert digest == "965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526"
     events.append({"event": "canonical_package_resource", "sha256": digest})
 
     namespace = _documents("deploy/v2/namespace.yaml")[0]
@@ -113,6 +113,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         ("", "configmaps"): {"create", "get", "list", "update", "delete"},
         ("", "secrets"): {"create", "get", "delete"},
         ("metrics.k8s.io", "pods"): {"get", "list"},
+        ("", "events"): {"get", "list", "watch"},
     }
     actual_verbs = {
         (rule["apiGroups"][0], resource): set(rule["verbs"])
@@ -143,7 +144,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     assert container["livenessProbe"]["httpGet"]["scheme"] == "HTTPS"
     assert "ephemeral-storage" in container["resources"]["requests"]
     assert "ephemeral-storage" in container["resources"]["limits"]
-    assert {volume["name"] for volume in pod["volumes"]} == {"tls", "tmp"}
+    assert {volume["name"] for volume in pod["volumes"]} == {"tls", "tmp", "state"}
     assert service["spec"]["type"] == "ClusterIP"
     assert service["spec"]["ports"] == [{"name": "https", "port": 443, "targetPort": "https"}]
     events.append({"event": "api_manifest_contract", "imageState": "non_runnable_placeholder"})

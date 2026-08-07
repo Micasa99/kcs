@@ -112,6 +112,19 @@ sed "s/@WORKER_PRIVATE_ADDRESS@/$KCS_WORKER_PRIVATE_ADDRESS/g" \
   ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
     'sudo tee /etc/systemd/system/kcs-v2-kubelet-metrics-relay.socket >/dev/null'
 
+# The worker must be able to pull the same immutable KCS images as the control
+# node.  Keep registry credentials out of the repository and transfer the
+# already-provisioned control-node configuration over the authenticated SSH
+# channel without rendering it in command output.
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  'sudo test -s /etc/rancher/k3s/registries.yaml && sudo cat /etc/rancher/k3s/registries.yaml' | \
+  ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+    'sudo install -d -m 0755 /etc/rancher/k3s; sudo tee /etc/rancher/k3s/registries.yaml >/dev/null; sudo chmod 0600 /etc/rancher/k3s/registries.yaml'
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" \
+  'sudo test -s /etc/rancher/k3s/kcs-v2-registry-ca.crt && sudo cat /etc/rancher/k3s/kcs-v2-registry-ca.crt' | \
+  ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
+    'sudo tee /etc/rancher/k3s/kcs-v2-registry-ca.crt >/dev/null; sudo chmod 0644 /etc/rancher/k3s/kcs-v2-registry-ca.crt'
+
 remote_token_path=$(ssh -o BatchMode=yes -- "$KCS_WORKER_SSH_ALIAS" \
   'umask 077; tmp=$(mktemp); printf "%s" "$tmp"')
 [[ $remote_token_path == /tmp/* ]] || { echo "unsafe remote token path" >&2; exit 1; }
@@ -168,6 +181,8 @@ validate_k3s_install() {
   local installed_version
   installed_version=$(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}')
   [[ $installed_version == "$k3s_version" ]] || return 1
+  [[ -f /etc/systemd/system/k3s-agent.service ]] || return 1
+  [[ $(systemctl show --property=UnitFileState --value k3s-agent 2>/dev/null) != bad ]] || return 1
   systemctl show --property=ExecStart --value k3s-agent 2>/dev/null | \
     /usr/local/libexec/kcs-v2-validate-k3s-exec \
       worker "$control_address" "$worker_address" "$node_name" "$interface" || return 1
@@ -181,8 +196,13 @@ if command -v k3s >/dev/null; then
 fi
 if ! validate_k3s_install; then
   token=$(cat "$token_path")
+  skip_download=false
+  if [[ $(k3s --version 2>/dev/null | awk 'NR == 1 {print $3}') == "$k3s_version" ]]; then
+    skip_download=true
+  fi
   curl -sfL https://get.k3s.io | K3S_URL="https://$control_address:6443" \
     K3S_TOKEN="$token" INSTALL_K3S_VERSION="$k3s_version" \
+    INSTALL_K3S_SKIP_DOWNLOAD="$skip_download" \
     INSTALL_K3S_EXEC="agent --server=https://$control_address:6443 --node-name=$node_name --node-ip=$worker_address --flannel-iface=$interface --kubelet-arg=address=127.0.0.1 --default-runtime=nvidia" sh -
 fi
 systemctl enable --now k3s-agent >/dev/null

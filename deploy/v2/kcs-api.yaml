@@ -1,3 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kcs-v2-api-state
+  namespace: researchcosmos-v2
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,6 +31,9 @@ spec:
     spec:
       serviceAccountName: kcs-v2-api
       automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       nodeSelector:
         researchcosmos.io/role: control
       containers:
@@ -40,6 +55,10 @@ spec:
               value: researchcosmos.io/pool=gpu
             - name: KCS_V2_WORKSPACE_STORAGE_CLASS
               value: kcs-workspace
+            - name: KCS_V2_PROMETHEUS_URL
+              value: http://kcs-prometheus.kcs-monitoring.svc.cluster.local:9090
+            - name: KCS_V2_EVENT_DB_PATH
+              value: /var/lib/kcs-v2/events.sqlite3
             - name: KCS_V2_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -96,6 +115,8 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp/kcs
+            - name: state
+              mountPath: /var/lib/kcs-v2
       volumes:
         - name: tls
           secret:
@@ -103,6 +124,9 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi
+        - name: state
+          persistentVolumeClaim:
+            claimName: kcs-v2-api-state
 ---
 apiVersion: v1
 kind: Service
