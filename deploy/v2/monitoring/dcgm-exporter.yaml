@@ -42,7 +42,7 @@ spec:
         - operator: Exists
       containers:
         - name: dcgm-exporter
-          image: 10.255.250.1:5000/researchcosmos/dcgm-exporter@sha256:a2a7f33ca47d8a5a88245be929dc80f1605d9888bae2b4819fc9900eb869c781
+          image: registry.example.invalid/researchcosmos/dcgm-exporter@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           args: ["-f", "/etc/dcgm-exporter/counters.csv"]
           env:

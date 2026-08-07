@@ -13,6 +13,10 @@ environment:
   KCS_WORKSPACE_STORAGE_ROOT: <same-dedicated-worker-data-disk-path-as-below>
   KCS_WORKER_WORKSPACE_ROOT: <required-path-on-dedicated-worker-data-disk>
   KCS_API_IMAGE: registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  KCS_KUBE_STATE_METRICS_IMAGE: registry.example.invalid/researchcosmos/kube-state-metrics@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  KCS_DCGM_EXPORTER_IMAGE: registry.example.invalid/researchcosmos/dcgm-exporter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  KCS_PROMETHEUS_IMAGE: registry.example.invalid/researchcosmos/prometheus@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  KCS_ALERTMANAGER_IMAGE: registry.example.invalid/researchcosmos/alertmanager@sha256:0000000000000000000000000000000000000000000000000000000000000000
   KCS_TLS_CERT_FILE: <required-untracked-path>
   KCS_TLS_KEY_FILE: <required-untracked-path>
   KCS_SERVICE_TOKEN_FILE: <required-untracked-path-exact-bytes-no-newline>

@@ -48,7 +48,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: alertmanager
-          image: 10.255.250.1:5000/researchcosmos/alertmanager@sha256:6b02bb0d0a30a9b64062d54d6e47e1535de770048d2585a441de00f71b339caa
+          image: registry.example.invalid/researchcosmos/alertmanager@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args:
             - --config.file=/etc/alertmanager/alertmanager.yml
             - --storage.path=/alertmanager

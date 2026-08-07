@@ -14,6 +14,8 @@ required=(
   KCS_CONTROL_SSH_ALIAS KCS_CONTROL_PRIVATE_ADDRESS KCS_WORKER_PRIVATE_ADDRESS
   KCS_ALLOWED_PEER_CIDRS KCS_PORT_FORWARD_ADDRESS KCS_TLS_SAN KCS_K3S_VERSION
   KCS_API_IMAGE KCS_TLS_CERT_FILE KCS_TLS_KEY_FILE KCS_SERVICE_TOKEN_FILE
+  KCS_KUBE_STATE_METRICS_IMAGE KCS_DCGM_EXPORTER_IMAGE
+  KCS_PROMETHEUS_IMAGE KCS_ALERTMANAGER_IMAGE
   KCS_LEGACY_DEBUG_UNITS KCS_LEGACY_SERVICE_ACCOUNT KCS_WORKSPACE_STORAGE_ROOT
 )
 for name in "${required[@]}"; do
@@ -39,14 +41,20 @@ validate_exact_file() {
 }
 
 validate_alias "$KCS_CONTROL_SSH_ALIAS"
-[[ $KCS_API_IMAGE =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
-  echo "KCS_API_IMAGE must be a nonzero digest-pinned image" >&2
-  exit 2
+validate_image() {
+  local name=$1
+  local image=${!name}
+  [[ $image =~ ^[^[:space:]@|]+@sha256:[0-9a-f]{64}$ && \
+     $image != *@sha256:0000000000000000000000000000000000000000000000000000000000000000 ]] || {
+    echo "$name must be a nonzero digest-pinned image" >&2
+    exit 2
+  }
 }
-[[ $KCS_API_IMAGE != *@sha256:0000000000000000000000000000000000000000000000000000000000000000 ]] || {
-  echo "KCS_API_IMAGE must be a nonzero digest-pinned image" >&2
-  exit 2
-}
+for image_name in \
+  KCS_API_IMAGE KCS_KUBE_STATE_METRICS_IMAGE KCS_DCGM_EXPORTER_IMAGE \
+  KCS_PROMETHEUS_IMAGE KCS_ALERTMANAGER_IMAGE; do
+  validate_image "$image_name"
+done
 [[ $KCS_K3S_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]] || {
   echo "KCS_K3S_VERSION must be an exact k3s release" >&2
   exit 2
@@ -264,12 +272,29 @@ for manifest in namespace.yaml rbac.yaml network-policy.yaml; do
     <"$ROOT/deploy/v2/$manifest" >/dev/null
 done
 
-for manifest in \
-  namespace.yaml kube-state-metrics.yaml dcgm-exporter.yaml \
-  alertmanager.yaml prometheus.yaml; do
-  ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
-    <"$ROOT/deploy/v2/monitoring/$manifest" >/dev/null
-done
+ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
+  <"$ROOT/deploy/v2/monitoring/namespace.yaml" >/dev/null
+apply_monitoring_manifest() {
+  local manifest=$1
+  local placeholder=$2
+  local image=$3
+  sed "s|$placeholder|$image|" "$ROOT/deploy/v2/monitoring/$manifest" | \
+    ssh -o BatchMode=yes -- "$KCS_CONTROL_SSH_ALIAS" sudo k3s kubectl apply -f - \
+      >/dev/null
+}
+zero_digest=0000000000000000000000000000000000000000000000000000000000000000
+apply_monitoring_manifest kube-state-metrics.yaml \
+  "registry.example.invalid/researchcosmos/kube-state-metrics@sha256:$zero_digest" \
+  "$KCS_KUBE_STATE_METRICS_IMAGE"
+apply_monitoring_manifest dcgm-exporter.yaml \
+  "registry.example.invalid/researchcosmos/dcgm-exporter@sha256:$zero_digest" \
+  "$KCS_DCGM_EXPORTER_IMAGE"
+apply_monitoring_manifest alertmanager.yaml \
+  "registry.example.invalid/researchcosmos/alertmanager@sha256:$zero_digest" \
+  "$KCS_ALERTMANAGER_IMAGE"
+apply_monitoring_manifest prometheus.yaml \
+  "registry.example.invalid/researchcosmos/prometheus@sha256:$zero_digest" \
+  "$KCS_PROMETHEUS_IMAGE"
 
 sed "s|registry.example.invalid/researchcosmos/kcs-api@sha256:0000000000000000000000000000000000000000000000000000000000000000|$KCS_API_IMAGE|" \
   "$ROOT/deploy/v2/kcs-api.yaml" | \

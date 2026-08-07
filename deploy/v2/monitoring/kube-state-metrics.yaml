@@ -55,7 +55,7 @@ spec:
         researchcosmos.io/role: control
       containers:
         - name: kube-state-metrics
-          image: 10.255.250.1:5000/researchcosmos/kube-state-metrics@sha256:7661da8c99b733d43117e4cba12bd9865d335e5777191d0af3d789807aded9f4
+          image: registry.example.invalid/researchcosmos/kube-state-metrics@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           args:
             - --port=8080

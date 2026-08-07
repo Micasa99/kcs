@@ -87,7 +87,10 @@ workspace smoke fixtures. All bases are pinned to linux/amd64 manifest digests a
 before building without isolation. Published API and workload image
 references must be immutable `name@sha256:<digest>` values; the
 `registry.example.invalid` values in committed YAML are deliberate non-runnable
-all-zero placeholders, not published image claims; deployment rejects them.
+all-zero placeholders, not published image claims; deployment rejects them. The
+operator supplies the API and four monitoring image references through the five
+`KCS_*_IMAGE` variables documented in `deploy/v2/config.example.yaml`, so source
+manifests do not bind a particular registry or server address.
 
 Start with `deploy/v2/config.example.yaml`, exporting every corresponding value from
 an untracked operator environment. Both scripts perform a mutation-free local

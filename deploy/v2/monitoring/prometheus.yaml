@@ -194,7 +194,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: prometheus
-          image: 10.255.250.1:5000/researchcosmos/prometheus@sha256:1361e7e2b9d85426bb9c1c9fa10d75bd4849ae9a0abfac689edea38fdd3afa54
+          image: registry.example.invalid/researchcosmos/prometheus@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
