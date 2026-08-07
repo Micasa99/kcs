@@ -14,10 +14,17 @@ for name in "${required[@]}"; do
   fi
 done
 
-if [[ ! $KCS_PUBLIC_HOST =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
-  echo "KCS_PUBLIC_HOST must be a DNS hostname" >&2
-  exit 2
+public_hosts=("$KCS_PUBLIC_HOST")
+if [[ -n ${KCS_PUBLIC_EXTRA_HOSTS:-} ]]; then
+  read -r -a extra_public_hosts <<<"$KCS_PUBLIC_EXTRA_HOSTS"
+  public_hosts+=("${extra_public_hosts[@]}")
 fi
+for public_host in "${public_hosts[@]}"; do
+  if [[ ! $public_host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+    echo "KCS public hosts must be DNS hostnames" >&2
+    exit 2
+  fi
+done
 for path in \
   "$KCS_PUBLIC_TLS_CERT_FILE" \
   "$KCS_PUBLIC_TLS_KEY_FILE" \
@@ -29,8 +36,10 @@ do
   }
 done
 
-openssl x509 -in "$KCS_PUBLIC_TLS_CERT_FILE" -noout \
-  -checkhost "$KCS_PUBLIC_HOST" >/dev/null
+for public_host in "${public_hosts[@]}"; do
+  openssl x509 -in "$KCS_PUBLIC_TLS_CERT_FILE" -noout \
+    -checkhost "$public_host" >/dev/null
+done
 certificate_key=$(openssl x509 -in "$KCS_PUBLIC_TLS_CERT_FILE" -pubkey -noout | sha256sum)
 private_key=$(openssl pkey -in "$KCS_PUBLIC_TLS_KEY_FILE" -pubout | sha256sum)
 [[ $certificate_key == "$private_key" ]] || {
@@ -104,5 +113,31 @@ spec:
                 port:
                   name: https
 EOF
+
+for public_host in "${public_hosts[@]:1}"; do
+  existing_tls_hosts=$(
+    "${kubectl[@]}" -n "$namespace" get ingress kcs-v2-public \
+      -o jsonpath='{.spec.tls[0].hosts[*]}'
+  )
+  if ! grep -Fqw -- "$public_host" <<<"$existing_tls_hosts"; then
+    tls_patch=$(printf \
+      '[{"op":"add","path":"/spec/tls/0/hosts/-","value":"%s"}]' \
+      "$public_host")
+    "${kubectl[@]}" -n "$namespace" patch ingress kcs-v2-public \
+      --type=json -p "$tls_patch"
+  fi
+
+  existing_rule_hosts=$(
+    "${kubectl[@]}" -n "$namespace" get ingress kcs-v2-public \
+      -o jsonpath='{.spec.rules[*].host}'
+  )
+  if ! grep -Fqw -- "$public_host" <<<"$existing_rule_hosts"; then
+    rule_patch=$(printf \
+      '[{"op":"add","path":"/spec/rules/-","value":{"host":"%s","http":{"paths":[{"path":"/api/v2","pathType":"Prefix","backend":{"service":{"name":"kcs-v2-public","port":{"name":"https"}}}}]}}}]' \
+      "$public_host")
+    "${kubectl[@]}" -n "$namespace" patch ingress kcs-v2-public \
+      --type=json -p "$rule_patch"
+  fi
+done
 
 "${kubectl[@]}" -n "$namespace" get ingress kcs-v2-public

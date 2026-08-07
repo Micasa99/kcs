@@ -12,6 +12,8 @@ export KCS_PUBLIC_HOST=kcs.example.org
 export KCS_PUBLIC_TLS_CERT_FILE=/secure/path/public.crt
 export KCS_PUBLIC_TLS_KEY_FILE=/secure/path/public.key
 export KCS_BACKEND_CA_FILE=/secure/path/backend-ca.pem
+# Optional temporary or migration hostnames already covered by the certificate.
+export KCS_PUBLIC_EXTRA_HOSTS='36-103-234-82.sslip.io'
 sudo -E ./scripts/deploy_v2_public_gateway.sh
 ```
 
@@ -24,3 +26,14 @@ DNS and the cloud firewall must deliver TCP 443 to the KCS Traefik service.
 The Product runtime callback is a separate, system-trusted HTTPS endpoint that
 KCS Jobs must be able to reach with Attempt-scoped credentials.
 
+If a hosting platform blocks public ports 80 and 443, permit Traefik's existing
+`websecure` NodePort instead. Discover it rather than hard-coding it:
+
+```bash
+sudo k3s kubectl -n kube-system get service traefik \
+  -o jsonpath='{.spec.ports[?(@.name=="websecure")].nodePort}{"\n"}'
+```
+
+Clients then use `https://<certificate-covered-host>:<node-port>`. This is a
+temporary transport address; the KCS API, bearer authentication and Product
+callback contracts are unchanged.
