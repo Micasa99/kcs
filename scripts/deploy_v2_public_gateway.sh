@@ -5,6 +5,7 @@ required=(
   KCS_PUBLIC_HOST
   KCS_PUBLIC_TLS_CERT_FILE
   KCS_PUBLIC_TLS_KEY_FILE
+  KCS_PUBLIC_TRUST_BUNDLE_FILE
   KCS_BACKEND_CA_FILE
 )
 for name in "${required[@]}"; do
@@ -28,6 +29,7 @@ done
 for path in \
   "$KCS_PUBLIC_TLS_CERT_FILE" \
   "$KCS_PUBLIC_TLS_KEY_FILE" \
+  "$KCS_PUBLIC_TRUST_BUNDLE_FILE" \
   "$KCS_BACKEND_CA_FILE"
 do
   [[ -f $path && -s $path ]] || {
@@ -46,6 +48,13 @@ private_key=$(openssl pkey -in "$KCS_PUBLIC_TLS_KEY_FILE" -pubout | sha256sum)
   echo "public gateway certificate and key do not match" >&2
   exit 2
 }
+# Match Python/OpenSSL's strict client verification before publishing the
+# gateway.  A CA with CA:TRUE but no certificate-signing key usage can appear
+# valid to permissive curl builds while every ResearchCosmos Python client
+# rejects it.
+openssl verify -x509_strict -purpose sslserver \
+  -CAfile "$KCS_PUBLIC_TRUST_BUNDLE_FILE" \
+  "$KCS_PUBLIC_TLS_CERT_FILE" >/dev/null
 
 namespace=${KCS_V2_NAMESPACE:-researchcosmos-v2}
 backend_server_name=${KCS_BACKEND_TLS_SERVER_NAME:-10.255.250.1}

@@ -11,16 +11,22 @@ certificate, private key and the existing backend CA in root-readable files:
 export KCS_PUBLIC_HOST=kcs.example.org
 export KCS_PUBLIC_TLS_CERT_FILE=/secure/path/public.crt
 export KCS_PUBLIC_TLS_KEY_FILE=/secure/path/public.key
+export KCS_PUBLIC_TRUST_BUNDLE_FILE=/secure/path/public-client-ca.pem
 export KCS_BACKEND_CA_FILE=/secure/path/backend-ca.pem
 # Optional temporary or migration hostnames already covered by the certificate.
 export KCS_PUBLIC_EXTRA_HOSTS='36-103-234-82.sslip.io'
 sudo -E ./scripts/deploy_v2_public_gateway.sh
 ```
 
-The script verifies the hostname and key pair, creates Kubernetes secrets, and
-publishes only `/api/v2/*`. Traefik verifies the existing private KCS API TLS
-certificate through a `ServersTransport`; service bearer authorization remains
-mandatory. Certificate bytes and tokens are never committed.
+The script verifies the hostname, key pair, and the complete public client
+trust chain with OpenSSL strict server-purpose validation before it creates
+Kubernetes secrets and publishes only `/api/v2/*`. For a private root CA,
+`basicConstraints = critical, CA:TRUE` and
+`keyUsage = critical, keyCertSign, cRLSign` are required; the leaf needs a SAN
+for every advertised hostname and `extendedKeyUsage = serverAuth`. Traefik
+verifies the existing private KCS API TLS certificate through a
+`ServersTransport`; service bearer authorization remains mandatory.
+Certificate bytes and tokens are never committed.
 
 DNS and the cloud firewall must deliver TCP 443 to the KCS Traefik service.
 The Product runtime callback is a separate, system-trusted HTTPS endpoint that
