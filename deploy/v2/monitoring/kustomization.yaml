@@ -6,4 +6,3 @@ resources:
   - dcgm-exporter.yaml
   - alertmanager.yaml
   - prometheus.yaml
-

@@ -51,4 +51,3 @@ Prometheus retains 15 days (bounded to 15 GB). Runtime events retain the tighter
 24 hours or 10,000 entries in `/var/lib/kcs-v2/events.sqlite3`; their sequence is
 restart-stable. Restore the PVC from infrastructure backup when required. A clipped
 event cursor resumes at the earliest retained event with `truncated=true`.
-

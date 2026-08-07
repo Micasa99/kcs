@@ -4,4 +4,3 @@ metadata:
   name: kcs-monitoring
   labels:
     app.kubernetes.io/part-of: kcs-v2
-
