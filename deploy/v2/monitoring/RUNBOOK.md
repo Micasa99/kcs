@@ -45,6 +45,63 @@ Read `GET /api/v2/queue`, `GET /api/v2/events`, Pod conditions and namespace Eve
 Distinguish unschedulable resources, image pull, quota and ordinary provisioning.
 Do not report requested resources as utilization.
 
+## KcsNativeMetricsUnavailable
+
+Verify the mirrored `kcs-v2-service-token` and `kcs-v2-api-ca` Secrets exist only in
+`kcs-monitoring`, then inspect the `kcs-v2-api` Prometheus target. The bearer token
+must equal the API service token and `ca.crt` must validate the internal Service DNS
+name. Never disable TLS verification to make the target green.
+
+## KcsNativeStopFailed
+
+Read the Job's `runnerStopAction`, `latestRunnerGeneration.runnerObservation`, and
+`runner_phase` events before touching the Pod. A failed or indeterminate stop keeps
+the Pod available for bounded capture; do not delete it or manually kill containers.
+
+## KcsNativeHardDeadline
+
+Archive Job/Pod YAML, both container logs, runtime events and the latest launcher
+state. Hard deadline destroys the Pod, so record `outputLossPossible=true`; do not
+claim that capture completed and do not create a replacement Pod.
+
+## KcsNativeStorageFailure
+
+Distinguish `enospc` from `emptydir_evicted`, compare the requested
+`ephemeralStorageMiB` with writable volume limits and node disk pressure, and retain
+imageFS compressed/unpacked bytes separately. This is a platform delivery failure,
+not an agent exit or OOM.
+
+## KcsNativeOutputLossPossible
+
+Preserve the exact jobUID/podUID/generation and capture barrier, then reconcile with
+ResearchCosmos. The flag cannot be cleared by retrying inspection; only a new Attempt
+may execute again.
+
+## KcsNativeCredentialProjectionFailed
+
+Inspect the typed runner grant state and projection timestamps without reading the
+Secret value. An expired pre-ACK grant is safe to replace with a new generation;
+an indeterminate grant requires reconciliation and exact Secret-absence proof first.
+
+## KcsNativeRecipeForbiddenSurge
+
+Compare rejected exact runner/environment refs with the operator-curated registry.
+Do not authorize a wildcard or mutable tag to silence this alert. Repeated unknown
+pairs usually mean the RC capability lock and the deployed recipe catalog diverged.
+
+## Native metric credentials
+
+Before applying the monitoring Deployment, create two operator-managed Secrets in
+`kcs-monitoring`: `kcs-v2-service-token` with key `service-token`, and
+`kcs-v2-api-ca` with key `ca.crt`. Values are copied through the secret manager, not
+committed or printed. The `/metrics` endpoint accepts the same bearer as `/api/v2`
+and returns aggregate states only—no job refs, subjects or credentials.
+
+Kubernetes NetworkPolicy deny events are not available from the current CNI, so
+network-policy violation telemetry remains honestly `not_reported`; validate the
+deny/allow paths with the canary probe and add CNI audit metrics before alerting on
+that signal.
+
 ## Retention and recovery
 
 Prometheus retains 15 days (bounded to 15 GB). Runtime events retain the tighter of

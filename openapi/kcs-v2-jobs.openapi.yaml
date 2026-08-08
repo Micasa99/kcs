@@ -1,5 +1,5 @@
 openapi: 3.1.0
-x-kcs-contract-status: dormant
+x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
   version: 2.4.0

@@ -1,0 +1,18 @@
+{
+  "sequence": 2,
+  "occurredAt": "2026-08-08T10:01:11Z",
+  "kind": "runner_phase",
+  "jobRef": "job-native-001",
+  "computeNode": "gpu-node-01",
+  "detail": {
+    "generation": 1,
+    "state": "killed",
+    "sequence": 3,
+    "stateDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "stopCause": "hard_deadline",
+    "processExitKind": "not_observed",
+    "exitCode": null,
+    "signal": null,
+    "protocolTerminalObserved": false
+  }
+}

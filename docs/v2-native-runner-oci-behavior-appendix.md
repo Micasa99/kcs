@@ -1,9 +1,10 @@
 # KCS OpenAPI 2.4 native-runner OCI behavior appendix
 
-Status: **dormant contract freeze**. This appendix defines the native arm that a
-future provider implementation must satisfy. It does not activate native routing,
-change the served 2.3 OpenAPI resource, or authorize provider/renderer/deployment
-changes.
+Status: **M1 implementation contract**. The implementation branch serves OpenAPI
+2.4.0 at SHA-256
+`61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc` and implements
+the native provider/renderer/launcher path. It has not been deployed to the formal
+`researchcosmos-v2` namespace; production activation still requires owner approval.
 
 ## 1. Delivery selection and immutable image roles
 
@@ -78,7 +79,10 @@ Frozen implementation requirement:
 
 - recipe identity records runtime/launcher UID/GID `0`, experiment child UID/GID
   `10001`, and terminal UID/GID `10002:10001`;
-- runtime launcher: drop `ALL`, add only `SETUID`, `SETGID`, and `KILL`; immediately
+- runtime launcher: drop `ALL`, add only `CHOWN`, `SETUID`, `SETGID`, and `KILL`;
+  `CHOWN` is used only before launch to transfer kubelet/control-created writable
+  paths to the exact experiment identity (the first M1 live Pod proved that the
+  earlier three-capability freeze fails with `EPERM` on an EmptyDir root); immediately
   before child exec, clear supplementary groups, set GID/UID `10001`, set
   `no_new_privs`, and verify zero effective capabilities;
 - control: drop `ALL`, add only `DAC_OVERRIDE` for the managed-worktree capture
@@ -87,17 +91,26 @@ Frozen implementation requirement:
 - the runtime container's only PID 1 command is
   `/opt/rc-platform/bin/rc-native-launcher`; a recipe's `runnerEntrypoint` is child
   argv and is never installed directly as PID 1;
-- control uses the existing fixed command `/opt/kcs/workspace-sidecar rpc` and talks
+- control serves workspace RPC as its container PID 1; the recipe-pinned
+  `/opt/kcs/workspace-sidecar rpc` command is the API-side exec client and talks
   to the launcher only through `/run/rc-control/launcher.sock`; it does not exec the
-  root runtime container;
+  root runtime container; its private temporary directory is the same bounded
+  `/run/rc-control` EmptyDir (`TMPDIR=/run/rc-control`), never the read-only image
+  root;
 - PodSpec/container environment contains configured gateway base URLs, model route,
   and only the credential file path. Launcher reads the credential and injects the
   short-lived protocol secret only into the native agent child process environment;
   it disappears with that child. Credential bytes never enter PodSpec/container
   env, API observations, events, logs, receipts, control, or terminal shells.
+- before spawning a known native CLI, the launcher writes only non-secret routing
+  material into the private agent home: Codex receives an exact `model_providers.*`
+  Responses configuration and Pi receives an exact `models.json` for the selected
+  protocol. API-key fields name child environment variables; token bytes are never
+  serialized into either file. Other registered CLIs may consume the frozen model
+  environment directly through their recipe-owned argv.
 
-Provider implementation must add executable conformance tests for these
-requirements before enabling the dormant arm.
+Provider implementation and isolated canary evidence must satisfy these requirements
+before production activation.
 
 The existing six workspace terminal operation IDs and paths are lane-additive in
 2.4. Hosted bindings retain the original `workspace` response shape. For a native
@@ -136,8 +149,9 @@ digest mismatch, binding mismatch, partial document, unknown field, or symlink.
 `/run/rc-control/launcher.sock` is a `root:root`/`0600` Unix stream socket. Each
 frame is a four-byte unsigned big-endian payload length followed by at most `131072`
 bytes of RFC 8785 canonical UTF-8 JSON. Request frames are closed objects with
-`schemaVersion` (constant `1`), `command` (`stop`, `finalize`, `createPty`,
-`writePty`, `resizePty`, or `closePty`), `requestRef`, `requestDigest`,
+`schemaVersion` (constant `1`), `command` (`credentialStatus`, `start`, `inspect`,
+`stop`, `finalize`, `createPty`, `writePty`, `readPty`, `resizePty`, or `closePty`),
+`requestRef`, `requestDigest`,
 `jobUid`, `podUid`, `generation`, and command-specific `payload`. ACK frames are
 closed objects with `schemaVersion=1`, the same binding and request fields plus `state` (`accepted`,
 `completed`, or `failed`), `replayed`, `observedAt`, and nullable `errorCode`.
@@ -221,8 +235,10 @@ The minimum evidence surface is:
 | initial init-copy canary | disk pressure/EmptyDir eviction on the large copy path | reject init-copy delivery; require explicit ephemeral and image-fs accounting |
 | K3s 1.36 ImageVolume canary | digest-pinned agent image mounted read-only; environment image present; Node/Pi/Codex launched; worktree write succeeded; runner mount write was denied; ephemeral request `64 MiB`/limit `256 MiB`; completion about `3.30s`; image events reported both images already present; no approximately `687 MiB` copy | `assembled.imageVolume` is the default; activation must record admitted request/limit |
 | optional Secret projection canaries | projection became visible after about `47s` and `55s`; a `60s` projection lease was exhausted before start | minimum projection lease `120s`; fixture/recommendation `180s` |
+| M1 registry pull canary | the exact platform ImageVolume digest was absent on the target node, authenticated pull succeeded in `301ms` (reported image size `1,364,805` bytes), and subsequent mounts used the cached digest; the exact runner and environment digests were already cached | registry authentication and an exact platform-image cold pull are proven; a full uncached assembly SLO remains `not_reported` |
 
-Private raw probe artifacts remain outside the repository. Before implementation,
-the evidence owner must attach sanitized command output and timestamps to the
-release review; this appendix intentionally does not invent unavailable image-size,
-headroom, grace-period, or hard-deadline numbers.
+Private raw probe artifacts remain outside the repository. Before production
+activation, the evidence owner attaches sanitized command output and timestamps to
+the release review. The M1 canary proves registry authentication and one exact
+platform-image cold pull, but does not present cached runner/environment timings as
+a full cold-assembly SLO.

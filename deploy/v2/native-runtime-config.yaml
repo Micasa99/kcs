@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kcs-v2-native-runtime-config
+  namespace: researchcosmos-v2
+data:
+  # Native remains fail-closed until an operator replaces this empty registry
+  # with reviewed exact runner/environment recipes.
+  recipes.json: |
+    {"version":1,"recipes":[]}
+  openai-base-url: https://model-gateway.researchcosmos-v2.svc.cluster.local/v1
+  anthropic-base-url: https://model-gateway.researchcosmos-v2.svc.cluster.local

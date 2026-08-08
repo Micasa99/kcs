@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -12,11 +13,14 @@ import stat
 import struct
 import sys
 import tempfile
+import time
 import unicodedata
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any, NoReturn
+
+import rfc8785
 
 from kcs.conformance.actions import (
     observe_workspace_gpu,
@@ -33,6 +37,7 @@ from kcs.jobs.transport import (
 
 _COPY_CHUNK = 1024 * 1024
 _MAX_RPC_HEADER = 4 * 1024 * 1024
+_MAX_NATIVE_FRAME = 131072
 
 
 class _RpcRejectedError(Exception):
@@ -59,6 +64,9 @@ class WorkspaceSidecar:
         self._operation_lock = RLock()
         self._stage_installs = 0
         self._operation_side_effects = 0
+        self._native_state_generation = 0
+        self._native_state_sequence = 0
+        self._native_state_digest: str | None = None
         self.shutdown_requested = False
 
     def dispatch(self, frame: bytes, body: Path | None, response_path: Path) -> None:
@@ -150,10 +158,286 @@ class WorkspaceSidecar:
             return {"ok": True, **self.stats()}, None
         if action == "inspectSupervisor":
             return {"ok": True, "state": "idle", "supervisorAlive": True}, None
+        if action == "nativeLauncher":
+            return self._native_launcher(request), None
         if action == "shutdown":
+            if os.environ.get("KCS_NATIVE_LAUNCHER_SOCKET"):
+                self._wait_for_native_launcher_exit()
             self.shutdown_requested = True
             return {"ok": True, "state": "stopped", "supervisorAlive": False}, None
         raise _RpcRejectedError("INVALID_REQUEST", "unsupported workspace RPC action")
+
+    @staticmethod
+    def _wait_for_native_launcher_exit() -> None:
+        socket_path = os.environ.get(
+            "KCS_NATIVE_LAUNCHER_SOCKET", "/run/rc-control/launcher.sock"
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(0.2)
+                    connection.connect(socket_path)
+            except OSError:
+                return
+            time.sleep(0.05)
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE", "native launcher did not exit after finalize"
+        )
+
+    def _native_launcher(self, request: Mapping[str, Any]) -> dict[str, object]:
+        if set(request) != {"action", "jobUid", "podUid", "frame"}:
+            raise _RpcRejectedError("INVALID_REQUEST", "native launcher envelope is invalid")
+        frame = request.get("frame")
+        if (
+            not isinstance(frame, dict)
+            or set(frame) != {"command", "requestRef", "requestDigest", "generation", "payload"}
+            or frame.get("command")
+            not in {
+                "credentialStatus",
+                "start",
+                "inspect",
+                "stop",
+                "finalize",
+                "createPty",
+                "writePty",
+                "readPty",
+                "resizePty",
+                "closePty",
+            }
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "native launcher command is not allowed")
+        command = frame["command"]
+        request_ref = frame["requestRef"]
+        request_digest = frame["requestDigest"]
+        generation = frame["generation"]
+        command_payload = frame["payload"]
+        if (
+            not isinstance(command, str)
+            or not isinstance(request_ref, str)
+            or not request_ref
+            or not isinstance(request_digest, str)
+            or len(request_digest) != 64
+            or type(generation) is not int
+            or generation < 0
+            or not isinstance(command_payload, dict)
+            or hashlib.sha256(rfc8785.dumps(command_payload)).hexdigest() != request_digest
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "native launcher identity is invalid")
+        payload = {
+            "schemaVersion": 1,
+            "command": command,
+            "requestRef": request_ref,
+            "requestDigest": request_digest,
+            "jobUid": request["jobUid"],
+            "podUid": request["podUid"],
+            "generation": generation,
+            "payload": command_payload,
+        }
+        encoded = rfc8785.dumps(payload)
+        if len(encoded) > _MAX_NATIVE_FRAME:
+            raise _RpcRejectedError("INVALID_REQUEST", "native launcher frame exceeds 128 KiB")
+        socket_path = Path(
+            os.environ.get("KCS_NATIVE_LAUNCHER_SOCKET", "/run/rc-control/launcher.sock")
+        )
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(30)
+                connection.connect(str(socket_path))
+                connection.sendall(struct.pack(">I", len(encoded)) + encoded)
+                response_size = struct.unpack(">I", _recv_exact(connection, 4))[0]
+                if response_size > _MAX_NATIVE_FRAME:
+                    raise _RpcRejectedError(
+                        "DEPENDENCY_UNAVAILABLE", "native launcher reply is too large"
+                    )
+                response = _recv_exact(connection, response_size)
+        except (OSError, TimeoutError) as error:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "native launcher socket is unavailable"
+            ) from error
+        try:
+            result = json.loads(response)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "native launcher reply is malformed"
+            ) from error
+        expected_ack_keys = {
+            "schemaVersion",
+            "command",
+            "requestRef",
+            "requestDigest",
+            "jobUid",
+            "podUid",
+            "generation",
+            "state",
+            "replayed",
+            "observedAt",
+            "errorCode",
+            "payload",
+        }
+        if (
+            not isinstance(result, dict)
+            or set(result) != expected_ack_keys
+            or result["schemaVersion"] != 1
+            or result["command"] != command
+            or result["requestRef"] != request_ref
+            or result["requestDigest"] != request_digest
+            or result["jobUid"] != request["jobUid"]
+            or result["podUid"] != request["podUid"]
+            or result["generation"] != generation
+            or result["state"] not in {"accepted", "completed", "failed"}
+            or type(result["replayed"]) is not bool
+            or not isinstance(result["payload"], dict)
+        ):
+            raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "native launcher reply is invalid")
+        if result["state"] == "failed":
+            code = result["errorCode"]
+            if code == "capacity_insufficient":
+                public_code = "PRECONDITION_FAILED"
+            elif code in {"identity_conflict", "stale_binding"}:
+                public_code = "STATE_CONFLICT"
+            else:
+                public_code = "DEPENDENCY_UNAVAILABLE"
+            raise _RpcRejectedError(
+                public_code,
+                "native launcher rejected the request",
+            )
+        if command in {"start", "inspect", "stop"}:
+            result["payload"]["runnerObservation"] = self._read_native_state(
+                request["jobUid"], request["podUid"], generation
+            )
+        return {"ok": True, "result": result["payload"]}
+
+    def _read_native_state(
+        self, job_uid: object, pod_uid: object, generation: int
+    ) -> dict[str, object]:
+        path = Path(
+            os.environ.get("KCS_NATIVE_RUNNER_STATE_PATH", "/run/rc-control/runner-state.json")
+        )
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > 65536
+            ):
+                raise _RpcRejectedError(
+                    "DEPENDENCY_UNAVAILABLE", "native runner state file is unsafe"
+                )
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                raw = source.read(65537)
+            value = json.loads(raw)
+        except _RpcRejectedError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "native runner state is unavailable"
+            ) from error
+        expected = {
+            "schemaVersion",
+            "jobUid",
+            "podUid",
+            "generation",
+            "sequence",
+            "state",
+            "stateDigest",
+            "childPid",
+            "processExit",
+            "stopCause",
+            "protocolTerminal",
+            "childStartedAt",
+            "childFinishedAt",
+            "observedAt",
+        }
+        process_exit = value.get("processExit") if isinstance(value, dict) else None
+        protocol_terminal = value.get("protocolTerminal") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or set(value) != expected
+            or value["schemaVersion"] != 1
+            or value["jobUid"] != job_uid
+            or value["podUid"] != pod_uid
+            or value["generation"] != generation
+            or type(value["sequence"]) is not int
+            or value["sequence"] < 1
+            or value["state"] not in {"starting", "running", "exited", "killed"}
+            or not isinstance(value["stateDigest"], str)
+            or len(value["stateDigest"]) != 64
+            or value["childPid"] is not None
+            and (type(value["childPid"]) is not int or value["childPid"] < 1)
+            or value["stopCause"]
+            not in {
+                "none",
+                "natural_exit",
+                "stop_requested",
+                "soft_deadline",
+                "cancel_requested",
+                "oom_killed",
+                "hard_deadline",
+                "unknown",
+            }
+            or not isinstance(process_exit, dict)
+            or set(process_exit) != {"kind", "exitCode", "signal"}
+            or process_exit["kind"] not in {"not_observed", "exited", "signaled"}
+            or process_exit["exitCode"] is not None
+            and type(process_exit["exitCode"]) is not int
+            or process_exit["signal"] is not None
+            and type(process_exit["signal"]) is not int
+            or not isinstance(protocol_terminal, dict)
+            or set(protocol_terminal)
+            != {"observed", "eventKind", "stopReason", "errorCode"}
+            or type(protocol_terminal["observed"]) is not bool
+            or any(
+                item is not None and not isinstance(item, str)
+                for item in (
+                    protocol_terminal["eventKind"],
+                    protocol_terminal["stopReason"],
+                    protocol_terminal["errorCode"],
+                    value["childStartedAt"],
+                    value["childFinishedAt"],
+                )
+            )
+            or not isinstance(value["observedAt"], str)
+        ):
+            raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "native runner state is malformed")
+        digest_input = dict(value)
+        retained_digest = str(digest_input.pop("stateDigest"))
+        actual_digest = hashlib.sha256(rfc8785.dumps(digest_input)).hexdigest()
+        if not hmac.compare_digest(retained_digest, actual_digest):
+            raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "native runner state digest differs")
+        sequence = int(value["sequence"])
+        if generation < self._native_state_generation or (
+            generation == self._native_state_generation
+            and (
+                sequence < self._native_state_sequence
+                or (
+                    sequence == self._native_state_sequence
+                    and self._native_state_digest not in {None, retained_digest}
+                )
+            )
+        ):
+            raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "native runner state moved backwards")
+        self._native_state_generation = generation
+        self._native_state_sequence = sequence
+        self._native_state_digest = retained_digest
+        return {
+            key: value[key]
+            for key in (
+                "state",
+                "sequence",
+                "stateDigest",
+                "childPid",
+                "processExit",
+                "stopCause",
+                "protocolTerminal",
+                "childStartedAt",
+                "childFinishedAt",
+                "observedAt",
+            )
+        }
 
     def _validate_transfer_path(
         self, request: Mapping[str, Any], *, allow_stage_existing: bool = False
@@ -822,7 +1106,14 @@ def serve(socket_path: Path, workspace: Path) -> None:
         while True:
             connection, _ = listener.accept()
             with connection:
-                _serve_connection(connection, sidecar)
+                try:
+                    _serve_connection(connection, sidecar)
+                except (ConnectionError, EOFError, DependencyUnavailableError, OSError):
+                    # A dropped Kubernetes exec/WebSocket can connect to the
+                    # long-lived socket and disappear before its bounded frame
+                    # arrives.  That request has no confirmed outcome, but it
+                    # must not terminate the capture/control authority.
+                    continue
             if sidecar.shutdown_requested:
                 return
 

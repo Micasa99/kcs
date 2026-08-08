@@ -9,6 +9,7 @@ and keeps every Pod incarnation under the immutable Job UID.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -95,6 +96,7 @@ from .errors import (
     PayloadTooLargeError,
     PreconditionFailedError,
     ReplacementPodError,
+    RuntimeRecipeForbiddenError,
     StaleBindingError,
     StaleCursorError,
     StalePageTokenError,
@@ -113,7 +115,25 @@ from .lifecycle import (
     phase_payload,
     read_phase,
 )
-from .renderer import credential_secret_name
+from .native_contracts import (
+    AnyJobBindingSnapshotList,
+    NativeCreateJobRequest,
+    NativeFinalizeJobRequest,
+    NativeJobBindingSnapshot,
+    NativeRoleLogs,
+    NativeRunnerGenerationSnapshot,
+    NativeTerminalSessionSnapshot,
+    ResolvedRuntimeRecipe,
+    RunnerCredentialGrantSnapshot,
+    RunnerStartRequest,
+    RunnerStopRequest,
+)
+from .native_runtime import (
+    NativeMutationResult,
+    NativeRuntimeController,
+    RunnerCredentialGrantMetadata,
+)
+from .renderer import credential_secret_name, runner_credential_secret_name
 from .transport import (
     AgentRpcResponse,
     AgentRpcTransportProtocol,
@@ -154,9 +174,13 @@ _START_MATERIAL_BINDINGS_DIGEST_KEY = "startMaterialBindingsDigest"
 class V2JobRendererProtocol(Protocol):
     """The pure renderer seam used by orchestration."""
 
-    def job_ref(self, request: CreateJobRequest) -> str: ...
+    def job_ref(self, request: CreateJobRequest | NativeCreateJobRequest) -> str: ...
 
-    def render(self, request: CreateJobRequest) -> object: ...
+    def render(self, request: CreateJobRequest | NativeCreateJobRequest) -> object: ...
+
+    def resolve_recipe(
+        self, runner_ref: str, environment_profile_ref: str
+    ) -> ResolvedRuntimeRecipe: ...
 
 
 class V2ObservabilityProtocol(Protocol):
@@ -316,7 +340,7 @@ class V2JobStoreProtocol(Protocol):
 class CreateResult:
     """A create snapshot plus the status distinction needed by the HTTP route."""
 
-    snapshot: JobBindingSnapshot
+    snapshot: JobBindingSnapshot | NativeJobBindingSnapshot
     created: bool
 
     @property
@@ -328,7 +352,7 @@ class CreateResult:
 class FinalizeResult:
     """A finalize snapshot plus the atomic slot reservation outcome."""
 
-    snapshot: JobBindingSnapshot
+    snapshot: JobBindingSnapshot | NativeJobBindingSnapshot
     created: bool
 
     @property
@@ -340,7 +364,7 @@ class FinalizeResult:
 class CancelResult:
     """A cancel snapshot plus the durable slot reservation outcome."""
 
-    snapshot: JobBindingSnapshot
+    snapshot: JobBindingSnapshot | NativeJobBindingSnapshot
     created: bool
 
     @property
@@ -358,7 +382,7 @@ class CredentialGrantResult:
 class TerminalCreateResult:
     """Public descriptor plus a private header credential for this response."""
 
-    snapshot: TerminalSessionSnapshot
+    snapshot: TerminalSessionSnapshot | NativeTerminalSessionSnapshot
     credential: str
     created: bool
 
@@ -422,6 +446,14 @@ class V2JobProvider:
             self._assert_accepting_workspace_work,
             self._now,
         )
+        self._native = NativeRuntimeController(
+            store,
+            kube,
+            workspace_transport,
+            clock=self._clock,
+        )
+        self._native_metrics_lock = threading.Lock()
+        self._native_recipe_forbidden_total = 0
         self._terminal_lifecycle_lock = threading.RLock()
         self.reconcile_credentials()
         self.reconcile_terminals()
@@ -460,12 +492,125 @@ class V2JobProvider:
             )
         return self._observability.healthz()
 
+    def prometheus_metrics(self) -> str:
+        """Expose bounded aggregate native lifecycle facts without job identities."""
+
+        jobs: collections.Counter[str] = collections.Counter()
+        runners: collections.Counter[str] = collections.Counter()
+        stops: collections.Counter[str] = collections.Counter()
+        activations: collections.Counter[tuple[str, str]] = collections.Counter()
+        credentials: collections.Counter[str] = collections.Counter()
+        hard_deadlines = 0
+        output_loss = 0
+        collection_errors = 0
+        with self._native_metrics_lock:
+            recipe_forbidden_total = self._native_recipe_forbidden_total
+        for record in self._store.list_create():
+            if not _is_native_record(record) or _is_deleted(record):
+                continue
+            try:
+                snapshot = self.inspect(str(_field(record, "job_ref")))
+                if not isinstance(snapshot, NativeJobBindingSnapshot):
+                    continue
+                values = snapshot.root
+                jobs[str(values["bindingState"])] += 1
+                generation = values.get("latestRunnerGeneration")
+                if isinstance(generation, Mapping):
+                    observation = generation.get("runnerObservation")
+                    if isinstance(observation, Mapping):
+                        runners[str(observation["state"])] += 1
+                stop_action = values.get("runnerStopAction")
+                if isinstance(stop_action, Mapping):
+                    stops[str(stop_action["state"])] += 1
+                activation = values.get("recipeActivation")
+                if isinstance(activation, Mapping):
+                    activations[
+                        (str(activation["state"]), str(activation["deliveryFailure"]))
+                    ] += 1
+                for credential in values.get("credentialObservations", []):
+                    if isinstance(credential, Mapping):
+                        credentials[str(credential["state"])] += 1
+                deadline = values.get("deadline")
+                if isinstance(deadline, Mapping) and deadline.get("hardDeadlineTriggeredAt"):
+                    hard_deadlines += 1
+                output_loss += int(bool(values.get("outputLossPossible")))
+            except Exception:
+                collection_errors += 1
+
+        lines = [
+            "# HELP kcs_native_jobs Current native jobs by binding state.",
+            "# TYPE kcs_native_jobs gauge",
+            *_prometheus_counter_lines("kcs_native_jobs", "binding_state", jobs),
+            "# HELP kcs_native_runner_generations Current runner generations by launcher state.",
+            "# TYPE kcs_native_runner_generations gauge",
+            *_prometheus_counter_lines("kcs_native_runner_generations", "runner_state", runners),
+            "# HELP kcs_native_runner_stop_actions Current stopRunner actions by state.",
+            "# TYPE kcs_native_runner_stop_actions gauge",
+            *_prometheus_counter_lines("kcs_native_runner_stop_actions", "state", stops),
+            "# HELP kcs_native_recipe_activations Current recipe delivery observations.",
+            "# TYPE kcs_native_recipe_activations gauge",
+            *(
+                f'kcs_native_recipe_activations{{state="{state}",delivery_failure="{failure}"}} {count}'
+                for (state, failure), count in sorted(activations.items())
+            ),
+            "# HELP kcs_native_credentials Current projected runner credentials by state.",
+            "# TYPE kcs_native_credentials gauge",
+            *_prometheus_counter_lines("kcs_native_credentials", "state", credentials),
+            "# HELP kcs_native_hard_deadline_triggered Current jobs killed by hard deadline.",
+            "# TYPE kcs_native_hard_deadline_triggered gauge",
+            f"kcs_native_hard_deadline_triggered {hard_deadlines}",
+            "# HELP kcs_native_output_loss_possible Current jobs with possible output loss.",
+            "# TYPE kcs_native_output_loss_possible gauge",
+            f"kcs_native_output_loss_possible {output_loss}",
+            "# HELP kcs_native_metrics_collection_errors Native bindings not readable during scrape.",
+            "# TYPE kcs_native_metrics_collection_errors gauge",
+            f"kcs_native_metrics_collection_errors {collection_errors}",
+            "# HELP kcs_native_recipe_forbidden_total Rejected unregistered runtime recipe resolutions.",
+            "# TYPE kcs_native_recipe_forbidden_total counter",
+            f"kcs_native_recipe_forbidden_total {recipe_forbidden_total}",
+        ]
+        return "\n".join(lines) + "\n"
+
     def collect_runtime_events(self) -> int:
         """Capture managed Kubernetes transitions into the persistent event ring."""
 
         if self._observability is None:
             return 0
-        return self._observability.collect()
+        emitted = self._observability.collect()
+        record_runner_phase = getattr(self._observability, "record_runner_phase", None)
+        if not callable(record_runner_phase):
+            return emitted
+        for record in self._store.list_create():
+            if not _is_native_record(record) or _is_deleted(record):
+                continue
+            job_ref = str(_field(record, "job_ref"))
+            try:
+                binding = self.inspect(job_ref)
+                if not isinstance(binding, NativeJobBindingSnapshot):
+                    continue
+                generation = binding.root["latestRunnerGeneration"]
+                if not isinstance(generation, Mapping):
+                    continue
+                node_name = binding.root["nodeName"]
+                compute_node = (
+                    self._cluster_feed.display_compute_node(str(node_name))
+                    if node_name is not None
+                    else None
+                )
+                emitted += int(
+                    record_runner_phase(
+                        job_ref,
+                        compute_node,
+                        int(generation["generation"]),
+                        generation["runnerObservation"],
+                    )
+                )
+            except Exception:
+                # Kubernetes and the launcher may disappear between the ordinary
+                # event sweep and this observation. The binding remains the
+                # authority; the next sweep retries without inventing a phase.
+                continue
+        return emitted
 
     def nvidia_telemetry(self, job_ref: str) -> NvidiaTelemetrySnapshot:
         """Read NVIDIA driver observations from the exact bound Workspace Pod.
@@ -476,15 +621,32 @@ class V2JobProvider:
         """
 
         binding = self._live_binding(job_ref)
-        if binding.pod_uid is None or binding.node_name is None:
+        if isinstance(binding, NativeJobBindingSnapshot):
+            root = binding.root
+            pod_uid = root["podUid"]
+            node_name = root["nodeName"]
+            record = self._store.read_by_job_ref(job_ref)
+            native_spec = _field(_field(record, "spec_payload", {}), "native", {})
+            accelerator = _field(_field(native_spec, "resources", {}), "accelerator", {})
+            gpu_count = int(_field(accelerator, "count", 0))
+            job_uid = root["jobUid"]
+            runtime_lane = "native"
+        else:
+            pod_uid = binding.pod_uid
+            node_name = binding.node_name
+            gpu_count = binding.workspace.requested.gpu if binding.workspace is not None else 0
+            job_uid = binding.job_uid
+            runtime_lane = "hosted"
+        if pod_uid is None or node_name is None:
             raise StateConflictError("The Job has no running compute placement")
-        if binding.workspace is None or binding.workspace.requested.gpu < 1:
-            raise StateConflictError("The bound Workspace has no NVIDIA GPU allocation")
+        if gpu_count < 1:
+            raise StateConflictError("The bound runtime has no NVIDIA GPU allocation")
         probe = self._kube.exec_workspace_readonly(
             {
                 "jobRef": job_ref,
-                "jobUid": str(binding.job_uid),
-                "podUid": str(binding.pod_uid),
+                "jobUid": str(job_uid),
+                "podUid": str(pod_uid),
+                "runtimeLane": runtime_lane,
             },
             (
                 "nvidia-smi",
@@ -516,9 +678,9 @@ class V2JobProvider:
             raise DependencyUnavailableError("NVIDIA telemetry returned no allocated device")
         return NvidiaTelemetrySnapshot(
             job_ref=job_ref,
-            job_uid=binding.job_uid,
-            pod_uid=binding.pod_uid,
-            compute_node=self._cluster_feed.display_compute_node(binding.node_name),
+            job_uid=job_uid,
+            pod_uid=pod_uid,
+            compute_node=self._cluster_feed.display_compute_node(node_name),
             observed_at=self._now(),
             devices=devices,
         )
@@ -547,6 +709,8 @@ class V2JobProvider:
             or str(binding.pod_uid) != str(spec.pod_uid)
         ):
             raise StaleBindingError()
+        if isinstance(binding, NativeJobBindingSnapshot):
+            return self._create_native_terminal(job_ref, request, binding)
         if self._transport is None:
             raise DependencyUnavailableError("Agent pause transport is unavailable")
         now = self._now()
@@ -631,6 +795,80 @@ class V2JobProvider:
             created=created,
         )
 
+    def _create_native_terminal(
+        self,
+        job_ref: str,
+        request: TerminalCreateRequest,
+        binding: NativeJobBindingSnapshot,
+    ) -> TerminalCreateResult:
+        spec = request.spec
+        now = self._now()
+        expires = now + timedelta(seconds=spec.ttl_seconds)
+        credential = secrets.token_urlsafe(32)
+        credential_sha = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        values = {
+            "identityDigest": request.request_digest,
+            "requestDigest": request.request_digest,
+            "subjectRef": spec.subject_ref,
+            "jobUid": str(spec.job_uid),
+            "podUid": str(spec.pod_uid),
+            "state": "opening",
+            "createdAt": now.isoformat(),
+            "expiresAt": expires.isoformat(),
+            "observedAt": now.isoformat(),
+            "credentialSha256": credential_sha,
+            "agentPaused": "true",
+            "runtimeLane": "native",
+            "ptyRef": request.terminal_ref,
+        }
+        record, created = self._store.reserve_runtime(
+            "terminal", request.terminal_ref, job_ref, values
+        )
+        retained = _runtime_values(record)
+        if retained.get("identityDigest") != request.request_digest:
+            raise IdentityDigestConflict()
+        if not created:
+            if retained.get("state") in {"closed", "expired", "lost"}:
+                raise StateConflictError("The retained terminal session is no longer attachable")
+            values = dict(retained)
+            values["credentialSha256"] = credential_sha
+            values["observedAt"] = now.isoformat()
+        exact = {
+            "runtimeLane": "native",
+            "jobRef": job_ref,
+            "jobUid": str(binding.job_uid),
+            "podUid": str(binding.pod_uid),
+        }
+        claimed = False
+        try:
+            self._claim_terminal_writer(exact, request.terminal_ref)
+            claimed = True
+            opened = self._native.launcher_rpc(
+                exact,
+                {
+                    "command": "createPty",
+                    "requestRef": request.terminal_ref,
+                    "generation": _native_generation(binding),
+                    "ptyRef": request.terminal_ref,
+                    "ttlSeconds": spec.ttl_seconds,
+                },
+            )
+            if opened.get("open") is not True or opened.get("runnerPaused") is not True:
+                raise DependencyUnavailableError("native terminal did not open")
+        except Exception:
+            if claimed:
+                self._release_terminal_writer(exact, request.terminal_ref)
+            values.update(state="lost", agentPaused="false", observedAt=self._now().isoformat())
+            self._store.update_runtime("terminal", job_ref, request.terminal_ref, values)
+            raise
+        values.update(state="open", agentPaused="true", observedAt=self._now().isoformat())
+        record = self._store.update_runtime("terminal", job_ref, request.terminal_ref, values)
+        return TerminalCreateResult(
+            snapshot=self._terminal_snapshot(record),
+            credential=credential,
+            created=created,
+        )
+
     def inspect_terminal(
         self,
         job_ref: str,
@@ -638,7 +876,7 @@ class V2JobProvider:
         *,
         subject_ref: str,
         credential: str,
-    ) -> TerminalSessionSnapshot:
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         self.reconcile_terminals()
         record = self._store.read_runtime("terminal", job_ref, terminal_ref)
         if record is None:
@@ -664,11 +902,23 @@ class V2JobProvider:
         *,
         subject_ref: str,
         credential: str,
-    ) -> TerminalSessionSnapshot:
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         record, binding = self._terminal_access(
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
-        self._kube.write_workspace_terminal(binding, terminal_ref, content)
+        if _runtime_values(record).get("runtimeLane") == "native":
+            self._native.launcher_rpc(
+                binding,
+                {
+                    "command": "writePty",
+                    "requestRef": f"terminal-write-{terminal_ref}-{secrets.token_hex(8)}",
+                    "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                    "ptyRef": terminal_ref,
+                    "contentBase64": base64.b64encode(content).decode("ascii"),
+                },
+            )
+        else:
+            self._kube.write_workspace_terminal(binding, terminal_ref, content)
         return self._touch_terminal(record)
 
     def read_terminal(
@@ -680,13 +930,39 @@ class V2JobProvider:
         limit_bytes: int,
         subject_ref: str,
         credential: str,
-    ) -> tuple[bytes, int, bool, TerminalSessionSnapshot]:
+    ) -> tuple[
+        bytes,
+        int,
+        bool,
+        TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
+    ]:
         record, binding = self._terminal_access(
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
-        content, next_cursor, open_state = self._kube.read_workspace_terminal(
-            binding, terminal_ref, cursor, limit_bytes
-        )
+        if _runtime_values(record).get("runtimeLane") == "native":
+            result = self._native.launcher_rpc(
+                binding,
+                {
+                    "command": "readPty",
+                    "requestRef": f"terminal-read-{terminal_ref}-{cursor}",
+                    "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                    "ptyRef": terminal_ref,
+                    "cursor": cursor,
+                    "limitBytes": limit_bytes,
+                },
+            )
+            try:
+                content = base64.b64decode(str(result["contentBase64"]), validate=True)
+                next_cursor = int(result["nextCursor"])
+                open_state = bool(result["open"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise DependencyUnavailableError(
+                    "native terminal returned an invalid output frame"
+                ) from error
+        else:
+            content, next_cursor, open_state = self._kube.read_workspace_terminal(
+                binding, terminal_ref, cursor, limit_bytes
+            )
         return content, next_cursor, open_state, self._touch_terminal(record)
 
     def resize_terminal(
@@ -698,11 +974,24 @@ class V2JobProvider:
         columns: int,
         subject_ref: str,
         credential: str,
-    ) -> TerminalSessionSnapshot:
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         record, binding = self._terminal_access(
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
-        self._kube.resize_workspace_terminal(binding, terminal_ref, rows=rows, columns=columns)
+        if _runtime_values(record).get("runtimeLane") == "native":
+            self._native.launcher_rpc(
+                binding,
+                {
+                    "command": "resizePty",
+                    "requestRef": f"terminal-resize-{terminal_ref}-{secrets.token_hex(8)}",
+                    "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                    "ptyRef": terminal_ref,
+                    "rows": rows,
+                    "columns": columns,
+                },
+            )
+        else:
+            self._kube.resize_workspace_terminal(binding, terminal_ref, rows=rows, columns=columns)
         return self._touch_terminal(record)
 
     def close_terminal(
@@ -712,7 +1001,7 @@ class V2JobProvider:
         *,
         subject_ref: str,
         credential: str,
-    ) -> TerminalSessionSnapshot:
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         record, binding = self._terminal_access(
             job_ref,
             terminal_ref,
@@ -723,10 +1012,23 @@ class V2JobProvider:
         values = dict(_runtime_values(record))
         if values.get("state") == "closed":
             return self._terminal_snapshot(record)
+        native = values.get("runtimeLane") == "native"
         try:
-            self._kube.close_workspace_terminal(binding, terminal_ref)
+            if native:
+                self._native.launcher_rpc(
+                    binding,
+                    {
+                        "command": "closePty",
+                        "requestRef": f"terminal-close-{terminal_ref}",
+                        "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                        "ptyRef": terminal_ref,
+                        "reason": "terminal_closed",
+                    },
+                )
+            else:
+                self._kube.close_workspace_terminal(binding, terminal_ref)
         finally:
-            if self._transport is not None:
+            if not native and self._transport is not None:
                 self._transport.resume_agent(binding)
         values.update(
             {
@@ -757,7 +1059,11 @@ class V2JobProvider:
                 "jobUid": values.get("jobUid", ""),
                 "podUid": values.get("podUid", ""),
             }
+            native = values.get("runtimeLane") == "native"
+            if native:
+                binding["runtimeLane"] = "native"
             binding_check_failed = False
+            current: JobBindingSnapshot | NativeJobBindingSnapshot | None = None
             try:
                 current = self._live_binding(job_ref)
                 stale_binding = (
@@ -770,7 +1076,11 @@ class V2JobProvider:
                 stale_binding = False
                 binding_check_failed = True
             expired = _as_datetime(values.get("expiresAt"), self._now()) <= self._now()
-            alive = self._kube.terminal_is_open(binding, str(_field(record, "identity")))
+            alive = (
+                True
+                if native
+                else self._kube.terminal_is_open(binding, str(_field(record, "identity")))
+            )
             if binding_check_failed and not expired:
                 indeterminate += 1
                 continue
@@ -779,11 +1089,39 @@ class V2JobProvider:
             terminal_ref = str(_field(record, "identity"))
             cleanup_failed = False
             try:
-                self._kube.close_workspace_terminal(binding, terminal_ref)
+                if native:
+                    self._native.launcher_rpc(
+                        binding,
+                        {
+                            "command": "closePty",
+                            "requestRef": f"terminal-expire-{terminal_ref}",
+                            "generation": _native_generation_from_values(
+                                current.root
+                                if isinstance(current, NativeJobBindingSnapshot)
+                                else {}
+                            ),
+                            "ptyRef": terminal_ref,
+                        },
+                    )
+                else:
+                    self._kube.close_workspace_terminal(binding, terminal_ref)
             except Exception:
                 cleanup_failed = True
             try:
-                if self._transport is not None:
+                if native:
+                    self._native.launcher_rpc(
+                        binding,
+                        {
+                            "command": "resume",
+                            "requestRef": f"terminal-resume-{terminal_ref}",
+                            "generation": _native_generation_from_values(
+                                current.root
+                                if isinstance(current, NativeJobBindingSnapshot)
+                                else {}
+                            ),
+                        },
+                    )
+                elif self._transport is not None:
                     self._transport.resume_agent(binding)
             except Exception:
                 cleanup_failed = True
@@ -916,11 +1254,14 @@ class V2JobProvider:
         if state != "open" and not (allow_closed and state == "closed"):
             raise StateConflictError("The terminal session is not open")
         if allow_closed and state == "closed":
-            return record, {
+            retained_binding = {
                 "jobRef": job_ref,
                 "jobUid": values["jobUid"],
                 "podUid": values["podUid"],
             }
+            if values.get("runtimeLane") == "native":
+                retained_binding["runtimeLane"] = "native"
+            return record, retained_binding
         current = self._live_binding(job_ref)
         if (
             current.subject_ref != subject_ref
@@ -933,11 +1274,20 @@ class V2JobProvider:
             "jobUid": str(current.job_uid),
             "podUid": str(current.pod_uid),
         }
-        if state == "open" and not self._kube.terminal_is_open(binding, terminal_ref):
+        native = values.get("runtimeLane") == "native"
+        if native:
+            binding["runtimeLane"] = "native"
+        if (
+            state == "open"
+            and not native
+            and not self._kube.terminal_is_open(binding, terminal_ref)
+        ):
             raise StateConflictError("The retained terminal PTY is no longer attached")
         return record, binding
 
-    def _touch_terminal(self, record: object) -> TerminalSessionSnapshot:
+    def _touch_terminal(
+        self, record: object
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         values = dict(_runtime_values(record))
         values["observedAt"] = self._now().isoformat()
         updated = self._store.update_runtime(
@@ -948,8 +1298,39 @@ class V2JobProvider:
         )
         return self._terminal_snapshot(updated)
 
-    def _terminal_snapshot(self, record: object) -> TerminalSessionSnapshot:
+    def _terminal_snapshot(
+        self, record: object
+    ) -> TerminalSessionSnapshot | NativeTerminalSessionSnapshot:
         values = _runtime_values(record)
+        if values.get("runtimeLane") == "native":
+            return NativeTerminalSessionSnapshot.model_validate(
+                {
+                    "terminalRef": str(_field(record, "identity")),
+                    "ptyRef": values.get("ptyRef", str(_field(record, "identity"))),
+                    "requestDigest": values["requestDigest"],
+                    "subjectRef": values["subjectRef"],
+                    "jobRef": str(_field(record, "job_ref")),
+                    "jobUid": values["jobUid"],
+                    "podUid": values["podUid"],
+                    "container": "runner",
+                    "state": values["state"],
+                    "createdAt": values["createdAt"],
+                    "expiresAt": values["expiresAt"],
+                    "observedAt": values["observedAt"],
+                    "writable": True,
+                    "runnerPaused": True,
+                    "launcherMediated": True,
+                    "shellCommand": ["/bin/sh"],
+                    "effectiveUid": 10002,
+                    "effectiveGid": 10001,
+                    "effectiveCapabilities": [],
+                    "noNewPrivileges": True,
+                    "umask": "0002",
+                    "cwd": "/workspace/worktree",
+                    "home": "/run/rc-terminal/home",
+                    "tmpdir": "/run/rc-terminal/tmp",
+                }
+            )
         return TerminalSessionSnapshot(
             terminal_ref=str(_field(record, "identity")),
             request_digest=values["requestDigest"],
@@ -1110,19 +1491,34 @@ class V2JobProvider:
                 raise DependencyUnavailableError(
                     "reserved create has no replayable retained specification"
                 )
-            self.create(
-                CreateJobRequest.model_validate(
-                    {
-                        "providerRequestId": str(_field(record, "provider_request_id")),
-                        "specDigest": str(_field(record, "spec_digest")),
-                        "spec": dict(spec_payload),
-                    }
-                )
+            replay_payload = {
+                "providerRequestId": str(_field(record, "provider_request_id")),
+                "specDigest": str(_field(record, "spec_digest")),
+                "spec": dict(spec_payload),
+            }
+            replay_request = (
+                NativeCreateJobRequest.model_validate(replay_payload)
+                if _is_native_record(record)
+                else CreateJobRequest.model_validate(replay_payload)
             )
+            self.create(replay_request)
             report.reconciled += 1
             return
         binding = self.inspect(job_ref)
         self._validate_job_annotations(record)
+        if isinstance(binding, NativeJobBindingSnapshot):
+            self._reconcile_native_runner_deadline(job_ref, binding)
+            native_finalizations = self._runtime_records("native-finalize", job_ref)
+            if native_finalizations:
+                values = _runtime_values(native_finalizations[-1])
+                payload = values.get("requestSpec")
+                if payload:
+                    self.finalize(
+                        job_ref,
+                        NativeFinalizeJobRequest.model_validate_json(payload),
+                    )
+                    report.reconciled += 1
+                    return
         cancellations = self._runtime_records("cancel", job_ref)
         if cancellations:
             values = _runtime_values(cancellations[-1])
@@ -1192,14 +1588,49 @@ class V2JobProvider:
                     claim.release()
                 report.reconciled += 1
 
-    def create(self, request: CreateJobRequest) -> CreateResult:
+    def _reconcile_native_runner_deadline(
+        self, job_ref: str, binding: NativeJobBindingSnapshot
+    ) -> None:
+        root = binding.root
+        generation = root["latestRunnerGeneration"]
+        if not isinstance(generation, Mapping):
+            return
+        observation = generation["runnerObservation"]
+        if observation["state"] not in {"starting", "running"}:
+            return
+        if self._now() < _as_datetime(generation["softDeadlineAt"], self._now()):
+            return
+        spec = {
+            "jobUid": root["jobUid"],
+            "podUid": root["podUid"],
+            "generation": generation["generation"],
+            "reason": "soft_deadline",
+        }
+        request = RunnerStopRequest.model_validate(
+            {
+                "stopRef": f"runner-soft-{canonical_digest(spec)[:24]}",
+                "requestDigest": canonical_digest(spec),
+                "spec": spec,
+            }
+        )
+        self.stop_runner(job_ref, request)
+
+    def create(self, request: CreateJobRequest | NativeCreateJobRequest) -> CreateResult:
         """Reserve before create and reconcile a response lost after API acceptance."""
 
-        spec_payload = request.spec.digest_payload()
+        spec_payload = (
+            request.spec
+            if isinstance(request, NativeCreateJobRequest)
+            else request.spec.digest_payload()
+        )
         if not hmac.compare_digest(request.spec_digest, canonical_digest(spec_payload)):
             raise DigestMismatchError
 
-        rendered_job = self._renderer.render(request)
+        try:
+            rendered_job = self._renderer.render(request)
+        except RuntimeRecipeForbiddenError:
+            self._record_native_recipe_forbidden()
+            raise
         job_ref = self._renderer.job_ref(request)
         reservation = self._reserve_create(request, job_ref, spec_payload)
         record = _field(reservation, "record", reservation)
@@ -1217,14 +1648,19 @@ class V2JobProvider:
             if _field(record, "job_uid", None) is not None:
                 reason = "the retained Job is no longer observable"
                 record = self._mark_indeterminate(record, reason)
-                return CreateResult(snapshot=self._missing_job_snapshot(record), created=False)
+                missing = (
+                    self._native_missing_job_snapshot(record)
+                    if _is_native_record(record)
+                    else self._missing_job_snapshot(record)
+                )
+                return CreateResult(snapshot=missing, created=False)
             job = self._create_or_reconcile_job(rendered_job, job_ref)
         job_uid = _required_text(job, "metadata", "uid")
         self._store.mark_created(request.provider_request_id, job_uid)
         snapshot = self.inspect(job_ref)
         return CreateResult(snapshot=snapshot, created=created)
 
-    def inspect(self, job_ref: str) -> JobBindingSnapshot:
+    def inspect(self, job_ref: str) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         """Rebuild a binding solely from its durable record and current Job/Pods."""
 
         record = self._store.read_by_job_ref(job_ref)
@@ -1241,8 +1677,12 @@ class V2JobProvider:
                     "The create identity is reserved but no Job UID is observable"
                 )
             if deleting:
+                if _is_native_record(record):
+                    return self._native_missing_job_snapshot(record)
                 return self._deleting_snapshot(self._missing_job_snapshot(record), record)
             record = self._mark_indeterminate(record, "the retained Job is no longer observable")
+            if _is_native_record(record):
+                return self._native_missing_job_snapshot(record)
             return self._missing_job_snapshot(record)
 
         actual_job_uid = _required_text(job, "metadata", "uid")
@@ -1254,11 +1694,20 @@ class V2JobProvider:
                 replacement_reason = "Job UID changed"
             elif _current_pod(pods)[1] is not None:
                 replacement_reason = _current_pod(pods)[1]
+            if _is_native_record(record):
+                return self._native_snapshot(
+                    record,
+                    job,
+                    pods,
+                    replacement_reason=replacement_reason,
+                )
             snapshot = self._snapshot(record, job, pods, replacement_reason=replacement_reason)
             return self._deleting_snapshot(snapshot, record)
         if retained_job_uid is not None and str(retained_job_uid) != actual_job_uid:
             reason = "Job UID changed"
             record = self._mark_indeterminate(record, reason)
+            if _is_native_record(record):
+                return self._native_snapshot(record, job, (), replacement_reason=reason)
             return self._snapshot(record, job, (), replacement_reason=reason)
         if retained_job_uid is None:
             record = self._store.mark_created(
@@ -1287,6 +1736,17 @@ class V2JobProvider:
 
         if replacement_reason is not None:
             record = self._mark_indeterminate(record, replacement_reason)
+
+        if _is_native_record(record):
+            binding = self._native_binding_identity(record, job, current_pod)
+            if current_pod is not None and replacement_reason is None:
+                self._native.refresh_generation(job_ref, binding)
+            return self._native_snapshot(
+                record,
+                job,
+                pods,
+                replacement_reason=replacement_reason,
+            )
 
         snapshot = self._snapshot(record, job, pods, replacement_reason=replacement_reason)
         if replacement_reason is None and self._refresh_running_generation(snapshot):
@@ -1392,7 +1852,9 @@ class V2JobProvider:
             raise
         return True
 
-    def list_jobs(self, query: JobListQuery | None = None) -> JobBindingSnapshotList:
+    def list_jobs(
+        self, query: JobListQuery | None = None
+    ) -> JobBindingSnapshotList | AnyJobBindingSnapshotList:
         """Return one stable-key-merge page over live bindings and tombstones."""
 
         query = query or JobListQuery()
@@ -1402,7 +1864,9 @@ class V2JobProvider:
         offset = self._page_offset(query.page_token, query_digest)
 
         records = list(self._store.list_create())
-        entries: list[tuple[datetime, str, JobBindingSnapshot | JobTombstone]] = []
+        entries: list[
+            tuple[datetime, str, JobBindingSnapshot | NativeJobBindingSnapshot | JobTombstone]
+        ] = []
         for record in records:
             if (
                 query.provider_request_id is not None
@@ -1422,7 +1886,9 @@ class V2JobProvider:
             if _is_deleted(record):
                 if not query.include_deleted:
                     continue
-                value: JobBindingSnapshot | JobTombstone = _as_tombstone(record)
+                value: JobBindingSnapshot | NativeJobBindingSnapshot | JobTombstone = _as_tombstone(
+                    record
+                )
                 state = JobBindingState.DELETED
             else:
                 if _field(record, "job_uid", None) is None:
@@ -1452,6 +1918,24 @@ class V2JobProvider:
                     "offset": next_offset,
                 }
             )
+        native_present = any(isinstance(value, NativeJobBindingSnapshot) for _, _, value in page)
+        if native_present:
+            return AnyJobBindingSnapshotList.model_validate(
+                {
+                    "items": [
+                        value.model_dump(mode="json", by_alias=True)
+                        for _, _, value in page
+                        if isinstance(value, (JobBindingSnapshot, NativeJobBindingSnapshot))
+                    ],
+                    "tombstones": [
+                        value.model_dump(mode="json", by_alias=True)
+                        for _, _, value in page
+                        if isinstance(value, JobTombstone)
+                    ],
+                    "nextPageToken": next_token,
+                    "observedAt": self._now().isoformat(),
+                }
+            )
         return JobBindingSnapshotList(
             items=[value for _, _, value in page if isinstance(value, JobBindingSnapshot)],
             tombstones=[value for _, _, value in page if isinstance(value, JobTombstone)],
@@ -1465,8 +1949,43 @@ class V2JobProvider:
         role: LogContainer | str,
         cursor: str | None = None,
         limit_bytes: int = DEFAULT_LOG_LIMIT_BYTES,
-    ) -> RoleLogs:
+    ) -> RoleLogs | NativeRoleLogs:
         """Read a bounded page from one explicit role on the immutable Pod."""
+
+        snapshot = self.inspect(job_ref)
+        if isinstance(snapshot, NativeJobBindingSnapshot):
+            container = str(role)
+            if container not in {"runner", "control"}:
+                raise InvalidRequestError("native container must be 'runner' or 'control'")
+            if not 1 <= limit_bytes <= MAX_LOG_LIMIT_BYTES:
+                raise InvalidRequestError("limitBytes must be between 1 and 1048576")
+            root = snapshot.root
+            if root["podUid"] is None:
+                raise StateConflictError("The Job does not yet have an immutable Pod binding")
+            page = self._read_role_logs(
+                job_ref, str(root["podUid"]), container, cursor, limit_bytes
+            )
+            role_snapshot = root[container]
+            return NativeRoleLogs.model_validate(
+                {
+                    "jobRef": job_ref,
+                    "jobUid": root["jobUid"],
+                    "podUid": root["podUid"],
+                    "container": container,
+                    "inputCursor": cursor,
+                    "startCursor": str(_field(page, "start_cursor")),
+                    "nextCursor": _optional_text(page, "next_cursor"),
+                    "content": str(_field(page, "content", "")),
+                    "truncated": bool(_field(page, "truncated", False)),
+                    "terminal": bool(_field(page, "terminal", False)),
+                    "containerId": (
+                        role_snapshot.get("containerId")
+                        if isinstance(role_snapshot, Mapping)
+                        else None
+                    ),
+                    "observedAt": self._now().isoformat(),
+                }
+            )
 
         try:
             container = role if isinstance(role, LogContainer) else LogContainer(role)
@@ -1476,6 +1995,8 @@ class V2JobProvider:
             raise InvalidRequestError("limitBytes must be between 1 and 1048576")
 
         snapshot = self.inspect(job_ref)
+        if not isinstance(snapshot, JobBindingSnapshot):
+            raise StateConflictError("hosted role logs require a hosted binding")
         if snapshot.pod_uid is None:
             raise StateConflictError("The Job does not yet have an immutable Pod binding")
 
@@ -1513,6 +2034,87 @@ class V2JobProvider:
             or (role_snapshot.container_id if role_snapshot is not None else None),
             observed_at=self._now(),
         )
+
+    def resolve_runtime_recipe(
+        self, runner_ref: str, environment_profile_ref: str
+    ) -> ResolvedRuntimeRecipe:
+        try:
+            return self._renderer.resolve_recipe(runner_ref, environment_profile_ref)
+        except RuntimeRecipeForbiddenError:
+            self._record_native_recipe_forbidden()
+            raise
+
+    def _record_native_recipe_forbidden(self) -> None:
+        with self._native_metrics_lock:
+            self._native_recipe_forbidden_total += 1
+
+    def grant_runner_credential_result(
+        self,
+        job_ref: str,
+        metadata: RunnerCredentialGrantMetadata,
+        raw_bytes: bytes,
+    ) -> NativeMutationResult:
+        snapshot, binding = self._native_binding(job_ref)
+        del snapshot
+        return self._native.grant(job_ref, binding, metadata, raw_bytes)
+
+    def inspect_runner_credential_grant(
+        self, job_ref: str, credential_grant_ref: str
+    ) -> RunnerCredentialGrantSnapshot:
+        self._native_binding(job_ref)
+        return self._native.inspect_grant(job_ref, credential_grant_ref)
+
+    def start_runner(
+        self, job_ref: str, request: RunnerStartRequest
+    ) -> NativeRunnerGenerationSnapshot:
+        snapshot, binding = self._native_binding(job_ref)
+        root = snapshot.root
+        record = self._store.read_by_job_ref(job_ref)
+        if record is None:
+            raise JobNotFoundError()
+        native_spec = _field(_field(record, "spec_payload", {}), "native", {})
+        recipe = self._renderer.resolve_recipe(
+            str(_field(native_spec, "runnerRef")),
+            str(_field(native_spec, "environmentProfileRef")),
+        )
+
+        def transfer_ready(ref: str) -> bool:
+            try:
+                return (
+                    self._workspace_runtime.inspect_transfer(job_ref, ref).state
+                    is TransferState.COMPLETED
+                )
+            except KcsV2Error:
+                return False
+
+        if root["recipeActivation"] is None or root["recipeActivation"]["state"] != "active":
+            raise PreconditionFailedError("native runtime recipe is not active")
+        return self._native.start(
+            job_ref,
+            binding,
+            native_spec,
+            recipe.root,
+            request,
+            transfer_ready,
+        )
+
+    def stop_runner(self, job_ref: str, request: RunnerStopRequest) -> NativeMutationResult:
+        _snapshot, binding = self._native_binding(job_ref)
+        return self._native.stop(job_ref, binding, request)
+
+    def _native_binding(self, job_ref: str) -> tuple[NativeJobBindingSnapshot, dict[str, Any]]:
+        snapshot = self.inspect(job_ref)
+        if not isinstance(snapshot, NativeJobBindingSnapshot):
+            raise StateConflictError("native runner operation requires a native binding")
+        root = snapshot.root
+        if root["podUid"] is None or root["bindingState"] == "indeterminate":
+            raise ReplacementPodError()
+        return snapshot, {
+            "runtimeLane": "native",
+            "jobRef": job_ref,
+            "jobUid": root["jobUid"],
+            "podUid": root["podUid"],
+        }
 
     def grant_credential(
         self, job_ref: str, metadata: CredentialGrantMetadata, raw_bytes: bytes
@@ -1842,8 +2444,31 @@ class V2JobProvider:
         )
         return generation
 
-    def finalize(self, job_ref: str, request: FinalizeJobRequest) -> FinalizeResult:
+    def finalize(
+        self, job_ref: str, request: FinalizeJobRequest | NativeFinalizeJobRequest
+    ) -> FinalizeResult:
         """Quiesce supervisors and revoke credentials without deleting Job/Pod/log reality."""
+        if isinstance(request, NativeFinalizeJobRequest):
+            _snapshot, binding = self._native_binding(job_ref)
+
+            def transfers_terminal(refs: list[str]) -> bool:
+                for ref in refs:
+                    try:
+                        state = self._workspace_runtime.inspect_transfer(job_ref, ref).state
+                    except KcsV2Error:
+                        return False
+                    if state not in {
+                        TransferState.COMPLETED,
+                        TransferState.CANCELED,
+                        TransferState.DISCARDED,
+                        TransferState.FAILED,
+                        TransferState.INDETERMINATE,
+                    }:
+                        return False
+                return True
+
+            result = self._native.finalize(job_ref, binding, request, transfers_terminal)
+            return FinalizeResult(snapshot=self.inspect(job_ref), created=result.created)
         self.reconcile_credentials()
         self._assert_no_cancel(job_ref)
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
@@ -1930,6 +2555,9 @@ class V2JobProvider:
 
     def cancel(self, job_ref: str, request: CancelJobRequest) -> CancelResult:
         """Interrupt one binding from a durable slot without inventing output manifests."""
+        current = self.inspect(job_ref)
+        if isinstance(current, NativeJobBindingSnapshot):
+            return self._cancel_native(job_ref, request, current)
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
         self._assert_not_finalizing(job_ref)
@@ -2041,6 +2669,71 @@ class V2JobProvider:
             raise DependencyUnavailableError("retained cancel phase is indeterminate")
         return CancelResult(snapshot=self.inspect(job_ref), created=created)
 
+    def _cancel_native(
+        self,
+        job_ref: str,
+        request: CancelJobRequest,
+        snapshot: NativeJobBindingSnapshot,
+    ) -> CancelResult:
+        if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
+            raise DigestMismatchError()
+        root = snapshot.root
+        if root["podUid"] is None or root["bindingState"] == "indeterminate":
+            raise ReplacementPodError()
+        values = {
+            "identityDigest": request.request_digest,
+            "cancelRef": request.cancel_ref,
+            "requestSpec": request.spec.model_dump_json(by_alias=True),
+            "payload": phase_payload("accepted", self._now(), output_loss_possible=False),
+        }
+        record, created = self._store.reserve_runtime("cancel", request.cancel_ref, job_ref, values)
+        retained = _runtime_values(record)
+        if (
+            retained.get("identityDigest") != request.request_digest
+            or retained.get("cancelRef") != request.cancel_ref
+        ):
+            raise IdentityDigestConflict()
+        state, _output_loss, _resume = read_phase(record)
+        if state == "succeeded":
+            return CancelResult(snapshot=self.inspect(job_ref), created=False)
+        binding = {
+            "runtimeLane": "native",
+            "jobRef": job_ref,
+            "jobUid": root["jobUid"],
+            "podUid": root["podUid"],
+        }
+        self._native.revoke_all(job_ref)
+        generation = self._native.refresh_generation(job_ref, binding)
+        if generation is not None and generation.root["runnerObservation"]["state"] not in {
+            "exited",
+            "killed",
+        }:
+            stop_spec = {
+                "jobUid": root["jobUid"],
+                "podUid": root["podUid"],
+                "generation": generation.root["generation"],
+                "reason": "cancel_requested",
+            }
+            stop_request = RunnerStopRequest.model_validate(
+                {
+                    "stopRef": f"runner-cancel-{request.request_digest[:24]}",
+                    "requestDigest": canonical_digest(stop_spec),
+                    "spec": stop_spec,
+                }
+            )
+            self._native.stop(job_ref, binding, stop_request)
+        updated = self._store.update_runtime(
+            "cancel",
+            job_ref,
+            request.cancel_ref,
+            {
+                **retained,
+                "payload": phase_payload("succeeded", self._now(), output_loss_possible=False),
+            },
+        )
+        del updated
+        return CancelResult(snapshot=self.inspect(job_ref), created=created)
+
     cancel_job = cancel
 
     def delete(self, job_ref: str, delete_ref: str, request_digest: str) -> JobTombstone:
@@ -2084,14 +2777,22 @@ class V2JobProvider:
         else:
             snapshot = self.inspect(job_ref)
             final_state = _terminal_state_for_binding(snapshot.binding_state)
-            credential_observations = [
-                item.model_dump(mode="json", by_alias=True)
-                for item in snapshot.credential_observations
-            ]
-            transfer_observations = [
-                item.model_dump(mode="json", by_alias=True)
-                for item in snapshot.transfer_observations
-            ]
+            if isinstance(snapshot, NativeJobBindingSnapshot):
+                credential_observations = [
+                    dict(item) for item in snapshot.root["credentialObservations"]
+                ]
+                transfer_observations = [
+                    dict(item) for item in snapshot.root["transferObservations"]
+                ]
+            else:
+                credential_observations = [
+                    item.model_dump(mode="json", by_alias=True)
+                    for item in snapshot.credential_observations
+                ]
+                transfer_observations = [
+                    item.model_dump(mode="json", by_alias=True)
+                    for item in snapshot.transfer_observations
+                ]
 
         deleted_at = self._now()
         expires_at = deleted_at + self._tombstone_ttl
@@ -2128,11 +2829,15 @@ class V2JobProvider:
         if close is not None:
             close.phase("delete_intent_persisted")
 
-        for grant_record in self._store.list_runtime("credential", job_ref):
-            grant = self._grant_snapshot(grant_record)
-            if grant.secret_present is not False:
-                self._revoke_grant(grant)
-        self._prove_secret_absent(job_ref, str(_field(record, "job_uid")))
+        if _is_native_record(record):
+            self._native.revoke_all(job_ref)
+            self._prove_native_secret_absent(job_ref, str(_field(record, "job_uid")))
+        else:
+            for grant_record in self._store.list_runtime("credential", job_ref):
+                grant = self._grant_snapshot(grant_record)
+                if grant.secret_present is not False:
+                    self._revoke_grant(grant)
+            self._prove_secret_absent(job_ref, str(_field(record, "job_uid")))
         observed_credentials, observed_transfers = self._deletion_observations(job_ref)
         credential_observations = observed_credentials or credential_observations
         transfer_observations = observed_transfers or transfer_observations
@@ -2267,7 +2972,7 @@ class V2JobProvider:
         except Exception as error:
             raise DependencyUnavailableError from error
 
-    def _live_binding(self, job_ref: str) -> JobBindingSnapshot:
+    def _live_binding(self, job_ref: str) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         binding = self.inspect(job_ref)
         if binding.binding_state is JobBindingState.DELETING:
             raise StateConflictError("The Job has a retained deletion intent")
@@ -3029,6 +3734,28 @@ class V2JobProvider:
         if deleted is not True:
             raise CredentialDestroyFailedError()
 
+    def _prove_native_secret_absent(self, job_ref: str, job_uid: str) -> None:
+        name = runner_credential_secret_name(job_ref)
+        try:
+            secret = self._kube.read_secret(name)
+            if secret is None:
+                return
+            annotations = _path(secret, "metadata", "annotations") or {}
+            if (
+                _field(annotations, "researchcosmos.io/job-uid", None) != job_uid
+                or _field(annotations, "researchcosmos.io/runtime-lane", "native") != "native"
+            ):
+                raise CredentialDestroyFailedError()
+            uid = _required_text(secret, "metadata", "uid")
+            if self._kube.delete_secret(name, uid) is not True:
+                raise CredentialDestroyFailedError()
+            if self._kube.read_secret(name) is not None:
+                raise CredentialDestroyFailedError()
+        except CredentialDestroyFailedError:
+            raise
+        except Exception as error:
+            raise CredentialDestroyFailedError() from error
+
     def _deletion_observations(
         self, job_ref: str
     ) -> tuple[list[Mapping[str, object]], list[Mapping[str, object]]]:
@@ -3044,6 +3771,20 @@ class V2JobProvider:
                 for record in self._store.list_runtime("credential", job_ref)
             )
         ]
+        credentials.extend(
+            {
+                "credentialGrantRef": snapshot.root["credentialGrantRef"],
+                "state": snapshot.root["state"],
+                "secretPresent": snapshot.root["secretPresent"],
+                "observedAt": snapshot.root["observedAt"],
+            }
+            for snapshot in (
+                RunnerCredentialGrantSnapshot.model_validate_json(
+                    _runtime_values(record)["payload"]
+                )
+                for record in self._store.list_runtime("runner-credential", job_ref)
+            )
+        )
         transfers: list[Mapping[str, object]] = [
             TransferObservation(
                 transfer_ref=snapshot.transfer_ref,
@@ -3407,6 +4148,390 @@ class V2JobProvider:
             # than turning a healthy Job inspection into a 503.
             return {}
         return value if isinstance(value, Mapping) else {}
+
+    def _native_binding_identity(
+        self, record: object, job: object, pod: object | None
+    ) -> dict[str, Any]:
+        pod_uid = _field(record, "pod_uid", None)
+        if pod_uid is None and pod is not None:
+            pod_uid = _required_text(pod, "metadata", "uid")
+        return {
+            "runtimeLane": "native",
+            "jobRef": str(_field(record, "job_ref")),
+            "jobUid": str(
+                _field(record, "job_uid", None) or _required_text(job, "metadata", "uid")
+            ),
+            "podUid": str(pod_uid) if pod_uid is not None else "",
+        }
+
+    def _native_snapshot(
+        self,
+        record: object,
+        job: object,
+        pods: Sequence[object],
+        *,
+        replacement_reason: str | None,
+    ) -> NativeJobBindingSnapshot:
+        observed_at = self._now()
+        pod = _current_pod(pods)[0] if replacement_reason is None else None
+        spec_payload = _field(record, "spec_payload", {})
+        native_spec = _field(spec_payload, "native", {})
+        job_ref = str(_field(record, "job_ref"))
+        job_uid = str(_field(record, "job_uid", None) or _required_text(job, "metadata", "uid"))
+        pod_uid_value = _field(record, "pod_uid", None)
+        if pod_uid_value is None and pod is not None:
+            pod_uid_value = _required_text(pod, "metadata", "uid")
+        pod_uid = str(pod_uid_value) if pod_uid_value is not None else None
+        binding_state, binding_reason = _binding_state(job, pod, replacement_reason)
+        if replacement_reason is None and pod is not None:
+            statuses = {
+                str(_field(item, "name", "")): item
+                for item in (_path(pod, "status", "container_statuses") or ())
+            }
+            if set(statuses).issuperset({"runner", "control"}) and all(
+                bool(_field(statuses[name], "ready", False)) for name in ("runner", "control")
+            ):
+                binding_state = JobBindingState.RUNNING
+        generation_records = list(self._store.list_runtime("runner-generation", job_ref))
+        latest = (
+            max(
+                (
+                    NativeRunnerGenerationSnapshot.model_validate_json(
+                        _runtime_values(item)["payload"]
+                    )
+                    for item in generation_records
+                ),
+                key=lambda item: int(item.root["generation"]),
+            )
+            if generation_records
+            else None
+        )
+        finalize_records = list(self._store.list_runtime("native-finalize", job_ref))
+        cancel_records = list(self._store.list_runtime("cancel", job_ref))
+        stop_records = list(self._store.list_runtime("runner-stop", job_ref))
+        if finalize_records and binding_state not in {
+            JobBindingState.SUCCEEDED,
+            JobBindingState.FAILED,
+        }:
+            binding_state = JobBindingState.FINALIZING
+            binding_reason = "native capture barrier accepted; platform finalizing"
+        usage = self._pod_usage(pod) if pod is not None else {}
+        runner = self._native_runner_role(native_spec, pod, latest, usage.get("runner"))
+        control = self._native_control_role(pod)
+        recipe = self._renderer.resolve_recipe(
+            str(_field(native_spec, "runnerRef")),
+            str(_field(native_spec, "environmentProfileRef")),
+        )
+        activation = self._native_activation(
+            record,
+            pod,
+            runner,
+            control,
+            recipe,
+            observed_at,
+        )
+        post_ack_delivery_loss = _native_post_ack_delivery_loss(activation, latest)
+        if post_ack_delivery_loss is not None:
+            # A delivery failure before start ACK is deterministic.  The same
+            # failure after ACK can destroy live outputs before capture, so a
+            # failed Job alone cannot prove a complete terminal observation.
+            binding_state = JobBindingState.INDETERMINATE
+            binding_reason = (
+                "native runtime delivery failed after runner start acknowledgment: "
+                f"{post_ack_delivery_loss}"
+            )
+        created_at = _as_datetime(_field(record, "created_at", None), observed_at)
+        hard_seconds = int(
+            _optional_path_text(
+                job, "metadata", "annotations", "researchcosmos.io/hard-deadline-seconds"
+            )
+            or int(_path(job, "spec", "active_deadline_seconds") or 1)
+        )
+        deadline_payload = {
+            "runnerDeadlineSeconds": int(_field(native_spec, "runnerDeadlineSeconds")),
+            "softTimerStartedAt": latest.root["softTimerStartedAt"] if latest else None,
+            "softDeadlineAt": latest.root["softDeadlineAt"] if latest else None,
+            "hardDeadlineSeconds": hard_seconds,
+            "hardDeadlineAt": (created_at + timedelta(seconds=hard_seconds)).isoformat(),
+            "hardDeadlineTriggeredAt": (
+                _job_finished_at(job).isoformat()
+                if _job_condition_reason(job, "Failed") == "DeadlineExceeded"
+                and _job_finished_at(job) is not None
+                else None
+            ),
+            "policyDigest": canonical_digest(
+                {
+                    "runnerDeadlineSeconds": int(_field(native_spec, "runnerDeadlineSeconds")),
+                    "hardDeadlineSeconds": hard_seconds,
+                }
+            ),
+        }
+        operation_states = [
+            (
+                str(_field(item, "identity")),
+                _validated_runtime_state(item, "operation")[0],
+            )
+            for item in self._store.list_runtime("operation", job_ref)
+        ]
+        transfer_states = [
+            (
+                str(_field(item, "identity")),
+                *_validated_runtime_state(item, "transfer"),
+            )
+            for item in self._store.list_runtime("transfer", job_ref)
+        ]
+        grants = [
+            RunnerCredentialGrantSnapshot.model_validate_json(_runtime_values(item)["payload"])
+            for item in self._store.list_runtime("runner-credential", job_ref)
+        ]
+        cleanup = {
+            "state": "complete"
+            if binding_state in {JobBindingState.SUCCEEDED, JobBindingState.FAILED}
+            else "pending",
+            "reason": None,
+            "observedAt": observed_at.isoformat(),
+        }
+        accelerator = _field(_field(native_spec, "resources", {}), "accelerator", {})
+        gpu_count = int(_field(accelerator, "count", 0))
+        payload = {
+            "runtimeLane": "native",
+            "jobRef": job_ref,
+            "providerHandle": job_ref,
+            "providerRequestId": str(_field(record, "provider_request_id")),
+            "subjectRef": str(_field(spec_payload, "subjectRef")),
+            "runtimePlanDigest": str(_field(spec_payload, "runtimePlanDigest")),
+            "specDigest": str(_field(record, "spec_digest")),
+            "jobUid": job_uid,
+            "podUid": pod_uid,
+            "resourceVersion": _optional_path_text(job, "metadata", "resource_version"),
+            "nodeName": _optional_path_text(pod, "spec", "node_name") if pod else None,
+            "bindingState": binding_state.value,
+            "bindingReason": binding_reason,
+            "observedPodCount": min(len(pods), 1),
+            "podIncarnations": [
+                item.model_dump(mode="json", by_alias=True)
+                for item in _pod_incarnations(record, pods, observed_at)[-1:]
+            ],
+            "createdAt": created_at.isoformat(),
+            "updatedAt": _as_datetime(_field(record, "updated_at", None), observed_at).isoformat(),
+            "startedAt": (
+                _as_optional_datetime(_path(pod, "status", "start_time")).isoformat()
+                if pod is not None and _as_optional_datetime(_path(pod, "status", "start_time"))
+                else None
+            ),
+            "finishedAt": _job_finished_at(job).isoformat() if _job_finished_at(job) else None,
+            "observedAt": observed_at.isoformat(),
+            "runner": runner,
+            "control": control,
+            "latestRunnerGeneration": latest.root if latest else None,
+            "recipeActivation": activation,
+            "deadline": deadline_payload,
+            "activeOperationRefs": sorted(
+                ref for ref, state in operation_states if state in _OPERATION_ACTIVE_STATES
+            ),
+            "terminalOperationRefs": sorted(
+                ref for ref, state in operation_states if state in _OPERATION_TERMINAL_STATES
+            ),
+            "credentialObservations": [
+                {
+                    "credentialGrantRef": item.root["credentialGrantRef"],
+                    "state": item.root["state"],
+                    "secretPresent": item.root["secretPresent"],
+                    "observedAt": item.root["observedAt"],
+                }
+                for item in grants
+            ],
+            "transferObservations": [
+                {"transferRef": ref, "state": state, "observedAt": timestamp.isoformat()}
+                for ref, state, timestamp in sorted(transfer_states)
+            ],
+            "runnerStopAction": action_snapshot(stop_records, "stopRef").model_dump(
+                mode="json", by_alias=True
+            ),
+            "finalizeAction": action_snapshot(finalize_records, "finalizeRef").model_dump(
+                mode="json", by_alias=True
+            ),
+            "cancelAction": action_snapshot(cancel_records, "cancelRef").model_dump(
+                mode="json", by_alias=True
+            ),
+            "deleteAction": _not_requested_action().model_dump(mode="json", by_alias=True),
+            "outputLossPossible": post_ack_delivery_loss is not None
+            or replacement_reason is not None
+            or deadline_payload["hardDeadlineTriggeredAt"] is not None,
+            "cleanup": cleanup,
+            "gpuRelease": {
+                "state": "complete"
+                if gpu_count
+                and binding_state in {JobBindingState.SUCCEEDED, JobBindingState.FAILED}
+                else ("pending" if gpu_count else "not_required"),
+                "reason": None,
+                "observedAt": observed_at.isoformat(),
+            },
+        }
+        return NativeJobBindingSnapshot.model_validate(payload)
+
+    def _native_runner_role(
+        self,
+        native_spec: Mapping[str, Any],
+        pod: object | None,
+        latest: NativeRunnerGenerationSnapshot | None,
+        observed: Mapping[str, int] | None,
+    ) -> dict[str, Any] | None:
+        status = _named_container_status(pod, "runner") if pod is not None else None
+        if status is None:
+            return None
+        state, reason, _exit, started, finished = _container_state(status)
+        observation = (
+            latest.root["runnerObservation"] if latest else _initial_runner_observation(self._now())
+        )
+        resources = _field(native_spec, "resources", {})
+        accelerator = _field(resources, "accelerator", {})
+        return {
+            "containerId": _optional_text(status, "container_id"),
+            "imageId": _optional_text(status, "image_id"),
+            "state": state.value,
+            "ready": bool(_field(status, "ready", False)),
+            "restartCount": int(_field(status, "restart_count", 0)),
+            "reason": reason,
+            "startedAt": started.isoformat() if started else None,
+            "finishedAt": finished.isoformat() if finished else None,
+            "requested": dict(resources),
+            "observed": {
+                "cpuMillis": None if observed is None else observed.get("cpuMillis"),
+                "memoryMiB": None if observed is None else observed.get("memoryMiB"),
+                "peakEphemeralStorageMiB": None,
+                "acceleratorKind": _field(accelerator, "kind", "none"),
+                "acceleratorCount": int(_field(accelerator, "count", 0)),
+            },
+            "observation": observation,
+        }
+
+    @staticmethod
+    def _native_control_role(pod: object | None) -> dict[str, Any] | None:
+        status = _named_container_status(pod, "control") if pod is not None else None
+        if status is None:
+            return None
+        state, reason, _exit, started, finished = _container_state(status)
+        return {
+            "containerId": _optional_text(status, "container_id"),
+            "imageId": _optional_text(status, "image_id"),
+            "state": state.value,
+            "ready": bool(_field(status, "ready", False)),
+            "restartCount": int(_field(status, "restart_count", 0)),
+            "reason": reason,
+            "startedAt": started.isoformat() if started else None,
+            "finishedAt": finished.isoformat() if finished else None,
+        }
+
+    def _native_activation(
+        self,
+        record: object,
+        pod: object | None,
+        runner: Mapping[str, Any] | None,
+        control: Mapping[str, Any] | None,
+        recipe: ResolvedRuntimeRecipe,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        if pod is None:
+            return None
+        node_name = _optional_path_text(pod, "spec", "node_name")
+        if node_name is None:
+            # The Pod exists but the scheduler has not assigned it yet.  The
+            # binding itself exposes nodeName=null; no activation receipt
+            # exists until KCS can bind it to a concrete node.
+            return None
+        spec_payload = _field(record, "spec_payload", {})
+        native_spec = _field(spec_payload, "native", {})
+        resources = dict(_field(native_spec, "resources", {}))
+        delivery = recipe.root["delivery"]
+        active = bool(runner and control and runner["ready"] and control["ready"])
+        failure = _native_delivery_failure(pod)
+        state = "failed" if failure != "none" else ("active" if active else "pending")
+        if delivery["mode"] == "assembled":
+            delivery_receipt = {
+                "mode": "assembled",
+                "transport": "imageVolume",
+                "environmentImageRef": delivery["environmentImageDigest"],
+                "environmentImageId": runner["imageId"] if runner else None,
+                "platformImageVolumeRef": delivery["platformImageVolumeDigest"],
+                "platformImageVolumeId": None,
+                "runnerImageVolumeRef": delivery["runnerImageVolumeDigest"],
+                "runnerImageVolumeId": None,
+                "controlImageRef": delivery["controlImageDigest"],
+                "controlImageId": control["imageId"] if control else None,
+            }
+        else:
+            delivery_receipt = {
+                "mode": "prebuilt",
+                "prebuiltImageRef": delivery["prebuiltImageDigest"],
+                "prebuiltImageId": runner["imageId"] if runner else None,
+                "platformImageVolumeRef": delivery["platformImageVolumeDigest"],
+                "platformImageVolumeId": None,
+                "controlImageRef": delivery["controlImageDigest"],
+                "controlImageId": control["imageId"] if control else None,
+            }
+        cpu = int(resources["cpuMillis"])
+        memory = int(resources["memoryMiB"])
+        ephemeral = int(resources["ephemeralStorageMiB"])
+        return {
+            "activationRef": f"activation-{str(_field(record, 'job_ref'))}",
+            "assemblyDigest": str(_field(native_spec, "assemblyDigest")),
+            "recipeRef": recipe.root["recipeRef"],
+            "recipeDigest": recipe.root["recipeDigest"],
+            "deliveryReceipt": delivery_receipt,
+            "imageFilesystem": recipe.root["imageFilesystem"],
+            "state": state,
+            "deliveryFailure": failure,
+            "replacementPodCreated": False,
+            "jobUid": str(_field(record, "job_uid")),
+            "podUid": _required_text(pod, "metadata", "uid"),
+            "nodeName": node_name,
+            "requestedResources": resources,
+            "admittedResources": {
+                "cpuRequestMillis": cpu + 250,
+                "cpuLimitMillis": min(cpu * 2, 64000) + 1000,
+                "memoryRequestMiB": memory + 256,
+                "memoryLimitMiB": min(memory * 2, 262144) + 1024,
+                "ephemeralStorageRequestMiB": ephemeral + 256,
+                "ephemeralStorageLimitMiB": min(ephemeral * 2, 262144) + 1024,
+                "accelerator": resources["accelerator"],
+            },
+            "observedResources": (
+                runner["observed"]
+                if runner
+                else {
+                    "cpuMillis": None,
+                    "memoryMiB": None,
+                    "peakEphemeralStorageMiB": None,
+                    "acceleratorKind": None,
+                    "acceleratorCount": None,
+                }
+            ),
+            "activatedAt": (
+                runner["startedAt"] if active and runner and runner["startedAt"] else None
+            ),
+            "observedAt": observed_at.isoformat(),
+        }
+
+    def _native_missing_job_snapshot(self, record: object) -> NativeJobBindingSnapshot:
+        # A native Job that disappeared after UID assignment is intentionally
+        # represented as indeterminate with output loss.  Reuse a minimal
+        # synthetic Job observation so the canonical snapshot stays complete.
+        job = {
+            "metadata": {
+                "uid": str(_field(record, "job_uid")),
+                "resource_version": None,
+                "annotations": {"researchcosmos.io/hard-deadline-seconds": "1"},
+            },
+            "spec": {"active_deadline_seconds": 1},
+            "status": {"conditions": []},
+        }
+        return self._native_snapshot(
+            record,
+            job,
+            (),
+            replacement_reason="the retained native Job is no longer observable",
+        )
 
     def _delete_job(self, job_ref: str, job_uid: str) -> None:
         try:
@@ -4033,11 +5158,109 @@ def _is_deleted(record: object) -> bool:
     return str(_field(record, "state", "")) == "deleted"
 
 
+def _is_native_record(record: object) -> bool:
+    spec = _field(record, "spec_payload", {})
+    return isinstance(spec, Mapping) and isinstance(spec.get("native"), Mapping)
+
+
 def _workspace_gpu(record: object) -> int:
     spec = _field(record, "spec_payload", {})
+    native = _field(spec, "native", None)
+    if isinstance(native, Mapping):
+        resources = _field(native, "resources", {})
+        accelerator = _field(resources, "accelerator", {})
+        return int(_field(accelerator, "count", 0))
     workspace = _field(spec, "workspace", {})
     resources = _field(workspace, "resources", {})
     return int(_field(resources, "gpu", 0))
+
+
+def _named_container_status(pod: object | None, name: str) -> object | None:
+    if pod is None:
+        return None
+    return next(
+        (
+            item
+            for item in (_path(pod, "status", "container_statuses") or ())
+            if _field(item, "name", None) == name
+        ),
+        None,
+    )
+
+
+def _initial_runner_observation(observed_at: datetime) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "state": "starting",
+        "sequence": 1,
+        "childPid": None,
+        "processExit": {"kind": "not_observed", "exitCode": None, "signal": None},
+        "stopCause": "none",
+        "protocolTerminal": {
+            "observed": False,
+            "eventKind": None,
+            "stopReason": None,
+            "errorCode": None,
+        },
+        "childStartedAt": None,
+        "childFinishedAt": None,
+        "observedAt": observed_at.isoformat(),
+    }
+    payload["stateDigest"] = canonical_digest(payload)
+    return payload
+
+
+def _native_generation(binding: NativeJobBindingSnapshot) -> int:
+    return _native_generation_from_values(binding.root)
+
+
+def _native_generation_from_values(values: Mapping[str, Any]) -> int:
+    generation = values.get("latestRunnerGeneration")
+    if not isinstance(generation, Mapping):
+        raise StateConflictError("native runner generation is not active")
+    value = generation.get("generation")
+    if type(value) is not int or value < 1:
+        raise StateConflictError("native runner generation identity is invalid")
+    return value
+
+
+def _native_delivery_failure(pod: object) -> str:
+    reason = str(_path(pod, "status", "reason") or "").casefold()
+    message = str(_path(pod, "status", "message") or "").casefold()
+    combined = f"{reason} {message}"
+    if "evict" in combined:
+        return "emptydir_evicted"
+    if "enospc" in combined or "no space left" in combined:
+        return "enospc"
+    for status in _path(pod, "status", "container_statuses") or ():
+        waiting_reason = str(_path(status, "state", "waiting", "reason") or "")
+        if waiting_reason in {"ImagePullBackOff", "ErrImagePull"}:
+            return "image_pull"
+    return "none"
+
+
+def _native_post_ack_delivery_loss(
+    activation: Mapping[str, Any] | None,
+    generation: NativeRunnerGenerationSnapshot | None,
+) -> str | None:
+    """Classify destructive delivery loss only after runner start ACK."""
+
+    if activation is None or generation is None:
+        return None
+    failure = str(activation.get("deliveryFailure", "none"))
+    if failure not in {"enospc", "emptydir_evicted"}:
+        return None
+    return failure if generation.root.get("credentialAcknowledgedAt") is not None else None
+
+
+def _prometheus_counter_lines(
+    metric: str,
+    label: str,
+    values: Mapping[str, int],
+) -> list[str]:
+    return [
+        f'{metric}{{{label}="{value}"}} {count}'
+        for value, count in sorted(values.items())
+    ]
 
 
 def _binding_state(

@@ -1,0 +1,70 @@
+"""Operator-curated exact native runtime recipe registry."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+
+from .errors import InvalidRequestError, RuntimeRecipeForbiddenError
+from .native_contracts import ResolvedRuntimeRecipe
+
+
+class NativeRecipeRegistry:
+    """Resolve one immutable recipe without becoming a scheduling authority."""
+
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._recipes: dict[tuple[str, str], ResolvedRuntimeRecipe] = {}
+        if path is not None:
+            self._load(path)
+
+    def _load(self, path: Path) -> None:
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("native recipe registry is unreadable") from error
+        if not isinstance(document, dict) or set(document) != {"version", "recipes"}:
+            raise ValueError("native recipe registry must contain only version and recipes")
+        if document["version"] != 1 or not isinstance(document["recipes"], list):
+            raise ValueError("native recipe registry version is unsupported")
+        for item in document["recipes"]:
+            if not isinstance(item, dict) or set(item) != {"recipe", "requires", "provides"}:
+                raise ValueError("native recipe entry has an invalid shape")
+            requires = item["requires"]
+            provides = item["provides"]
+            if (
+                not isinstance(requires, list)
+                or not isinstance(provides, list)
+                or any(not isinstance(value, str) or not value for value in requires + provides)
+                or not set(requires).issubset(provides)
+            ):
+                raise ValueError("native recipe requires must be a subset of provides")
+            recipe = ResolvedRuntimeRecipe.model_validate(item["recipe"])
+            key = (recipe.runner_ref, recipe.environment_profile_ref)
+            if key in self._recipes:
+                raise ValueError("native recipe registry contains a duplicate pair")
+            self._recipes[key] = recipe
+
+    def resolve(self, runner_ref: str, environment_profile_ref: str) -> ResolvedRuntimeRecipe:
+        if not runner_ref or not environment_profile_ref:
+            raise InvalidRequestError("runnerRef and environmentProfileRef are required")
+        recipe = self._recipes.get((runner_ref, environment_profile_ref))
+        if recipe is None:
+            raise RuntimeRecipeForbiddenError()
+        payload = recipe.wire()
+        payload["observedAt"] = self._clock().isoformat()
+        return ResolvedRuntimeRecipe.model_validate(payload)
+
+    @property
+    def count(self) -> int:
+        return len(self._recipes)
+
+
+__all__ = ["NativeRecipeRegistry"]

@@ -14,7 +14,7 @@
     "imageFsUnpackedBytes": 1400000000
   },
   "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
-  "runnerEntrypoint": ["/opt/rc/bin/codex", "exec"],
+  "runnerEntrypoint": ["/opt/rc/bin/codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],
   "controlCommand": ["/opt/kcs/workspace-sidecar", "rpc"],
   "launcherSocketPath": "/run/rc-control/launcher.sock",
   "identity": {

@@ -47,6 +47,16 @@ data:
       - job_name: kcs-prometheus
         static_configs:
           - targets: [127.0.0.1:9090]
+      - job_name: kcs-v2-api
+        scheme: https
+        authorization:
+          type: Bearer
+          credentials_file: /var/run/kcs-auth/service-token
+        tls_config:
+          ca_file: /var/run/kcs-api-ca/ca.crt
+          server_name: kcs-v2-api.researchcosmos-v2.svc.cluster.local
+        static_configs:
+          - targets: [kcs-v2-api.researchcosmos-v2.svc.cluster.local:443]
       - job_name: kcs-kube-state-metrics
         static_configs:
           - targets: [kcs-kube-state-metrics.kcs-monitoring.svc.cluster.local:8080]
@@ -158,6 +168,55 @@ data:
             annotations:
               summary: A KCS managed workload has remained Pending
               runbook: deploy/v2/monitoring/RUNBOOK.md#kcsmanagedpodpending
+          - alert: KcsNativeMetricsUnavailable
+            expr: absent(up{job="kcs-v2-api"}) or up{job="kcs-v2-api"} == 0
+            for: 5m
+            labels: {severity: warning}
+            annotations:
+              summary: KCS native lifecycle metrics are unavailable
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativemetricsunavailable
+          - alert: KcsNativeStopFailed
+            expr: kcs_native_runner_stop_actions{state=~"failed|indeterminate"} > 0
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: A native stopRunner action failed or became indeterminate
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativestopfailed
+          - alert: KcsNativeHardDeadline
+            expr: kcs_native_hard_deadline_triggered > 0
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: A native Job reached its hard deadline
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativeharddeadline
+          - alert: KcsNativeStorageFailure
+            expr: kcs_native_recipe_activations{delivery_failure=~"enospc|emptydir_evicted"} > 0
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: Native delivery lost writable ephemeral storage
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativestoragefailure
+          - alert: KcsNativeOutputLossPossible
+            expr: kcs_native_output_loss_possible > 0
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: A native Attempt may have lost output
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativeoutputlosspossible
+          - alert: KcsNativeCredentialProjectionFailed
+            expr: kcs_native_credentials{state=~"expired|indeterminate"} > 0
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: A native runner credential projection expired or became indeterminate
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativecredentialprojectionfailed
+          - alert: KcsNativeRecipeForbiddenSurge
+            expr: increase(kcs_native_recipe_forbidden_total[5m]) >= 5
+            for: 0m
+            labels: {severity: warning}
+            annotations:
+              summary: Native runtime recipe refusals increased sharply
+              runbook: deploy/v2/monitoring/RUNBOOK.md#kcsnativerecipeforbiddensurge
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -223,6 +282,8 @@ spec:
             - {name: config, mountPath: /etc/prometheus/prometheus.yml, subPath: prometheus.yml, readOnly: true}
             - {name: rules, mountPath: /etc/prometheus/rules, readOnly: true}
             - {name: data, mountPath: /prometheus}
+            - {name: kcs-auth, mountPath: /var/run/kcs-auth, readOnly: true}
+            - {name: kcs-api-ca, mountPath: /var/run/kcs-api-ca, readOnly: true}
       volumes:
         - name: config
           configMap: {name: kcs-prometheus-config}
@@ -230,6 +291,10 @@ spec:
           configMap: {name: kcs-prometheus-rules}
         - name: data
           persistentVolumeClaim: {claimName: kcs-prometheus-data}
+        - name: kcs-auth
+          secret: {secretName: kcs-v2-service-token}
+        - name: kcs-api-ca
+          secret: {secretName: kcs-v2-api-ca}
 ---
 apiVersion: v1
 kind: Service

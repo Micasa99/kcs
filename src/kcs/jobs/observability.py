@@ -616,7 +616,7 @@ class RuntimeEventCollector:
 
 
 class V2Observability:
-    """Public service boundary shared by the three additive V2.3 routes."""
+    """Public service boundary shared by the additive V2 observability routes."""
 
     def __init__(
         self,
@@ -647,6 +647,42 @@ class V2Observability:
 
     def collect(self) -> int:
         return self._collector.collect()
+
+    def record_runner_phase(
+        self,
+        job_ref: str,
+        compute_node: str | None,
+        generation: int,
+        observation: Mapping[str, object],
+    ) -> bool:
+        """Persist one deduplicated launcher-authored runner transition."""
+        process_exit = observation.get("processExit")
+        protocol_terminal = observation.get("protocolTerminal")
+        if not isinstance(process_exit, Mapping) or not isinstance(
+            protocol_terminal, Mapping
+        ):
+            raise DependencyUnavailableError("native runner observation is malformed")
+        detail: dict[str, object] = {
+            "generation": generation,
+            "state": observation["state"],
+            "sequence": observation["sequence"],
+            "stateDigest": observation["stateDigest"],
+            "stopCause": observation["stopCause"],
+            "processExitKind": process_exit["kind"],
+            "exitCode": process_exit.get("exitCode"),
+            "signal": process_exit.get("signal"),
+            "protocolTerminalObserved": protocol_terminal["observed"],
+        }
+        observed_at = _parse_time(observation.get("observedAt")) or self._aware_now()
+        return self._events.record_state(
+            f"runner:{job_ref}:{generation}",
+            str(observation["stateDigest"]),
+            kind=RuntimeEventKind.RUNNER_PHASE,
+            job_ref=job_ref,
+            compute_node=compute_node,
+            detail=detail,
+            occurred_at=observed_at,
+        )
 
     def _node_payloads(self, samples: Sequence[_Sample]) -> list[NodeTelemetrySnapshot]:
         node_values: dict[str, dict[str, float]] = {}

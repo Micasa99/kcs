@@ -229,8 +229,8 @@ EXPECTED_ROOT_LIMITS = {
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "ebd665ee1630216cd2ae4f56f59627aa524a3a91c7219bf5814b8dc6872e5acc"
-CANONICAL_OPENAPI_SHA256 = "5d47e071cf515f89ffd66837989e511819d2b1d26366d466dfe0f2eac59bac38"
+CANONICAL_X_KCS_POLICY_SHA256 = "34aab1f7958f0866ead568c8a36a510b62c0021cbdf3d69ef35fa5080c239e2d"
+CANONICAL_OPENAPI_SHA256 = "61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -1199,7 +1199,7 @@ def _validate_contract_extensions(document: dict[str, Any]) -> None:
     if (
         info.get("x-kcs-features") != EXPECTED_ROOT_FEATURES
         or info.get("x-kcs-limits") != EXPECTED_ROOT_LIMITS
-        or document.get("x-kcs-contract-status") != "dormant"
+        or document.get("x-kcs-contract-status") != "active"
         or document.get("x-kcs-legacy-authorization") != expected_legacy_authorization
         or document.get("x-kcs-network-boundary") != expected_network_boundary
     ):

@@ -77,7 +77,7 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     )
     digest = hashlib.sha256(packaged).hexdigest()
     assert packaged == canonical
-    assert digest == "965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526"
+    assert digest == "61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc"
     events.append({"event": "canonical_package_resource", "sha256": digest})
 
     namespace = _documents("deploy/v2/namespace.yaml")[0]
@@ -144,7 +144,24 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
     assert container["livenessProbe"]["httpGet"]["scheme"] == "HTTPS"
     assert "ephemeral-storage" in container["resources"]["requests"]
     assert "ephemeral-storage" in container["resources"]["limits"]
-    assert {volume["name"] for volume in pod["volumes"]} == {"tls", "tmp", "state"}
+    assert {volume["name"] for volume in pod["volumes"]} == {
+        "tls",
+        "tmp",
+        "state",
+        "native-runtime-config",
+    }
+    native_config = _documents("deploy/v2/native-runtime-config.yaml")[0]
+    assert json.loads(native_config["data"]["recipes.json"]) == {"version": 1, "recipes": []}
+    assert all(
+        native_config["data"][key].startswith("https://")
+        for key in ("openai-base-url", "anthropic-base-url")
+    )
+    network_policy = _documents("deploy/v2/native-network-policy.example.yaml")[0]
+    assert network_policy["spec"]["podSelector"]["matchLabels"][
+        "researchcosmos.io/runtime-lane"
+    ] == "native"
+    assert network_policy["spec"]["policyTypes"] == ["Ingress", "Egress"]
+    assert network_policy["spec"]["ingress"] == []
     assert service["spec"]["type"] == "ClusterIP"
     assert service["spec"]["ports"] == [{"name": "https", "port": 443, "targetPort": "https"}]
     events.append({"event": "api_manifest_contract", "imageState": "non_runnable_placeholder"})
@@ -174,6 +191,14 @@ def test_task9_packaging_journey(tmp_path: Path) -> None:
         assert 'org.opencontainers.image.licenses="MIT"' in text
         assert "setuptools==80.9.0" in text and "wheel==0.45.1" in text
         assert "--no-build-isolation" in text
+    launcher_containerfile = (ROOT / "native/launcher/Containerfile").read_text()
+    launcher_from = [
+        line for line in launcher_containerfile.splitlines() if line.startswith("FROM ")
+    ]
+    assert launcher_from and all(
+        line == "FROM scratch" or ("linux/amd64" in line and "@sha256:" in line)
+        for line in launcher_from
+    )
     requirements = [
         line
         for line in (ROOT / "requirements.lock").read_text().splitlines()

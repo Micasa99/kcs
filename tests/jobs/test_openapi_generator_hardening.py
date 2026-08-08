@@ -514,6 +514,7 @@ def test_actual_route_extensions_exclude_identity_and_bind_projected_payload() -
     module = _load_generator_module()
     document = yaml.safe_load(SOURCE.read_text())
     examples = SOURCE.parent / "examples"
+    native_fixtures = SOURCE.parent / "native-fixtures"
     cases = {
         "createJob": ("jobs.json", "create-new"),
         "grantCredential": ("credentials.json", "grant-new"),
@@ -528,24 +529,58 @@ def test_actual_route_extensions_exclude_identity_and_bind_projected_payload() -
         "cancelJob": ("jobs.json", "cancel-output-loss"),
         "deleteJob": ("jobs.json", "delete-tombstone"),
     }
+    native_requests = {
+        "grantRunnerCredential": {
+            "request": {
+                "headers": {
+                    "KCS-Credential-Grant-Ref": "runner-grant-001",
+                    "KCS-Credential-Kind": "modelGatewayToken",
+                    "KCS-Agent-Run-Ref": "agent-run-001",
+                    "KCS-Generation": "1",
+                    "KCS-Native-Launch-Digest": "6" * 64,
+                    "KCS-Audience": "model-gateway",
+                    "KCS-Credential-SHA256": "4" * 64,
+                    "KCS-Projection-TTL-Seconds": "180",
+                    "KCS-Job-UID": "11111111-1111-4111-8111-111111111111",
+                    "KCS-Pod-UID": "22222222-2222-4222-8222-222222222222",
+                }
+            },
+            "bodyBytes": b"synthetic-native-runner-credential",
+        },
+        "startRunner": {
+            "request": {},
+            "body": json.loads((native_fixtures / "runner-start-request.json").read_text()),
+        },
+        "stopRunner": {
+            "request": {},
+            "body": json.loads((native_fixtures / "runner-stop-request.json").read_text()),
+        },
+    }
     operations = {
         operation["operationId"]: operation
         for path_item in document["paths"].values()
         for method, operation in path_item.items()
         if method in {"post", "put", "delete"} and "x-kcs-digest-projection" in operation
     }
-    assert set(cases) == set(operations)
+    assert set(cases) | set(native_requests) == set(operations)
 
-    for operation_id, (bundle_name, scenario) in cases.items():
-        bundle = json.loads((examples / bundle_name).read_text())
-        exchange = next(item for item in bundle["exchanges"] if item["scenario"] == scenario)
-        request = json.loads(json.dumps(exchange["request"]))
-        body = None
-        body_bytes = None
-        if "bodyFixture" in request:
-            body = json.loads((examples / request["bodyFixture"]).read_text())
-        elif "bodyFile" in request:
-            body_bytes = (examples / request["bodyFile"]).read_bytes()
+    for operation_id in operations:
+        if operation_id in native_requests:
+            native_request = native_requests[operation_id]
+            request = json.loads(json.dumps(native_request["request"]))
+            body = native_request.get("body")
+            body_bytes = native_request.get("bodyBytes")
+        else:
+            bundle_name, scenario = cases[operation_id]
+            bundle = json.loads((examples / bundle_name).read_text())
+            exchange = next(item for item in bundle["exchanges"] if item["scenario"] == scenario)
+            request = json.loads(json.dumps(exchange["request"]))
+            body = None
+            body_bytes = None
+            if "bodyFixture" in request:
+                body = json.loads((examples / request["bodyFixture"]).read_text())
+            elif "bodyFile" in request:
+                body_bytes = (examples / request["bodyFile"]).read_bytes()
         extension = operations[operation_id]["x-kcs-digest-projection"]
         definition = (
             extension["storedIntegrityDigest"]
@@ -630,6 +665,10 @@ def test_actual_route_extensions_exclude_identity_and_bind_projected_payload() -
                     payload_body["spec"]["drainTimeoutSeconds"] += 1
                 elif operation_id == "cancelJob":
                     payload_body["spec"]["reason"] = "changed-reason"
+                elif operation_id == "startRunner":
+                    payload_body["descriptor"]["executionEnvelopeRef"] = "changed-envelope"
+                elif operation_id == "stopRunner":
+                    payload_body["spec"]["reason"] = "cancel_requested"
                 else:
                     raise AssertionError(f"missing schema-valid payload mutation: {operation_id}")
                 changed_projection = module._projected_digest(

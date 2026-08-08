@@ -272,11 +272,16 @@ def test_job_binding_snapshot_exposes_recoverable_kubernetes_reality() -> None:
         success = "201" if operation_id == "createJob" else "200"
         schema = operation["responses"][success]["content"]["application/json"]["schema"]
         expected_ref = (
-            "#/components/schemas/JobBindingSnapshotList"
+            "#/components/schemas/AnyJobBindingSnapshotList"
             if operation_id == "listJobs"
-            else "#/components/schemas/JobBindingSnapshot"
+            else "#/components/schemas/AnyJobBindingSnapshot"
         )
         assert schema == {"$ref": expected_ref}
+
+    assert schemas["AnyJobBindingSnapshot"]["oneOf"] == [
+        {"$ref": "#/components/schemas/JobBindingSnapshot"},
+        {"$ref": "#/components/schemas/NativeJobBindingSnapshot"},
+    ]
 
 
 def test_list_and_logs_freeze_filters_ordering_and_cursor_recovery() -> None:
@@ -447,6 +452,9 @@ def test_transfer_contract_freezes_relative_paths_direct_mode_and_recovery() -> 
         "transferModes": ["direct"],
         "rangeRequests": False,
         "signedTransfers": False,
+        "nativeRunner": True,
+        "runtimeRecipeDeliveryDefault": "assembled.imageVolume",
+        "runtimeRecipeDeliveryModes": ["assembled", "prebuilt"],
     }
     snapshot = schemas["TransferSnapshot"]
     assert {
@@ -622,6 +630,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "retry_same",
         "inspect_job",
         "inspect_grant",
+        "inspect_runner_credential_grant",
         "inspect_transfer",
         "inspect_operation",
         "inspect_terminal",
@@ -653,6 +662,11 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "grantCredential": "v2-private-credential-writer",
         "inspectCredentialGrant": "v2-reader",
         "startAgent": "v2-mutator",
+        "grantRunnerCredential": "v2-private-credential-writer",
+        "inspectRunnerCredentialGrant": "v2-reader",
+        "startRunner": "v2-mutator",
+        "stopRunner": "v2-mutator",
+        "resolveRuntimeRecipe": "v2-reader",
         "registerTransfer": "v2-mutator",
         "inspectTransfer": "v2-reader",
         "discardTransfer": "v2-mutator",
@@ -717,7 +731,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "source": "exact-response-bytes",
         "encoding": "lowercase-hex",
     }
-    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.3.0"
+    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.4.0"
     assert discovery["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
     assert document["x-kcs-legacy-authorization"] == {
         "v2NamespaceAccess": "denied",

@@ -411,6 +411,7 @@ class RuntimeEventKind(StrEnum):
     IMAGE_PULL = "image_pull"
     SCHEDULING = "scheduling"
     OOM = "oom"
+    RUNNER_PHASE = "runner_phase"
 
 
 EventDetailValue = StrictStr | StrictInt | StrictBool | None | list[StrictStr]

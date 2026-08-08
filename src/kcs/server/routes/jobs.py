@@ -40,7 +40,6 @@ from kcs.jobs.contracts import (
     JobBindingSnapshotList,
     JobBindingState,
     JobTombstone,
-    LogContainer,
     NodeTelemetryList,
     NvidiaTelemetrySnapshot,
     ObservabilityHealth,
@@ -64,6 +63,21 @@ from kcs.jobs.errors import (
     PayloadTooLargeError,
     TransferBytesMismatchError,
 )
+from kcs.jobs.native_contracts import (
+    AnyJobBindingSnapshotList,
+    NativeCreateJobRequest,
+    NativeFinalizeJobRequest,
+    NativeJobBindingSnapshot,
+    NativeRoleLogs,
+    NativeRunnerGenerationSnapshot,
+    NativeTerminalSessionSnapshot,
+    ResolvedRuntimeRecipe,
+    RunnerCredentialGrantSnapshot,
+    RunnerStartRequest,
+    RunnerStopRequest,
+    RunnerStopSnapshot,
+)
+from kcs.jobs.native_runtime import RunnerCredentialGrantMetadata
 from kcs.jobs.provider import (
     DEFAULT_LOG_LIMIT_BYTES,
     DEFAULT_PAGE_SIZE,
@@ -74,7 +88,7 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.3.0"
+API_VERSION = "2.4.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -217,7 +231,7 @@ def _require_json_media_type(request: Request) -> None:
     if request.method not in {"POST", "PUT", "PATCH"}:
         return
     media_type = request.headers.get("content-type", "").partition(";")[0].strip()
-    if request.url.path.endswith("/agent/credential-grants"):
+    if request.url.path.endswith(("/agent/credential-grants", "/runner/credential-grants")):
         if media_type.lower() != "application/octet-stream":
             raise _CredentialMediaTypeError
         return
@@ -396,18 +410,50 @@ def create_jobs_router(
     def get_queue() -> Response:
         return _json_model(provider.queue())
 
+    @router.get(
+        "/api/v2/runtime-recipes/resolve",
+        operation_id="resolveRuntimeRecipe",
+        tags=["Jobs"],
+        response_model=ResolvedRuntimeRecipe,
+        responses=_error_responses(400, 401, 403, 422, 500, 503),
+    )
+    def resolve_runtime_recipe(
+        runner_ref: Annotated[
+            str,
+            Query(
+                alias="runnerRef",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        environment_profile_ref: Annotated[
+            str,
+            Query(
+                alias="environmentProfileRef",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(provider.resolve_runtime_recipe(runner_ref, environment_profile_ref))
+
     @router.post(
         "/api/v2/jobs",
         operation_id="createJob",
         tags=["Jobs"],
         status_code=201,
-        response_model=JobBindingSnapshot,
+        response_model=JobBindingSnapshot | NativeJobBindingSnapshot,
         responses={
-            200: {"model": JobBindingSnapshot, "description": "Stable create replay."},
+            200: {
+                "model": JobBindingSnapshot | NativeJobBindingSnapshot,
+                "description": "Stable create replay.",
+            },
             **_error_responses(400, 401, 403, 409, 410, 413, 415, 422, 429, 500, 503, 504),
         },
     )
-    def create_job(payload: CreateJobRequest) -> Response:
+    def create_job(payload: CreateJobRequest | NativeCreateJobRequest) -> Response:
         result = provider.create(payload)
         return _json_model(result.snapshot, status_code=201 if result.created else 200)
 
@@ -415,7 +461,7 @@ def create_jobs_router(
         "/api/v2/jobs",
         operation_id="listJobs",
         tags=["Jobs"],
-        response_model=JobBindingSnapshotList,
+        response_model=JobBindingSnapshotList | AnyJobBindingSnapshotList,
         responses=_error_responses(400, 401, 403, 409, 429, 500, 503),
     )
     def list_jobs(
@@ -475,7 +521,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}",
         operation_id="inspectJob",
         tags=["Jobs"],
-        response_model=JobBindingSnapshot,
+        response_model=JobBindingSnapshot | NativeJobBindingSnapshot,
         responses=_error_responses(401, 403, 404, 410, 500, 503),
     )
     def inspect_job(
@@ -490,7 +536,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/logs",
         operation_id="getRoleLogs",
         tags=["Jobs"],
-        response_model=RoleLogs,
+        response_model=RoleLogs | NativeRoleLogs,
         responses=_error_responses(400, 401, 403, 404, 409, 410, 500, 503),
     )
     def get_role_logs(
@@ -498,7 +544,7 @@ def create_jobs_router(
             str,
             ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN),
         ],
-        container: Annotated[LogContainer, Query()],
+        container: Annotated[Literal["agent", "workspace", "runner", "control"], Query()],
         cursor: Annotated[
             str | None,
             Query(min_length=1, max_length=4096, pattern=_OPAQUE_TOKEN_PATTERN),
@@ -530,9 +576,12 @@ def create_jobs_router(
         operation_id="createTerminalSession",
         tags=["Workspace terminal"],
         status_code=201,
-        response_model=TerminalSessionSnapshot,
+        response_model=TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
         responses={
-            200: {"model": TerminalSessionSnapshot, "description": "Stable session replay."},
+            200: {
+                "model": TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
+                "description": "Stable session replay.",
+            },
             **_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503, 504),
         },
     )
@@ -552,7 +601,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
         operation_id="inspectTerminalSession",
         tags=["Workspace terminal"],
-        response_model=TerminalSessionSnapshot,
+        response_model=TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
         responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
     )
     def inspect_terminal_session(
@@ -577,7 +626,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input",
         operation_id="writeTerminalInput",
         tags=["Workspace terminal"],
-        response_model=TerminalSessionSnapshot,
+        response_model=TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 410, 413, 415, 500, 503),
     )
     async def write_terminal_input(
@@ -632,7 +681,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize",
         operation_id="resizeTerminalSession",
         tags=["Workspace terminal"],
-        response_model=TerminalSessionSnapshot,
+        response_model=TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503),
     )
     def resize_terminal_session(
@@ -657,7 +706,7 @@ def create_jobs_router(
         "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
         operation_id="closeTerminalSession",
         tags=["Workspace terminal"],
-        response_model=TerminalSessionSnapshot,
+        response_model=TerminalSessionSnapshot | NativeTerminalSessionSnapshot,
         responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
     )
     def close_terminal_session(
@@ -671,6 +720,150 @@ def create_jobs_router(
                 job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
             )
         )
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/runner/credential-grants",
+        operation_id="grantRunnerCredential",
+        tags=["Credentials"],
+        status_code=201,
+        response_model=RunnerCredentialGrantSnapshot,
+        responses={
+            200: {
+                "model": RunnerCredentialGrantSnapshot,
+                "description": "Stable runner credential replay.",
+            },
+            **_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503),
+        },
+    )
+    async def grant_runner_credential(
+        request: Request,
+        job_ref: Annotated[
+            str,
+            ApiPath(
+                alias="jobRef",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        credential_grant_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Credential-Grant-Ref",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        credential_sha256: Annotated[
+            str, Header(alias="KCS-Credential-SHA256", pattern=_SHA256_PATTERN)
+        ],
+        grant_metadata_digest: Annotated[
+            str, Header(alias="KCS-Grant-Metadata-Digest", pattern=_SHA256_PATTERN)
+        ],
+        credential_kind: Annotated[
+            Literal["modelGatewayToken"], Header(alias="KCS-Credential-Kind")
+        ],
+        agent_run_ref: Annotated[
+            str,
+            Header(
+                alias="KCS-Agent-Run-Ref",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        generation: Annotated[int, Header(alias="KCS-Generation", ge=1)],
+        native_launch_digest: Annotated[
+            str, Header(alias="KCS-Native-Launch-Digest", pattern=_SHA256_PATTERN)
+        ],
+        audience: Annotated[
+            str,
+            Header(
+                alias="KCS-Audience",
+                min_length=1,
+                max_length=256,
+                pattern=_OPAQUE_REF_PATTERN,
+            ),
+        ],
+        job_uid: Annotated[UUID, Header(alias="KCS-Job-UID")],
+        pod_uid: Annotated[UUID, Header(alias="KCS-Pod-UID")],
+        projection_ttl_seconds: Annotated[
+            int, Header(alias="KCS-Projection-TTL-Seconds", ge=120, le=900)
+        ],
+    ) -> Response:
+        metadata = RunnerCredentialGrantMetadata(
+            credential_grant_ref=credential_grant_ref,
+            credential_sha256=credential_sha256,
+            grant_metadata_digest=grant_metadata_digest,
+            kind=credential_kind,
+            agent_run_ref=agent_run_ref,
+            generation=generation,
+            native_launch_digest=native_launch_digest,
+            audience=audience,
+            projection_ttl_seconds=projection_ttl_seconds,
+            job_uid=str(job_uid),
+            pod_uid=str(pod_uid),
+        )
+        result = provider.grant_runner_credential_result(
+            job_ref, metadata, await _credential_body(request)
+        )
+        return _json_model(result.snapshot, status_code=201 if result.created else 200)
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/runner/credential-grants/{credentialGrantRef}",
+        operation_id="inspectRunnerCredentialGrant",
+        tags=["Credentials"],
+        response_model=RunnerCredentialGrantSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 500, 503),
+    )
+    def inspect_runner_credential_grant(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        credential_grant_ref: Annotated[str, ApiPath(alias="credentialGrantRef")],
+    ) -> Response:
+        return _json_model(provider.inspect_runner_credential_grant(job_ref, credential_grant_ref))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/runner/start",
+        operation_id="startRunner",
+        tags=["Jobs"],
+        status_code=202,
+        response_model=NativeRunnerGenerationSnapshot,
+        responses={
+            200: {
+                "model": NativeRunnerGenerationSnapshot,
+                "description": "Stable runner generation replay.",
+            },
+            **_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
+        },
+    )
+    def start_runner(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        payload: RunnerStartRequest,
+    ) -> Response:
+        result = provider.start_runner(job_ref, payload)
+        return _json_model(result, status_code=200 if result.root["replayed"] else 202)
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/runner/stop",
+        operation_id="stopRunner",
+        tags=["Jobs"],
+        status_code=202,
+        response_model=RunnerStopSnapshot,
+        responses={
+            200: {
+                "model": RunnerStopSnapshot,
+                "description": "Stable runner stop replay.",
+            },
+            **_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
+        },
+    )
+    def stop_runner(
+        job_ref: Annotated[str, ApiPath(alias="jobRef")],
+        payload: RunnerStopRequest,
+    ) -> Response:
+        result = provider.stop_runner(job_ref, payload)
+        return _json_model(result.snapshot, status_code=202 if result.created else 200)
 
     @router.post(
         "/api/v2/jobs/{jobRef}/agent/credential-grants",
@@ -992,14 +1185,14 @@ def create_jobs_router(
         operation_id="finalizeJob",
         tags=["Jobs"],
         status_code=202,
-        response_model=JobBindingSnapshot,
+        response_model=JobBindingSnapshot | NativeJobBindingSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
     )
     def finalize_job(
         job_ref: Annotated[
             str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
         ],
-        payload: FinalizeJobRequest,
+        payload: FinalizeJobRequest | NativeFinalizeJobRequest,
     ) -> Response:
         result = provider.finalize(job_ref, payload)
         return _json_model(result.snapshot, status_code=202 if result.created else 200)
@@ -1009,7 +1202,7 @@ def create_jobs_router(
         operation_id="cancelJob",
         tags=["Jobs"],
         status_code=202,
-        response_model=JobBindingSnapshot,
+        response_model=JobBindingSnapshot | NativeJobBindingSnapshot,
         responses=_error_responses(400, 401, 403, 404, 409, 415, 422, 500, 503, 504),
     )
     def cancel_job(

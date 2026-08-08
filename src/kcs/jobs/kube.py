@@ -29,9 +29,9 @@ from .errors import (
     StaleCursorError,
 )
 
-Role = Literal["agent", "workspace"]
+Role = Literal["agent", "workspace", "runner", "control"]
 
-_ROLE_NAMES = frozenset(("agent", "workspace"))
+_ROLE_NAMES = frozenset(("agent", "workspace", "runner", "control"))
 _TIMESTAMPED_LOG_LINE = re.compile(r"^(\S+) ?(.*)$")
 
 
@@ -289,7 +289,7 @@ class V2KubeAdapter:
         cursor: str | None,
         limit_bytes: int,
     ) -> LogRead:
-        """Read a bounded timestamp-based page for ``agent`` or ``workspace``.
+        """Read a bounded timestamp-based page for one hosted or native role.
 
         Kubernetes does not expose a byte-offset log API.  The cursor therefore stores
         the last Kubernetes log timestamp and is bound to namespace, Job, Pod UID and
@@ -298,7 +298,7 @@ class V2KubeAdapter:
         reported through ``truncated``, and does not advance the timestamp boundary.
         """
         if container not in _ROLE_NAMES:
-            raise ValueError("container must be 'agent' or 'workspace'")
+            raise ValueError("container must be agent, workspace, runner, or control")
         role = cast(Role, container)
         if limit_bytes < 1:
             raise ValueError("limit_bytes must be positive")
@@ -520,11 +520,12 @@ class V2KubeAdapter:
         pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
         pod_name = str(_value(_value(pod, "metadata"), "name"))
         exec_core = self._exec_core_api_factory()
+        native = binding.get("runtimeLane") == "native"
         websocket: Any = stream(
             exec_core.connect_get_namespaced_pod_exec,
             pod_name,
             self.namespace,
-            container="workspace",
+            container="control" if native else "workspace",
             command=["/opt/kcs/workspace-sidecar", "rpc"],
             stderr=True,
             stdin=True,
@@ -592,11 +593,12 @@ class V2KubeAdapter:
             raise ValueError("readonly Workspace exec parameters are invalid")
         pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
         pod_name = str(_value(_value(pod, "metadata"), "name"))
+        native = binding.get("runtimeLane") == "native"
         websocket: Any = stream(
             self._exec_core_api_factory().connect_get_namespaced_pod_exec,
             pod_name,
             self.namespace,
-            container="workspace",
+            container="runner" if native else "workspace",
             command=list(command),
             stderr=True,
             stdin=False,

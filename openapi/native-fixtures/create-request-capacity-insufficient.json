@@ -1,0 +1,29 @@
+{
+  "providerRequestId": "native-provider-capacity-001",
+  "specDigest": "abababababababababababababababababababababababababababababababab",
+  "spec": {
+    "subjectRef": "subject-native-capacity-001",
+    "runtimePlanDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sharedWorkspace": {"kind": "ephemeral", "mountPath": "/workspace", "sizeLimitGiB": 20},
+    "native": {
+      "runnerRef": "runner-codex",
+      "environmentProfileRef": "env-default",
+      "taskPath": "/workspace/worktree/TASK.md",
+      "runnerDeadlineSeconds": 3600,
+      "selectedModelProtocol": "openai-responses",
+      "modelEnv": {
+        "OPENAI_BASE_URL": "https://model-gateway.example/openai/v1",
+        "ANTHROPIC_BASE_URL": "https://model-gateway.example/anthropic",
+        "MODEL_ROUTE": "route-default",
+        "RC_MODEL_GATEWAY_TOKEN_FILE": "/var/run/rc/model-gateway/token"
+      },
+      "resources": {
+        "cpuMillis": 2000,
+        "memoryMiB": 4096,
+        "ephemeralStorageMiB": 128,
+        "accelerator": {"kind": "nvidia-gpu", "count": 1}
+      },
+      "assemblyDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  }
+}

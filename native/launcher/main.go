@@ -1,0 +1,1087 @@
+// rc-native-launcher is the native runtime PID 1 and the only process owner.
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/creack/pty"
+)
+
+const (
+	controlDir = "/run/rc-control"
+	socketPath = controlDir + "/launcher.sock"
+	statePath  = controlDir + "/runner-state.json"
+	tokenPath  = "/var/run/rc/model-gateway/token"
+	worktree   = "/workspace/worktree"
+	maxFrame   = 131072
+	maxPTYData = 65536
+)
+
+type processExit struct {
+	Kind     string `json:"kind"`
+	ExitCode *int   `json:"exitCode"`
+	Signal   *int   `json:"signal"`
+}
+
+type protocolTerminal struct {
+	Observed   bool    `json:"observed"`
+	EventKind  *string `json:"eventKind"`
+	StopReason *string `json:"stopReason"`
+	ErrorCode  *string `json:"errorCode"`
+}
+
+type observation struct {
+	State            string           `json:"state"`
+	Sequence         int64            `json:"sequence"`
+	StateDigest      string           `json:"stateDigest"`
+	ChildPID         *int             `json:"childPid"`
+	ProcessExit      processExit      `json:"processExit"`
+	StopCause        string           `json:"stopCause"`
+	ProtocolTerminal protocolTerminal `json:"protocolTerminal"`
+	ChildStartedAt   *string          `json:"childStartedAt"`
+	ChildFinishedAt  *string          `json:"childFinishedAt"`
+	ObservedAt       string           `json:"observedAt"`
+}
+
+type request struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	Command       string          `json:"command"`
+	RequestRef    string          `json:"requestRef"`
+	RequestDigest string          `json:"requestDigest"`
+	JobUID        string          `json:"jobUid"`
+	PodUID        string          `json:"podUid"`
+	Generation    int             `json:"generation"`
+	Payload       json.RawMessage `json:"payload"`
+}
+
+type acknowledgement struct {
+	SchemaVersion int            `json:"schemaVersion"`
+	Command       string         `json:"command"`
+	RequestRef    string         `json:"requestRef"`
+	RequestDigest string         `json:"requestDigest"`
+	JobUID        string         `json:"jobUid"`
+	PodUID        string         `json:"podUid"`
+	Generation    int            `json:"generation"`
+	State         string         `json:"state"`
+	Replayed      bool           `json:"replayed"`
+	ObservedAt    string         `json:"observedAt"`
+	ErrorCode     *string        `json:"errorCode"`
+	Payload       map[string]any `json:"payload"`
+}
+
+type retainedAcknowledgement struct {
+	digest string
+	ack    acknowledgement
+}
+
+type terminalSession struct {
+	cmd          *exec.Cmd
+	pty          *os.File
+	output       []byte
+	base         int
+	closed       bool
+	expiresAt    time.Time
+	pausedRunner bool
+	mu           sync.Mutex
+}
+
+type launcher struct {
+	mu               sync.Mutex
+	obs              observation
+	cmd              *exec.Cmd
+	generation       int
+	jobUID           string
+	podUID           string
+	stopCause        string
+	finalizing       bool
+	terminals        map[string]*terminalSession
+	acknowledgements map[string]retainedAcknowledgement
+}
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "__rc_unprivileged_child" {
+		if err := runUnprivilegedChild(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	syscall.Umask(0002)
+	if err := preparePaths(); err != nil {
+		fatal(err)
+	}
+	l := &launcher{
+		terminals:        map[string]*terminalSession{},
+		acknowledgements: map[string]retainedAcknowledgement{},
+	}
+	if err := removeSocket(); err != nil {
+		fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		fatal(err)
+	}
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			fatal(err)
+		}
+		go l.serve(connection)
+	}
+}
+
+func (l *launcher) serve(connection net.Conn) {
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(35 * time.Second))
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(connection, header); err != nil {
+		return
+	}
+	size := binary.BigEndian.Uint32(header)
+	if size == 0 || size > maxFrame {
+		return
+	}
+	payload := make([]byte, size)
+	if _, err := io.ReadFull(connection, payload); err != nil {
+		return
+	}
+	var frame request
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&frame); err != nil || frame.SchemaVersion != 1 || decoder.Decode(&struct{}{}) != io.EOF {
+		return
+	}
+	ack := l.handle(frame)
+	if err := writeFrame(connection, ack); err != nil {
+		return
+	}
+}
+
+func (l *launcher) handle(frame request) acknowledgement {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ack := acknowledgement{
+		SchemaVersion: 1,
+		Command:       frame.Command,
+		RequestRef:    frame.RequestRef,
+		RequestDigest: frame.RequestDigest,
+		JobUID:        frame.JobUID,
+		PodUID:        frame.PodUID,
+		Generation:    frame.Generation,
+		State:         "failed",
+		ObservedAt:    now(),
+		Payload:       map[string]any{},
+	}
+	if err := validateRequest(frame); err != nil {
+		code := err.Error()
+		ack.ErrorCode = &code
+		return ack
+	}
+	if l.jobUID != "" && (l.jobUID != frame.JobUID || l.podUID != frame.PodUID) {
+		code := "stale_binding"
+		ack.ErrorCode = &code
+		return ack
+	}
+	if l.jobUID == "" {
+		l.jobUID, l.podUID = frame.JobUID, frame.PodUID
+		l.generation = frame.Generation
+		l.setObservation(
+			"starting",
+			nil,
+			processExit{Kind: "not_observed"},
+			"none",
+			nil,
+			nil,
+		)
+	}
+	key := requestIdentity(frame)
+	cacheable := !isQuery(frame.Command)
+	if cacheable {
+		if retained, found := l.acknowledgements[key]; found {
+			if retained.digest != frame.RequestDigest {
+				code := "identity_conflict"
+				ack.ErrorCode = &code
+				return ack
+			}
+			replayed := retained.ack
+			replayed.Replayed = true
+			replayed.ObservedAt = now()
+			return replayed
+		}
+	}
+	result, err := l.dispatch(frame)
+	if err != nil {
+		code := err.Error()
+		ack.ErrorCode = &code
+	} else {
+		ack.State = "completed"
+		ack.Payload = result
+	}
+	if cacheable {
+		l.acknowledgements[key] = retainedAcknowledgement{
+			digest: frame.RequestDigest,
+			ack:    ack,
+		}
+	}
+	return ack
+}
+
+func (l *launcher) dispatch(frame request) (map[string]any, error) {
+	switch frame.Command {
+	case "credentialStatus":
+		if err := decodePayload(frame.Payload, &struct{}{}); err != nil {
+			return nil, err
+		}
+		bytes, err := readCredential()
+		if err != nil {
+			return map[string]any{"credentialReady": false}, nil
+		}
+		digest := sha256.Sum256(bytes)
+		return map[string]any{"credentialReady": true, "credentialSha256": hex.EncodeToString(digest[:])}, nil
+	case "start":
+		return l.start(frame)
+	case "inspect":
+		if err := decodePayload(frame.Payload, &struct{}{}); err != nil {
+			return nil, err
+		}
+		return l.snapshot(), nil
+	case "stop":
+		return l.stop(frame)
+	case "finalize":
+		var payload struct {
+			CaptureReceiptDigest string `json:"captureReceiptDigest"`
+		}
+		if err := decodePayload(frame.Payload, &payload); err != nil || payload.CaptureReceiptDigest == "" {
+			return nil, errors.New("finalize_invalid")
+		}
+		if l.obs.State != "exited" && l.obs.State != "killed" {
+			return nil, errors.New("runner_not_terminal")
+		}
+		l.finalizing = true
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			os.Exit(0)
+		}()
+		return map[string]any{"finalized": true, "launcherAlive": true}, nil
+	case "createPty":
+		return l.createTerminal(frame)
+	case "writePty":
+		return l.writeTerminal(frame)
+	case "readPty":
+		return l.readTerminal(frame)
+	case "resizePty":
+		return l.resizeTerminal(frame)
+	case "closePty":
+		return l.closeTerminal(frame)
+	default:
+		return nil, errors.New("unsupported_command")
+	}
+}
+
+func (l *launcher) start(frame request) (map[string]any, error) {
+	var payload struct {
+		NativeLaunchDigest string         `json:"nativeLaunchDigest"`
+		Descriptor         map[string]any `json:"descriptor"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil {
+		return nil, err
+	}
+	if l.cmd != nil || l.obs.State == "running" {
+		if l.generation == frame.Generation {
+			return l.snapshot(), nil
+		}
+		return nil, errors.New("generation_conflict")
+	}
+	if frame.Generation < 1 || payload.NativeLaunchDigest == "" || payload.Descriptor == nil {
+		return nil, errors.New("launch_invalid")
+	}
+	requiredMiB, err := strconv.Atoi(os.Getenv("RC_NATIVE_EPHEMERAL_STORAGE_MIB"))
+	if err != nil || requiredMiB < 512 || storagePreflight(requiredMiB) != nil {
+		return nil, errors.New("capacity_insufficient")
+	}
+	if err := normalizeWorktree(); err != nil {
+		return nil, errors.New("worktree_prepare_failed")
+	}
+	token, err := readCredential()
+	if err != nil || len(token) == 0 {
+		return nil, errors.New("credential_unavailable")
+	}
+	var argv []string
+	if err := json.Unmarshal([]byte(os.Getenv("RC_NATIVE_RUNNER_ENTRYPOINT_JSON")), &argv); err != nil || len(argv) == 0 {
+		return nil, errors.New("entrypoint_invalid")
+	}
+	prompt := "Work autonomously in the current workspace. Read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ". Inspect the actual files and report honestly."
+	argv = append(argv, prompt)
+	childArgv := append([]string{"__rc_unprivileged_child"}, argv...)
+	cmd := exec.Command("/proc/self/exe", childArgv...)
+	cmd.Dir = worktree
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = nil
+	cmd.Env = childEnvironment(string(token))
+	cmd.SysProcAttr = childProcessAttributes(10001, 10001)
+	started := now()
+	l.generation = frame.Generation
+	l.stopCause = ""
+	l.setObservation("starting", nil, processExit{Kind: "not_observed"}, "none", &started, nil)
+	if err := cmd.Start(); err != nil {
+		finished := now()
+		code := 127
+		l.setObservation("exited", nil, processExit{Kind: "exited", ExitCode: &code}, "natural_exit", &started, &finished)
+		return nil, errors.New("child_start_failed")
+	}
+	l.cmd = cmd
+	pid := cmd.Process.Pid
+	l.setObservation("running", &pid, processExit{Kind: "not_observed"}, "none", &started, nil)
+	go l.wait(cmd, started)
+	return l.snapshot(), nil
+}
+
+func (l *launcher) wait(cmd *exec.Cmd, started string) {
+	err := cmd.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cmd != cmd {
+		return
+	}
+	finished := now()
+	exit := processExit{Kind: "exited"}
+	code := 0
+	state := "exited"
+	cause := "natural_exit"
+	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			status := exitError.Sys().(syscall.WaitStatus)
+			if status.Signaled() {
+				signal := int(status.Signal())
+				exit = processExit{Kind: "signaled", Signal: &signal}
+				state = "killed"
+				cause = l.stopCause
+				if cause == "" {
+					cause = "unknown"
+				}
+			} else {
+				code = status.ExitStatus()
+				exit.ExitCode = &code
+			}
+		}
+	} else {
+		exit.ExitCode = &code
+	}
+	if l.stopCause == "stop_requested" || l.stopCause == "soft_deadline" || l.stopCause == "cancel_requested" {
+		state = "killed"
+		cause = l.stopCause
+	}
+	l.setObservation(state, nil, exit, cause, &started, &finished)
+	l.cmd = nil
+}
+
+func (l *launcher) stop(frame request) (map[string]any, error) {
+	var payload struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil || payload.Reason == "" {
+		return nil, errors.New("stop_invalid")
+	}
+	if frame.Generation != l.generation {
+		return nil, errors.New("generation_conflict")
+	}
+	if l.obs.State == "exited" || l.obs.State == "killed" {
+		result := l.snapshot()
+		result["result"] = "already_terminal"
+		return result, nil
+	}
+	if l.cmd == nil || l.cmd.Process == nil {
+		return nil, errors.New("runner_not_started")
+	}
+	cause := payload.Reason
+	if cause == "stop_requested" {
+		cause = "stop_requested"
+	}
+	l.stopCause = cause
+	termAt := now()
+	_ = syscall.Kill(-l.cmd.Process.Pid, syscall.SIGTERM)
+	deadline := time.Now().Add(10 * time.Second)
+	for l.cmd != nil && time.Now().Before(deadline) {
+		l.mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		l.mu.Lock()
+	}
+	var killAt *string
+	result := "terminated"
+	if l.cmd != nil {
+		value := now()
+		killAt = &value
+		result = "killed"
+		_ = syscall.Kill(-l.cmd.Process.Pid, syscall.SIGKILL)
+	}
+	killDeadline := time.Now().Add(2 * time.Second)
+	for l.cmd != nil && time.Now().Before(killDeadline) {
+		l.mu.Unlock()
+		time.Sleep(25 * time.Millisecond)
+		l.mu.Lock()
+	}
+	snapshot := l.snapshot()
+	snapshot["result"] = result
+	snapshot["termSentAt"] = termAt
+	snapshot["killSentAt"] = killAt
+	snapshot["runnerTerminalAt"] = l.obs.ChildFinishedAt
+	return snapshot, nil
+}
+
+func (l *launcher) snapshot() map[string]any {
+	return map[string]any{"runnerObservation": l.obs, "launcherAlive": true}
+}
+
+func (l *launcher) setObservation(state string, pid *int, exit processExit, cause string, started, finished *string) {
+	l.obs = observation{
+		State: state, Sequence: l.obs.Sequence + 1, ChildPID: pid, ProcessExit: exit,
+		StopCause: cause, ProtocolTerminal: protocolTerminal{}, ChildStartedAt: started,
+		ChildFinishedAt: finished, ObservedAt: now(),
+	}
+	document := l.stateDocument(false)
+	bytes, _ := json.Marshal(document)
+	digest := sha256.Sum256(bytes)
+	l.obs.StateDigest = hex.EncodeToString(digest[:])
+	if err := writeAtomicJSON(statePath, l.stateDocument(true)); err != nil {
+		fatal(errors.New("state_publish_failed"))
+	}
+}
+
+func (l *launcher) stateDocument(withDigest bool) map[string]any {
+	document := map[string]any{
+		"schemaVersion": 1,
+		"jobUid":        l.jobUID,
+		"podUid":        l.podUID,
+		"generation":    l.generation,
+		"sequence":      l.obs.Sequence,
+		"state":         l.obs.State,
+		"childPid":      l.obs.ChildPID,
+		"processExit": map[string]any{
+			"kind":     l.obs.ProcessExit.Kind,
+			"exitCode": l.obs.ProcessExit.ExitCode,
+			"signal":   l.obs.ProcessExit.Signal,
+		},
+		"stopCause": l.obs.StopCause,
+		"protocolTerminal": map[string]any{
+			"observed":   l.obs.ProtocolTerminal.Observed,
+			"eventKind":  l.obs.ProtocolTerminal.EventKind,
+			"stopReason": l.obs.ProtocolTerminal.StopReason,
+			"errorCode":  l.obs.ProtocolTerminal.ErrorCode,
+		},
+		"childStartedAt":  l.obs.ChildStartedAt,
+		"childFinishedAt": l.obs.ChildFinishedAt,
+		"observedAt":      l.obs.ObservedAt,
+	}
+	if withDigest {
+		document["stateDigest"] = l.obs.StateDigest
+	}
+	return document
+}
+
+func (l *launcher) createTerminal(frame request) (map[string]any, error) {
+	var payload struct {
+		PTYRef     string `json:"ptyRef"`
+		TTLSeconds int    `json:"ttlSeconds"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil {
+		return nil, err
+	}
+	if payload.PTYRef == "" || payload.TTLSeconds < 1 || payload.TTLSeconds > 86400 || l.terminals[payload.PTYRef] != nil {
+		return nil, errors.New("pty_conflict")
+	}
+	pausedRunner := false
+	if l.cmd != nil && l.cmd.Process != nil && l.obs.State == "running" {
+		if err := syscall.Kill(-l.cmd.Process.Pid, syscall.SIGSTOP); err != nil {
+			return nil, errors.New("runner_pause_failed")
+		}
+		pausedRunner = true
+	}
+	cmd := exec.Command("/proc/self/exe", "__rc_unprivileged_child", "/bin/sh")
+	cmd.Dir = worktree
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-terminal/home", "TMPDIR=/run/rc-terminal/tmp", "TERM=xterm-256color", "LANG=C.UTF-8", "RC_NATIVE_CHILD_ROLE=terminal"}
+	cmd.SysProcAttr = childProcessAttributes(10002, 10001)
+	terminal, err := pty.StartWithAttrs(
+		cmd,
+		&pty.Winsize{Rows: 24, Cols: 80},
+		cmd.SysProcAttr,
+	)
+	if err != nil {
+		return nil, errors.New("pty_failed")
+	}
+	session := &terminalSession{
+		cmd:          cmd,
+		pty:          terminal,
+		expiresAt:    time.Now().Add(time.Duration(payload.TTLSeconds) * time.Second),
+		pausedRunner: pausedRunner,
+	}
+	l.terminals[payload.PTYRef] = session
+	go session.capture(terminal)
+	go func() {
+		_ = cmd.Wait()
+		l.finishTerminal(payload.PTYRef, session, false)
+	}()
+	go func() {
+		timer := time.NewTimer(time.Until(session.expiresAt))
+		defer timer.Stop()
+		<-timer.C
+		l.finishTerminal(payload.PTYRef, session, true)
+	}()
+	return map[string]any{
+		"ptyRef":       payload.PTYRef,
+		"open":         true,
+		"runnerPaused": pausedRunner,
+		"expiresAt":    session.expiresAt.UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+func (s *terminalSession) capture(reader io.Reader) {
+	buffer := make([]byte, 4096)
+	for {
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			s.mu.Lock()
+			s.output = append(s.output, buffer[:n]...)
+			if len(s.output) > 1048576 {
+				drop := len(s.output) - 1048576
+				s.output = append([]byte(nil), s.output[drop:]...)
+				s.base += drop
+			}
+			s.mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (l *launcher) writeTerminal(frame request) (map[string]any, error) {
+	var payload struct {
+		PTYRef        string `json:"ptyRef"`
+		ContentBase64 string `json:"contentBase64"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil {
+		return nil, err
+	}
+	s := l.terminals[payload.PTYRef]
+	if s == nil {
+		return nil, errors.New("pty_not_found")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed || time.Now().After(s.expiresAt) {
+		return nil, errors.New("pty_expired")
+	}
+	content, err := base64.StdEncoding.DecodeString(payload.ContentBase64)
+	if err != nil || len(content) > maxPTYData {
+		return nil, errors.New("pty_input_invalid")
+	}
+	_, err = s.pty.Write(content)
+	if err != nil {
+		return nil, errors.New("pty_closed")
+	}
+	return map[string]any{"written": len(content)}, nil
+}
+
+func (l *launcher) readTerminal(frame request) (map[string]any, error) {
+	var payload struct {
+		PTYRef     string `json:"ptyRef"`
+		Cursor     int    `json:"cursor"`
+		LimitBytes int    `json:"limitBytes"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil {
+		return nil, err
+	}
+	s := l.terminals[payload.PTYRef]
+	if s == nil {
+		return nil, errors.New("pty_not_found")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if payload.Cursor < s.base {
+		return nil, errors.New("pty_cursor_stale")
+	}
+	start := payload.Cursor - s.base
+	if start > len(s.output) {
+		start = len(s.output)
+	}
+	limit := payload.LimitBytes
+	if limit < 1 || limit > 1048576 {
+		limit = 65536
+	}
+	end := start + limit
+	if end > len(s.output) {
+		end = len(s.output)
+	}
+	return map[string]any{
+		"contentBase64": base64.StdEncoding.EncodeToString(s.output[start:end]),
+		"nextCursor":    s.base + end,
+		"open":          !s.closed,
+	}, nil
+}
+
+func (l *launcher) resizeTerminal(frame request) (map[string]any, error) {
+	var payload struct {
+		PTYRef  string `json:"ptyRef"`
+		Rows    int    `json:"rows"`
+		Columns int    `json:"columns"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil {
+		return nil, err
+	}
+	s := l.terminals[payload.PTYRef]
+	if s == nil || payload.Rows < 1 || payload.Columns < 1 || payload.Rows > 1000 || payload.Columns > 1000 {
+		return nil, errors.New("pty_resize_invalid")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed || time.Now().After(s.expiresAt) {
+		return nil, errors.New("pty_expired")
+	}
+	if err := pty.Setsize(
+		s.pty,
+		&pty.Winsize{Rows: uint16(payload.Rows), Cols: uint16(payload.Columns)},
+	); err != nil {
+		return nil, errors.New("pty_resize_failed")
+	}
+	return map[string]any{"resized": true}, nil
+}
+
+func (l *launcher) closeTerminal(frame request) (map[string]any, error) {
+	var payload struct {
+		PTYRef string `json:"ptyRef"`
+		Reason string `json:"reason"`
+	}
+	if err := decodePayload(frame.Payload, &payload); err != nil || payload.Reason == "" {
+		return nil, errors.New("pty_close_invalid")
+	}
+	s := l.terminals[payload.PTYRef]
+	if s == nil {
+		return nil, errors.New("pty_not_found")
+	}
+	delete(l.terminals, payload.PTYRef)
+	l.closeTerminalProcess(s)
+	l.resumeRunnerAfterTerminal(s)
+	return map[string]any{"closed": true}, nil
+}
+
+func (l *launcher) finishTerminal(ptyRef string, session *terminalSession, terminate bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.terminals[ptyRef] != session {
+		return
+	}
+	if terminate {
+		l.closeTerminalProcess(session)
+	} else {
+		session.mu.Lock()
+		session.closed = true
+		session.mu.Unlock()
+	}
+	l.resumeRunnerAfterTerminal(session)
+}
+
+func (l *launcher) closeTerminalProcess(session *terminalSession) {
+	session.mu.Lock()
+	alreadyClosed := session.closed
+	session.closed = true
+	session.mu.Unlock()
+	if alreadyClosed {
+		return
+	}
+	_ = session.pty.Close()
+	if session.cmd.Process != nil {
+		_ = syscall.Kill(-session.cmd.Process.Pid, syscall.SIGTERM)
+	}
+}
+
+func (l *launcher) resumeRunnerAfterTerminal(session *terminalSession) {
+	if !session.pausedRunner || l.cmd == nil || l.cmd.Process == nil || l.stopCause != "" {
+		return
+	}
+	for _, other := range l.terminals {
+		if other == session {
+			continue
+		}
+		other.mu.Lock()
+		activePause := other.pausedRunner && !other.closed
+		other.mu.Unlock()
+		if activePause {
+			return
+		}
+	}
+	_ = syscall.Kill(-l.cmd.Process.Pid, syscall.SIGCONT)
+}
+
+func preparePaths() error {
+	if err := os.MkdirAll(controlDir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(controlDir, 0700); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		path     string
+		uid, gid int
+	}{{"/run/rc-user/home", 10001, 10001}, {"/run/rc-user/tmp", 10001, 10001}, {"/run/rc-terminal/home", 10002, 10001}, {"/run/rc-terminal/tmp", 10002, 10001}} {
+		if err := os.MkdirAll(item.path, 0700); err != nil {
+			return err
+		}
+		if err := os.Chmod(item.path, 0700); err != nil {
+			return err
+		}
+		if err := os.Chown(item.path, item.uid, item.gid); err != nil {
+			return err
+		}
+	}
+	return os.MkdirAll(worktree, 02775)
+}
+
+func normalizeWorktree() error {
+	paths := make([]string, 0, 32)
+	err := filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		paths = append(paths, path)
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, resolveErr := filepath.EvalSymlinks(path)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			relative, relErr := filepath.Rel(worktree, target)
+			if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+				return errors.New("worktree_symlink_escape")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Change ownership leaf-first.  The launcher deliberately has no
+	// DAC_OVERRIDE capability; handing a 0700 parent to the experiment UID
+	// before its children would lock the launcher out mid-walk.
+	for index := len(paths) - 1; index >= 0; index-- {
+		path := paths[index]
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if err := os.Lchown(path, 10001, 10001); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Chown(path, 10001, 10001); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeWorktreeModes() error {
+	return filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		mode := info.Mode().Perm()
+		if info.IsDir() {
+			mode = 02775
+		} else {
+			mode = (mode & 0111) | 0660
+		}
+		return os.Chmod(path, mode)
+	})
+}
+
+func childEnvironment(token string) []string {
+	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "CODEX_HOME=/run/rc-user/home/.codex", "PI_CODING_AGENT_DIR=/run/rc-user/home/pi-agent", "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
+	if strings.HasPrefix(protocol, "anthropic-") {
+		values = append(values, "ANTHROPIC_API_KEY="+token)
+	} else {
+		values = append(values, "OPENAI_API_KEY="+token)
+	}
+	return values
+}
+
+func prepareRunnerConfiguration(argv []string) error {
+	if len(argv) == 0 {
+		return errors.New("runner argv is empty")
+	}
+	route := os.Getenv("MODEL_ROUTE")
+	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
+	if route == "" || protocol == "" {
+		return errors.New("model route is incomplete")
+	}
+	switch filepath.Base(argv[0]) {
+	case "codex":
+		if protocol != "openai-responses" {
+			return errors.New("codex requires openai-responses")
+		}
+		directory := "/run/rc-user/home/.codex"
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			return err
+		}
+		contents := strings.Join([]string{
+			"model = " + strconv.Quote(route),
+			"model_provider = \"researchcosmos\"",
+			"",
+			"[model_providers.researchcosmos]",
+			"name = \"ResearchCosmos Model Gateway\"",
+			"base_url = " + strconv.Quote(os.Getenv("OPENAI_BASE_URL")),
+			"env_key = \"OPENAI_API_KEY\"",
+			"wire_api = \"responses\"",
+			"",
+		}, "\n")
+		return writeRunnerConfig(filepath.Join(directory, "config.toml"), []byte(contents))
+	case "pi":
+		if protocol != "openai-completions" && protocol != "anthropic-messages" {
+			return errors.New("pi protocol is unsupported")
+		}
+		directory := "/run/rc-user/home/pi-agent"
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			return err
+		}
+		baseURL := os.Getenv("OPENAI_BASE_URL")
+		keyName := "OPENAI_API_KEY"
+		if protocol == "anthropic-messages" {
+			baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+			keyName = "ANTHROPIC_API_KEY"
+		}
+		payload := map[string]any{
+			"providers": map[string]any{
+				"researchcosmos": map[string]any{
+					"baseUrl": baseURL,
+					"api":     protocol,
+					"apiKey":  keyName,
+					"models": []map[string]any{{
+						"id":            route,
+						"name":          route,
+						"reasoning":     true,
+						"input":         []string{"text"},
+						"contextWindow": 200000,
+						"maxTokens":     8192,
+					}},
+				},
+			},
+		}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		return writeRunnerConfig(filepath.Join(directory, "models.json"), bytes)
+	default:
+		// Other registered native CLIs may consume the frozen model environment
+		// directly. Their exact argv remains recipe-owned rather than launcher-owned.
+		return nil
+	}
+}
+
+func writeRunnerConfig(path string, contents []byte) error {
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+func readCredential() ([]byte, error) {
+	resolved, err := filepath.EvalSymlinks(tokenPath)
+	if err != nil {
+		return nil, err
+	}
+	credentialDirectory, err := filepath.EvalSymlinks(filepath.Dir(tokenPath))
+	if err != nil {
+		return nil, err
+	}
+	credentialRoot := credentialDirectory + string(os.PathSeparator)
+	if !strings.HasPrefix(resolved, credentialRoot) {
+		return nil, errors.New("unsafe credential projection")
+	}
+	descriptor, err := syscall.Open(
+		resolved,
+		syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(descriptor), resolved)
+	if file == nil {
+		_ = syscall.Close(descriptor)
+		return nil, errors.New("unsafe credential projection")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	statValue, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode().Perm() != 0400 || statValue.Uid != 0 || statValue.Gid != 0 || info.Size() < 1 || info.Size() > 65536 {
+		return nil, errors.New("unsafe credential projection")
+	}
+	return io.ReadAll(io.LimitReader(file, 65537))
+}
+
+func runUnprivilegedChild(argv []string) error {
+	if len(argv) == 0 || !filepath.IsAbs(argv[0]) {
+		return errors.New("child argv must begin with an absolute path")
+	}
+	syscall.Umask(0002)
+	if os.Getenv("RC_NATIVE_CHILD_ROLE") == "agent" {
+		if err := normalizeWorktreeModes(); err != nil {
+			return err
+		}
+		if err := prepareRunnerConfiguration(argv); err != nil {
+			return err
+		}
+	}
+	if err := setNoNewPrivileges(); err != nil {
+		return err
+	}
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	text := string(status)
+	if !strings.Contains(text, "CapEff:\t0000000000000000") || !strings.Contains(text, "NoNewPrivs:\t1") {
+		return errors.New("child security transition was not effective")
+	}
+	return syscall.Exec(argv[0], argv, os.Environ())
+}
+
+func validateRequest(frame request) error {
+	if frame.JobUID == "" || frame.PodUID == "" || frame.RequestRef == "" || frame.Generation < 0 {
+		return errors.New("identity_missing")
+	}
+	if len(frame.RequestDigest) != 64 {
+		return errors.New("digest_invalid")
+	}
+	digest := sha256.Sum256(frame.Payload)
+	if !strings.EqualFold(frame.RequestDigest, hex.EncodeToString(digest[:])) {
+		return errors.New("digest_mismatch")
+	}
+	return nil
+}
+
+func requestIdentity(frame request) string {
+	return strings.Join(
+		[]string{frame.Command, frame.RequestRef, frame.JobUID, frame.PodUID, strconv.Itoa(frame.Generation)},
+		"\x00",
+	)
+}
+
+func isQuery(command string) bool {
+	return command == "credentialStatus" || command == "inspect" || command == "readPty"
+}
+
+func decodePayload(raw json.RawMessage, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return errors.New("payload_invalid")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("payload_invalid")
+	}
+	return nil
+}
+
+func writeFrame(writer io.Writer, value acknowledgement) error {
+	bytes, err := json.Marshal(value)
+	if err != nil || len(bytes) > maxFrame {
+		return errors.New("ack_invalid")
+	}
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(bytes)))
+	if _, err = writer.Write(header); err != nil {
+		return err
+	}
+	_, err = writer.Write(bytes)
+	return err
+}
+
+func removeSocket() error {
+	info, err := os.Lstat(socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		return errors.New("unsafe launcher socket path")
+	}
+	return os.Remove(socketPath)
+}
+
+func writeAtomicJSON(path string, value any) error {
+	bytes, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if info, statErr := os.Lstat(path); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("unsafe state file symlink")
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	temp, err := os.CreateTemp(controlDir, ".runner-state-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err = temp.Chmod(0600); err == nil {
+		err = temp.Chown(0, 0)
+	}
+	if err == nil {
+		_, err = temp.Write(bytes)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	closeErr := temp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tempName, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(controlDir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+func now() string     { return time.Now().UTC().Format(time.RFC3339Nano) }
+func fatal(err error) { fmt.Fprintln(os.Stderr, "rc-native-launcher:", err); os.Exit(1) }

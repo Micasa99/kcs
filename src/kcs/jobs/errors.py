@@ -114,6 +114,10 @@ class GrantIdentityConflictError(IdentityDigestConflictError):
     recovery_action = "inspect_grant"
 
 
+class RunnerGrantIdentityConflictError(IdentityDigestConflictError):
+    recovery_action = "inspect_runner_credential_grant"
+
+
 class TransferIdentityConflictError(IdentityDigestConflictError):
     recovery_action = "inspect_transfer"
 
@@ -173,11 +177,32 @@ class CredentialActiveError(KcsV2Error):
     default_message = "Another credential grant is still active"
 
 
+class RunnerCredentialActiveError(CredentialActiveError):
+    recovery_action = "inspect_runner_credential_grant"
+
+
 class CredentialExpiredError(KcsV2Error):
     code = "CREDENTIAL_EXPIRED"
     status_code = 409
     recovery_action = "inspect_grant"
     default_message = "The credential grant is no longer usable"
+
+
+class RunnerCredentialExpiredError(CredentialExpiredError):
+    recovery_action = "inspect_runner_credential_grant"
+
+
+class RuntimeRecipeForbiddenError(KcsV2Error):
+    code = "FORBIDDEN"
+    status_code = 403
+    default_message = "The runner and environment profile pair is not registered"
+
+
+class CapacityLimitError(KcsV2Error):
+    code = "CAPACITY_LIMIT"
+    status_code = 409
+    recovery_action = "inspect_job"
+    default_message = "The native runtime cannot be admitted with the available capacity"
 
 
 class CredentialDestroyFailedError(KcsV2Error):

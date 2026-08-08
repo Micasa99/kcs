@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -213,7 +215,7 @@ def _create_v2_app(
     app = FastAPI(
         title="kcs V2 Attempt Runtime API",
         description="Isolated physical attempt runtime for ResearchCosmos.",
-        version="2.3.0",
+        version="2.4.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -226,7 +228,7 @@ def _create_v2_app(
             try:
                 await asyncio.to_thread(provider.reconcile_all)
             except Exception:
-                log.warning("V2 credential reconciliation failed; retrying", exc_info=True)
+                log.warning("V2 runtime reconciliation failed; retrying", exc_info=True)
             try:
                 await asyncio.wait_for(reconcile_stop.wait(), timeout=30)
             except TimeoutError:
@@ -261,6 +263,27 @@ def _create_v2_app(
     @app.get("/api/v1/health", include_in_schema=False)
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics(request: Request) -> Response:
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, supplied = authorization.partition(" ")
+        authenticated = (
+            separator == " "
+            and scheme.casefold() == "bearer"
+            and hmac.compare_digest(
+                hashlib.sha256(supplied.encode("utf-8")).digest(),
+                hashlib.sha256(resolved_token.encode("utf-8")).digest(),
+            )
+        )
+        if not authenticated:
+            return Response(status_code=401, headers={"Cache-Control": "no-store"})
+        payload = provider.prometheus_metrics()
+        return Response(
+            content=payload,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.middleware("http")
     async def log_v2_requests(

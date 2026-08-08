@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import tempfile
 import time
@@ -49,7 +50,10 @@ from .errors import (
     TransferIndeterminateError,
     UnsafePathError,
 )
+from .native_contracts import NativeJobBindingSnapshot
 from .transport import WorkspaceRpcReply, WorkspaceRpcTransportProtocol
+
+log = logging.getLogger("kcs")
 
 _COPY_CHUNK = 1024 * 1024
 _EMPTY_OBJECT_DIGEST = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
@@ -155,7 +159,7 @@ class WorkspaceRuntime:
         self,
         store: RuntimeStoreProtocol,
         transport: WorkspaceRpcTransportProtocol | None,
-        live_binding: Callable[[str], JobBindingSnapshot],
+        live_binding: Callable[[str], JobBindingSnapshot | NativeJobBindingSnapshot],
         assert_accepting: Callable[[str], None],
         clock: Callable[[], datetime],
     ) -> None:
@@ -342,7 +346,7 @@ class WorkspaceRuntime:
     def resolve_start_material_bindings(
         self,
         job_ref: str,
-        binding: JobBindingSnapshot,
+        binding: JobBindingSnapshot | NativeJobBindingSnapshot,
         launch_path: str,
         launch_size_bytes: int,
         launch_digest: str,
@@ -1295,18 +1299,25 @@ class WorkspaceRuntime:
         if self._transport is None:
             raise DependencyUnavailableError("workspace RPC transport is not configured")
         try:
+            exact_binding = {
+                "jobRef": binding.job_ref,
+                "jobUid": str(binding.job_uid),
+                "podUid": str(_pod_uid(binding)),
+            }
+            if isinstance(binding, NativeJobBindingSnapshot):
+                exact_binding["runtimeLane"] = "native"
             reply = self._transport.rpc(
-                {
-                    "jobRef": binding.job_ref,
-                    "jobUid": str(binding.job_uid),
-                    "podUid": str(_pod_uid(binding)),
-                },
+                exact_binding,
                 header,
                 body,
             )
         except KcsV2Error:
             raise
         except Exception as error:
+            log.exception(
+                "workspace sidecar RPC outcome unconfirmed errorType=%s",
+                type(error).__name__,
+            )
             raise DependencyUnavailableError(
                 "workspace sidecar response was not confirmed"
             ) from error
@@ -1318,19 +1329,23 @@ class WorkspaceRuntime:
             )
         return reply
 
-    def _binding_for_new_work(self, job_ref: str) -> JobBindingSnapshot:
+    def _binding_for_new_work(
+        self, job_ref: str
+    ) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         binding = self._live_binding(job_ref)
         self._assert_binding_accepts_new_work(job_ref, binding)
         return binding
 
-    def _assert_binding_accepts_new_work(self, job_ref: str, binding: JobBindingSnapshot) -> None:
+    def _assert_binding_accepts_new_work(
+        self, job_ref: str, binding: JobBindingSnapshot | NativeJobBindingSnapshot
+    ) -> None:
         if binding.binding_state is not JobBindingState.RUNNING:
             raise StateConflictError("The Job is not running and cannot accept workspace work")
         self._assert_accepting(job_ref)
 
     def _binding_for_existing(
         self, snapshot: TransferSnapshot, *, accepting: bool = False
-    ) -> JobBindingSnapshot:
+    ) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         binding = self._live_binding(snapshot.job_ref)
         if str(binding.job_uid) != str(snapshot.job_uid) or str(_pod_uid(binding)) != str(
             snapshot.pod_uid
@@ -1533,7 +1548,7 @@ def _resource_version(record: object) -> str:
     return value
 
 
-def _pod_uid(binding: JobBindingSnapshot) -> UUID:
+def _pod_uid(binding: JobBindingSnapshot | NativeJobBindingSnapshot) -> UUID | str:
     if binding.pod_uid is None:
         raise StateConflictError("The Job has no immutable Pod binding")
     return binding.pod_uid

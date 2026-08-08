@@ -59,6 +59,24 @@ spec:
               value: http://kcs-prometheus.kcs-monitoring.svc.cluster.local:9090
             - name: KCS_V2_EVENT_DB_PATH
               value: /var/lib/kcs-v2/events.sqlite3
+            - name: KCS_V2_NATIVE_RECIPE_REGISTRY
+              value: /etc/kcs/native/recipes.json
+            - name: KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: openai-base-url
+            - name: KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: anthropic-base-url
+            - name: KCS_V2_NATIVE_PROVISION_SECONDS
+              value: "900"
+            - name: KCS_V2_NATIVE_CAPTURE_SECONDS
+              value: "900"
+            - name: KCS_V2_NATIVE_FINALIZE_SECONDS
+              value: "300"
             - name: KCS_V2_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -117,6 +135,9 @@ spec:
               mountPath: /tmp/kcs
             - name: state
               mountPath: /var/lib/kcs-v2
+            - name: native-runtime-config
+              mountPath: /etc/kcs/native
+              readOnly: true
       volumes:
         - name: tls
           secret:
@@ -127,6 +148,12 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: kcs-v2-api-state
+        - name: native-runtime-config
+          configMap:
+            name: kcs-v2-native-runtime-config
+            items:
+              - key: recipes.json
+                path: recipes.json
 ---
 apiVersion: v1
 kind: Service

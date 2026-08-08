@@ -135,6 +135,13 @@ and `/api/v2/healthz`. Operational checks and failure recovery are documented in
 runtime API dependency: Product and developer clients connect to the configured KCS
 HTTPS endpoint with its CA and Bearer token.
 
+The source tree now implements the additive V2.4 native-runner M1 lane while
+preserving all 31 hosted operation locations and hosted request shapes. Native
+recipes remain deny-by-default until an operator installs exact digest mappings;
+production activation is a separate owner checkpoint. See
+`docs/v2-native-runner-m1-runbook.md` and
+`docs/v2-native-runner-oci-behavior-appendix.md`.
+
 `scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation
 drives the normal, cancel, and UID-precondition Pod-loss branches and retains raw API,
 role-log, transfer, and operator-checkpoint evidence. It is valid only against the

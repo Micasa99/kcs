@@ -18,6 +18,9 @@ DEFAULT_NODE_SELECTOR = "researchcosmos.io/pool=gpu"
 DEFAULT_WORKSPACE_STORAGE_CLASS = "kcs-workspace"
 DEFAULT_PROMETHEUS_URL = "http://kcs-prometheus.kcs-monitoring.svc.cluster.local:9090"
 DEFAULT_EVENT_DB_PATH = Path("/var/lib/kcs-v2/events.sqlite3")
+DEFAULT_NATIVE_PROVISION_SECONDS = 900
+DEFAULT_NATIVE_CAPTURE_SECONDS = 900
+DEFAULT_NATIVE_FINALIZE_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +35,12 @@ class V2RuntimeSettings:
     prometheus_url: str = DEFAULT_PROMETHEUS_URL
     prometheus_timeout_seconds: float = 3.0
     event_db_path: Path = DEFAULT_EVENT_DB_PATH
+    native_recipe_registry_path: Path | None = None
+    model_gateway_openai_base_url: str | None = None
+    model_gateway_anthropic_base_url: str | None = None
+    native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
+    native_capture_seconds: int = DEFAULT_NATIVE_CAPTURE_SECONDS
+    native_finalize_seconds: int = DEFAULT_NATIVE_FINALIZE_SECONDS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> V2RuntimeSettings:
@@ -89,6 +98,35 @@ class V2RuntimeSettings:
         if not event_db_path.is_absolute():
             raise ValueError("KCS_V2_EVENT_DB_PATH must be absolute")
 
+        recipe_path_raw = environ.get("KCS_V2_NATIVE_RECIPE_REGISTRY")
+        native_recipe_registry_path = Path(recipe_path_raw) if recipe_path_raw else None
+        if (
+            native_recipe_registry_path is not None
+            and not native_recipe_registry_path.is_absolute()
+        ):
+            raise ValueError("KCS_V2_NATIVE_RECIPE_REGISTRY must be absolute")
+
+        openai_base = _optional_https_url(
+            environ.get("KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL"),
+            "KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL",
+        )
+        anthropic_base = _optional_https_url(
+            environ.get("KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL"),
+            "KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL",
+        )
+        native_provision_seconds = _bounded_seconds(
+            environ.get("KCS_V2_NATIVE_PROVISION_SECONDS", str(DEFAULT_NATIVE_PROVISION_SECONDS)),
+            "KCS_V2_NATIVE_PROVISION_SECONDS",
+        )
+        native_capture_seconds = _bounded_seconds(
+            environ.get("KCS_V2_NATIVE_CAPTURE_SECONDS", str(DEFAULT_NATIVE_CAPTURE_SECONDS)),
+            "KCS_V2_NATIVE_CAPTURE_SECONDS",
+        )
+        native_finalize_seconds = _bounded_seconds(
+            environ.get("KCS_V2_NATIVE_FINALIZE_SECONDS", str(DEFAULT_NATIVE_FINALIZE_SECONDS)),
+            "KCS_V2_NATIVE_FINALIZE_SECONDS",
+        )
+
         return cls(
             namespace=namespace,
             node_selector=MappingProxyType(selector),
@@ -98,7 +136,39 @@ class V2RuntimeSettings:
             prometheus_url=prometheus_url.rstrip("/"),
             prometheus_timeout_seconds=prometheus_timeout_seconds,
             event_db_path=event_db_path,
+            native_recipe_registry_path=native_recipe_registry_path,
+            model_gateway_openai_base_url=openai_base,
+            model_gateway_anthropic_base_url=anthropic_base,
+            native_provision_seconds=native_provision_seconds,
+            native_capture_seconds=native_capture_seconds,
+            native_finalize_seconds=native_finalize_seconds,
         )
+
+
+def _optional_https_url(raw: str | None, name: str) -> str | None:
+    if raw is None:
+        return None
+    parsed = urlsplit(raw)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"{name} must be an operator-controlled HTTPS URL")
+    return raw.rstrip("/")
+
+
+def _bounded_seconds(raw: str, name: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+    if not 1 <= value <= 86400:
+        raise ValueError(f"{name} must be between 1 and 86400")
+    return value
 
 
 def _parse_selector(raw: str) -> dict[str, str]:

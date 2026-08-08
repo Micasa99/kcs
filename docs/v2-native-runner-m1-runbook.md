@@ -1,0 +1,91 @@
+# KCS V2.4 native runner M1 runbook
+
+This runbook operates the M1 native lane without changing the hosted lane. The
+canonical contract is `openapi/kcs-v2-jobs.openapi.yaml`; generated and packaged
+bytes must all have SHA-256
+`61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc`.
+Production deployment is a separate owner checkpoint.
+
+## 1. Build and register immutable images
+
+Build the API from `Containerfile`, the control sidecar from
+`deploy/v2/conformance-workspace.Containerfile`, and the platform image volume from
+`native/launcher/Containerfile`. Push each image to the KCS-managed registry and
+resolve the registry digest; tags are never accepted in a recipe. The runner image
+volume is a digest-pinned image containing the native CLI and its own runtime. The
+environment image is the experiment filesystem and must not contain platform
+credentials.
+
+Copy `deploy/v2/native-recipe-registry.example.json` outside Git, replace every
+example digest/ref, recompute the canonical recipe digest, and validate it by
+starting KCS with `KCS_V2_NATIVE_RECIPE_REGISTRY` pointing at that file. Registration
+fails unless `requires` is a subset of `provides`; an unregistered exact pair returns
+typed 403. The committed ConfigMap is deliberately empty so applying manifests does
+not silently authorize native workloads.
+
+## 2. Configure Model Gateway and egress
+
+Set the two HTTPS base URLs in `kcs-v2-native-runtime-config`; KCS accepts only exact
+configured values from a native Job. Render
+`deploy/v2/native-network-policy.example.yaml` with the actual operator-owned Gateway
+VIP/CIDR and apply it only after verifying DNS and TCP 443 from an isolated canary.
+The native Pod receives no ingress and no general Internet egress. Do not add
+provider keys to KCS:
+ResearchCosmos grants an Attempt-scoped gateway token through
+`grantRunnerCredential`.
+
+The projection Secret is late-created after jobUID/podUID exist, mounted only into
+the runtime as `/var/run/rc/model-gateway/token`, and must be root:root `0400` on
+Secret-backed tmpfs. Use a projection TTL of 180 seconds unless an approved policy
+chooses another value in 120..900. After `startRunner` ACK, verify the Secret was
+deleted and that inspect/log/event/Pod/ConfigMap surfaces contain no token bytes.
+
+## 3. Lifecycle order
+
+The required order is create → stage → grantRunnerCredential → startRunner ACK →
+runner running/exited/killed → capture while both containers live →
+finalizeJob(captureBarrier) → Job terminal. `backoffLimit=0`; a second Pod UID is a
+contract failure. Soft deadline starts only at the successful start ACK and stops
+the child, not launcher/control. Hard deadline, eviction, node loss, or ENOSPC may
+destroy the Pod and must set output-loss/indeterminate facts rather than simulate a
+runner result.
+
+Use `GET /api/v2/jobs/{jobRef}`, `GET /api/v2/events`, and bounded runner/control logs
+for diagnosis. The launcher state file and socket are private platform surfaces;
+never use root kube-exec as the terminal implementation.
+
+## 4. Isolated canary
+
+Create a new namespace name for every canary. Snapshot
+`researchcosmos-v2/kcs-v2-api` availability before and after; do not apply, patch,
+restart, or delete anything in that namespace. Install namespace-local RBAC, API,
+TLS/token/config, exact recipes, NetworkPolicy and images.
+
+Exercise at least these journeys with unique ids: natural hello-task, stopRunner,
+cancel/revoke, hard deadline, invalid recipe, insufficient ephemeral storage, and
+terminal pause/read/replay/close. Record job/pod YAML, events, both raw logs, API
+request/response envelopes with credentials redacted, state digests, image IDs,
+timings, NetworkPolicy allow/deny probes, and secret scans. Delete only the exact
+canary namespace after evidence capture and prove it is absent.
+
+Cold pull and registry authentication must be measured on a node that does not
+already cache the exact digests. If such a node is unavailable, record the SLO as
+`not_reported`; cached-pull timings must not be presented as cold-pull evidence.
+
+## 5. Monitoring
+
+The authenticated `/metrics` endpoint exports aggregate native binding, runner,
+stop, recipe-delivery, credential, hard-deadline and output-loss gauges without job
+or subject labels. Prometheus uses the same service bearer from a mirrored secret
+and verifies the internal API CA. Follow `deploy/v2/monitoring/RUNBOOK.md` for the
+alerts. NetworkPolicy-denial metrics remain `not_reported` until CNI audit telemetry
+is installed; canary allow/deny commands are the M1 evidence.
+
+## 6. Rollback and production gate
+
+Before owner approval, rollback means deleting only the isolated canary namespace.
+For an approved production rollout, retain the prior 2.3 API image/manifest and
+state snapshot; first verify the 31 hosted operation locations and hosted schema
+fingerprints, then deploy one API replica and run hosted smoke before admitting a
+native recipe. A failed smoke rolls back the API image/config without deleting
+managed Jobs or their state PVC.
