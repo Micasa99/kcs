@@ -249,12 +249,14 @@ def test_task8_legacy_isolation_and_ssh_identity_journey(
         for rule in role["rules"]
     }
     assert rules == {
-        (("batch",), ("jobs",)): {"create", "get", "patch", "delete"},
+        (("batch",), ("jobs",)): {"create", "get", "list", "patch", "delete"},
         (("",), ("pods",)): {"get", "list", "patch"},
         (("",), ("pods/log",)): {"get"},
         (("",), ("pods/exec",)): {"get", "create"},
         (("",), ("configmaps",)): {"create", "get", "list", "update", "delete"},
         (("",), ("secrets",)): {"create", "get", "delete"},
+        (("",), ("events",)): {"get", "list", "watch"},
+        (("metrics.k8s.io",), ("pods",)): {"get", "list"},
     }
     policy = yaml.safe_load((repo / "deploy/v2/network-policy.yaml").read_text())
     assert policy["metadata"]["namespace"] == V2_NAMESPACE
