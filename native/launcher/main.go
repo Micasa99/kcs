@@ -328,7 +328,7 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	if err := json.Unmarshal([]byte(os.Getenv("RC_NATIVE_RUNNER_ENTRYPOINT_JSON")), &argv); err != nil || len(argv) == 0 {
 		return nil, errors.New("entrypoint_invalid")
 	}
-	prompt := "Work autonomously in the current workspace. Read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ". Inspect the actual files and report honestly."
+	prompt := "Begin the work now and continue autonomously until the task is complete or a concrete blocker is proven. Use your native shell and file tools; do not stop after describing what you intend to do. First read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ", then inspect the actual workspace, implement the work, run relevant verification, and leave all requested outputs in the workspace. Report observed results and blockers honestly."
 	argv = append(argv, prompt)
 	childArgv := append([]string{"__rc_unprivileged_child"}, argv...)
 	cmd := exec.Command("/proc/self/exe", childArgv...)
