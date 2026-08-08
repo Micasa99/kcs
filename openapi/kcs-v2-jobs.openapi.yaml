@@ -1,7 +1,8 @@
 openapi: 3.1.0
+x-kcs-contract-status: dormant
 info:
-  title: KCS V2 Hosted Attempt API
-  version: 2.3.0
+  title: KCS V2 Attempt API
+  version: 2.4.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -9,6 +10,9 @@ info:
     transferModes: [direct]
     rangeRequests: false
     signedTransfers: false
+    nativeRunner: true
+    runtimeRecipeDeliveryModes: [assembled, prebuilt]
+    runtimeRecipeDeliveryDefault: assembled.imageVolume
   x-kcs-limits:
     refUtf8Bytes: 256
     environmentEntries: 32
@@ -41,6 +45,8 @@ x-kcs-network-boundary:
 tags:
   - {name: Jobs}
   - {name: Credentials}
+  - {name: Native runner}
+  - {name: Runtime recipes}
   - {name: Transfers}
   - {name: Workspace}
   - {name: Workspace terminal}
@@ -96,10 +102,10 @@ paths:
       responses:
         '201': &JobCreated
           description: New provider binding created.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}}
         '200': &JobReplay
           description: Stable same-identity, same-digest replay.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}}
         '400': &Error400
           description: Malformed or invalid request.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
@@ -167,7 +173,7 @@ paths:
       responses:
         '200':
           description: Deterministically ordered live bindings and requested tombstones.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshotList'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshotList'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
@@ -192,7 +198,7 @@ paths:
       responses:
         '200':
           description: Current immutable binding and observed provider reality.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}}
         '401': *Error401
         '403': *Error403
         '404': &Error404
@@ -267,13 +273,13 @@ paths:
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       x-kcs-cursor-binding: [namespace, jobRef, podUid, container]
       parameters:
-        - {$ref: '#/components/parameters/Container'}
+        - {$ref: '#/components/parameters/AnyContainer'}
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/LogLimit'}
       responses:
         '200':
           description: One bounded continuation of the actual combined Kubernetes container log.
-          content: {application/json: {schema: {$ref: '#/components/schemas/RoleLogs'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyRoleLogs'}}}
         '400': *Error400
         '401': *Error401
         '403': *Error403
@@ -508,6 +514,298 @@ paths:
         '500': *Error500
         '503': *Error503
         '504': *Error504
+  /api/v2/jobs/{jobRef}/runner/credential-grants:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Native runner, Credentials]
+      operationId: grantRunnerCredential
+      x-kcs-service-authorization: v2-private-credential-writer
+      x-kcs-private-ingress: true
+      x-kcs-request-body-logging: forbidden
+      x-kcs-no-request-body-log: true
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Credential-SHA256, KCS-Grant-Metadata-Digest]
+      x-kcs-rbac-boundary: v2-namespace-only
+      x-kcs-legacy-proxy-access: denied
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_runner_credential_grant}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
+        CREDENTIAL_ACTIVE: {status: 409, recoveryAction: inspect_runner_credential_grant}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: raw-body
+        identity:
+          - {in: path, name: jobRef}
+          - {in: header, name: KCS-Credential-Grant-Ref}
+        digest: credentialSha256
+        digestLocation: header
+        projection: {source: requestBody, encoding: raw-bytes}
+        metadataDigest:
+          field: grantMetadataDigest
+          kind: rfc8785-jcs
+          digestLocation: header
+          projection:
+            - {field: kind, header: KCS-Credential-Kind}
+            - {field: agentRunRef, header: KCS-Agent-Run-Ref}
+            - {field: generation, header: KCS-Generation}
+            - {field: nativeLaunchDigest, header: KCS-Native-Launch-Digest}
+            - {field: audience, header: KCS-Audience}
+            - {field: credentialSha256, header: KCS-Credential-SHA256}
+            - {field: projectionTtlSeconds, header: KCS-Projection-TTL-Seconds}
+            - {field: jobUid, header: KCS-Job-UID}
+            - {field: podUid, header: KCS-Pod-UID}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_runner_credential_grant
+      parameters:
+        - {$ref: '#/components/parameters/CredentialGrantRefHeader'}
+        - {$ref: '#/components/parameters/CredentialSha256Header'}
+        - {$ref: '#/components/parameters/GrantMetadataDigestHeader'}
+        - {$ref: '#/components/parameters/RunnerCredentialKindHeader'}
+        - {$ref: '#/components/parameters/AgentRunRefHeader'}
+        - {$ref: '#/components/parameters/GenerationHeader'}
+        - {$ref: '#/components/parameters/NativeLaunchDigestHeader'}
+        - {$ref: '#/components/parameters/AudienceHeader'}
+        - {$ref: '#/components/parameters/JobUidHeader'}
+        - {$ref: '#/components/parameters/PodUidHeader'}
+        - {$ref: '#/components/parameters/ProjectionTtlHeader'}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, maxLength: 65536, x-kcs-maxBytes: 65536}
+      responses:
+        '201':
+          description: New model-gateway credential projection accepted for the exact runner launch.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/RunnerCredentialGrantSnapshot'}}}
+        '200':
+          description: Stable same-grant replay without replacement Secret.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/RunnerCredentialGrantSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/runner/credential-grants/{credentialGrantRef}:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/CredentialGrantRef'}
+    get:
+      tags: [Native runner, Credentials]
+      operationId: inspectRunnerCredentialGrant
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses:
+        '200':
+          description: Non-secret runner grant lifecycle and destruction observation.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/RunnerCredentialGrantSnapshot'}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/runner/start:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Native runner]
+      operationId: startRunner
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-native-start-preconditions:
+        exactBinding: [descriptor.jobUid=job.jobUid, descriptor.podUid=job.podUid]
+        frozenSpec:
+          - descriptor.assemblyDigest=job.spec.native.assemblyDigest
+          - descriptor.taskPath=job.spec.native.taskPath
+          - descriptor.selectedModelProtocol=job.spec.native.selectedModelProtocol
+        activeRecipe:
+          - descriptor.recipeDigest=job.recipeActivation.recipeDigest
+          - job.recipeActivation.state=active
+        credentialGrant:
+          - descriptor.credentialGrantRef=grant.credentialGrantRef
+          - descriptor.agentRunRef=grant.agentRunRef
+          - descriptor.generation=grant.generation
+          - request.nativeLaunchDigest=grant.nativeLaunchDigest
+          - descriptor.jobUid=grant.jobUid
+          - descriptor.podUid=grant.podUid
+          - grant.state=available
+          - grant.projectionExpiresAt>kcsNow
+        readyBeforeAck: [stagingTransfersAvailable, recipeActivationActive]
+        failureCodes: [STALE_BINDING, PRECONDITION_FAILED]
+        softTimerOrigin: successful-startRunner-ack
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
+        ILLEGAL_GENERATION: {status: 409, recoveryAction: inspect_job}
+        CREDENTIAL_EXPIRED: {status: 409, recoveryAction: inspect_runner_credential_grant}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        PRECONDITION_FAILED: {status: 422, recoveryAction: inspect_job}
+        CREDENTIAL_DESTROY_FAILED: {status: 500, recoveryAction: reconcile}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: generation}
+        digest: runnerStartMetadataDigest
+        digestLocation: response
+        projection: {source: requestBody, exclude: [generation]}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RunnerStartRequest'}
+      responses:
+        '202':
+          description: New runner generation accepted; the soft timer starts at this ACK.
+          content: {application/json: {schema: {$ref: '#/components/schemas/NativeRunnerGenerationSnapshot'}}}
+        '200':
+          description: Stable same-generation, same-launch replay.
+          content: {application/json: {schema: {$ref: '#/components/schemas/NativeRunnerGenerationSnapshot'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '415': *Error415
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/jobs/{jobRef}/runner/stop:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Native runner]
+      operationId: stopRunner
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        REPLACEMENT_POD: {status: 409, recoveryAction: reattach}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: jobRef}
+          - {in: body, name: stopRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 202
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RunnerStopRequest'}
+      responses:
+        '202':
+          description: Child-only TERM-to-KILL stop accepted; launcher and control stay alive.
+          content: {application/json: {schema: {$ref: '#/components/schemas/RunnerStopSnapshot'}}}
+        '200':
+          description: Stable stop replay or already-terminal runner observation.
+          content: {application/json: {schema: {$ref: '#/components/schemas/RunnerStopSnapshot'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '404': *Error404
+        '409': *Error409
+        '415': *Error415
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
+        '504': *Error504
+  /api/v2/runtime-recipes/resolve:
+    get:
+      tags: [Runtime recipes]
+      operationId: resolveRuntimeRecipe
+      x-kcs-service-authorization: v2-reader
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      parameters:
+        - name: runnerRef
+          in: query
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueRef'}
+        - name: environmentProfileRef
+          in: query
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueRef'}
+      responses:
+        '200':
+          description: Authorized immutable recipe selected for the exact runner/environment pair.
+          content: {application/json: {schema: {$ref: '#/components/schemas/ResolvedRuntimeRecipe'}}}
+        '400': *Error400
+        '401': *Error401
+        '403': *Error403
+        '422': *Error422
+        '500': *Error500
+        '503': *Error503
   /api/v2/jobs/{jobRef}/transfers:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -924,14 +1222,14 @@ paths:
           headers:
             Cache-Control: {$ref: '#/components/headers/NoStore'}
             KCS-Terminal-Credential: {$ref: '#/components/headers/TerminalCredential'}
-          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyTerminalSessionSnapshot'}}}
         '200':
           description: Stable first-wins replay with a rotated short-lived header credential.
           x-kcs-required-headers: [Cache-Control, KCS-Terminal-Credential]
           headers:
             Cache-Control: {$ref: '#/components/headers/NoStore'}
             KCS-Terminal-Credential: {$ref: '#/components/headers/TerminalCredential'}
-          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyTerminalSessionSnapshot'}}}
         '400': *NoStoreError
         '401': *NoStoreError
         '403': *NoStoreError
@@ -970,7 +1268,7 @@ paths:
           description: Exact non-secret terminal descriptor.
           x-kcs-required-headers: [Cache-Control]
           headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
-          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyTerminalSessionSnapshot'}}}
         '401': *NoStoreError
         '403': *NoStoreError
         '404': *NoStoreError
@@ -1021,7 +1319,7 @@ paths:
           description: Input accepted by the exact PTY.
           x-kcs-required-headers: [Cache-Control]
           headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
-          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyTerminalSessionSnapshot'}}}
         '401': *NoStoreError
         '403': *NoStoreError
         '404': *NoStoreError
@@ -1095,7 +1393,7 @@ paths:
           description: PTY size updated.
           x-kcs-required-headers: [Cache-Control]
           headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
-          content: {application/json: {schema: {$ref: '#/components/schemas/TerminalSessionSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyTerminalSessionSnapshot'}}}
         '400': *NoStoreError
         '401': *NoStoreError
         '403': *NoStoreError
@@ -1177,11 +1475,11 @@ paths:
         required: true
         content:
           application/json:
-            schema: {$ref: '#/components/schemas/FinalizeJobRequest'}
+            schema: {$ref: '#/components/schemas/AnyFinalizeJobRequest'}
       responses:
         '202':
           description: Provider-only quiesce accepted; no research success is inferred.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}}
         '200': *JobReplay
         '400': *Error400
         '401': *Error401
@@ -1237,7 +1535,7 @@ paths:
       responses:
         '202':
           description: Interruption accepted; possible output loss is reported in the snapshot.
-          content: {application/json: {schema: {$ref: '#/components/schemas/JobBindingSnapshot'}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}}
         '200': *JobReplay
         '400': *Error400
         '401': *Error401
@@ -1372,7 +1670,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.3.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.4.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -1395,6 +1693,7 @@ components:
     TransferRef: {name: transferRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     OperationRef: {name: operationRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     Container: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace]}}
+    AnyContainer: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace, runner, control]}}
     Cursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
     EventCursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
     EventLimit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 200}}
@@ -1420,6 +1719,16 @@ components:
     AgentRunRefHeader: {name: KCS-Agent-Run-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     GenerationHeader: {name: KCS-Generation, in: header, required: true, schema: {type: integer, minimum: 1}}
     LaunchBundleDigestHeader: {name: KCS-Launch-Bundle-Digest, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    NativeLaunchDigestHeader: {name: KCS-Native-Launch-Digest, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
+    RunnerCredentialKindHeader: {name: KCS-Credential-Kind, in: header, required: true, schema: {type: string, const: modelGatewayToken}}
+    ProjectionTtlHeader:
+      name: KCS-Projection-TTL-Seconds
+      in: header
+      required: true
+      description: >-
+        KCS Secret-projection lease. Minimum 120 seconds covers observed kubelet
+        projection jitter; this is distinct from opaque gateway-token claim expiry.
+      schema: {type: integer, minimum: 120, maximum: 900}
     AudienceHeader: {name: KCS-Audience, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     JobUidHeader: {name: KCS-Job-UID, in: header, required: true, schema: {$ref: '#/components/schemas/KubernetesUid'}}
     PodUidHeader: {name: KCS-Pod-UID, in: header, required: true, schema: {$ref: '#/components/schemas/KubernetesUid'}}
@@ -1662,10 +1971,31 @@ components:
           items: {$ref: '#/components/schemas/NodeTelemetrySnapshot'}
     RuntimeEventKind:
       type: string
-      enum: [job_phase, node_condition, image_pull, scheduling, oom]
+      enum: [job_phase, node_condition, image_pull, scheduling, oom, runner_phase]
+    RunnerPhaseEventDetail:
+      type: object
+      additionalProperties: false
+      required: [generation, state, sequence, stateDigest, stopCause, processExitKind, exitCode, signal, protocolTerminalObserved]
+      properties:
+        generation: {type: integer, minimum: 1}
+        state: {$ref: '#/components/schemas/NativeRunnerState'}
+        sequence: {type: integer, minimum: 1}
+        stateDigest: {$ref: '#/components/schemas/Sha256'}
+        stopCause: {$ref: '#/components/schemas/RunnerStopCause'}
+        processExitKind: {type: string, enum: [not_observed, exited, signaled]}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        signal: {$ref: '#/components/schemas/NullableInteger'}
+        protocolTerminalObserved: {type: boolean}
     RuntimeEvent:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [kind]
+            properties: {kind: {const: runner_phase}}
+          then:
+            properties:
+              detail: {$ref: '#/components/schemas/RunnerPhaseEventDetail'}
       required: [sequence, occurredAt, kind, jobRef, computeNode, detail]
       properties:
         sequence: {type: integer, minimum: 1}
@@ -1756,6 +2086,76 @@ components:
         sharedWorkspace: {$ref: '#/components/schemas/SharedWorkspaceSpec'}
         nodeSelector: {$ref: '#/components/schemas/NodeSelector'}
         activeDeadlineSeconds: {type: integer, minimum: 1, maximum: 86400, default: 21600}
+    SelectedModelProtocol:
+      type: string
+      enum: [openai-responses, openai-completions, anthropic-messages]
+    NativeAcceleratorRequest:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [kind]
+            properties: {kind: {const: none}}
+          then:
+            properties: {count: {const: 0}}
+          else:
+            properties: {count: {type: integer, minimum: 1, maximum: 8}}
+      required: [kind, count]
+      properties:
+        kind: {type: string, enum: [none, nvidia-gpu]}
+        count: {type: integer, minimum: 0, maximum: 8}
+    NativeRuntimeResources:
+      type: object
+      additionalProperties: false
+      required: [cpuMillis, memoryMiB, ephemeralStorageMiB, accelerator]
+      properties:
+        cpuMillis: {type: integer, minimum: 1, maximum: 64000}
+        memoryMiB: {type: integer, minimum: 1, maximum: 262144}
+        ephemeralStorageMiB:
+          type: integer
+          minimum: 1
+          description: >-
+            Requested Pod ephemeral-storage for writable layers, logs, and disk-backed
+            emptyDir volumes. OCI image layers are accounted separately by
+            ImageFilesystemEstimate. The platform policy supplies the upper bound.
+        accelerator: {$ref: '#/components/schemas/NativeAcceleratorRequest'}
+    NativeModelEnv:
+      type: object
+      additionalProperties: false
+      x-kcs-configured-gateway-only: true
+      required: [OPENAI_BASE_URL, ANTHROPIC_BASE_URL, MODEL_ROUTE, RC_MODEL_GATEWAY_TOKEN_FILE]
+      properties:
+        OPENAI_BASE_URL: {type: string, format: uri, pattern: '^https://'}
+        ANTHROPIC_BASE_URL: {type: string, format: uri, pattern: '^https://'}
+        MODEL_ROUTE: {$ref: '#/components/schemas/OpaqueRef'}
+        RC_MODEL_GATEWAY_TOKEN_FILE: {type: string, const: /var/run/rc/model-gateway/token}
+    NativeRuntimeSpec:
+      type: object
+      additionalProperties: false
+      required: [runnerRef, environmentProfileRef, taskPath, runnerDeadlineSeconds, selectedModelProtocol, modelEnv, resources, assemblyDigest]
+      properties:
+        runnerRef: {$ref: '#/components/schemas/OpaqueRef'}
+        environmentProfileRef: {$ref: '#/components/schemas/OpaqueRef'}
+        taskPath: {type: string, const: /workspace/worktree/TASK.md}
+        runnerDeadlineSeconds: {type: integer, minimum: 1}
+        selectedModelProtocol: {$ref: '#/components/schemas/SelectedModelProtocol'}
+        modelEnv: {$ref: '#/components/schemas/NativeModelEnv'}
+        resources: {$ref: '#/components/schemas/NativeRuntimeResources'}
+        assemblyDigest: {$ref: '#/components/schemas/Sha256'}
+    NativeJobSpec:
+      type: object
+      additionalProperties: false
+      x-kcs-placement-owner: kcs
+      required: [subjectRef, runtimePlanDigest, sharedWorkspace, native]
+      properties:
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
+        sharedWorkspace: {$ref: '#/components/schemas/SharedWorkspaceSpec'}
+        native: {$ref: '#/components/schemas/NativeRuntimeSpec'}
+    CreateJobSpec:
+      oneOf:
+        - {$ref: '#/components/schemas/JobSpec'}
+        - {$ref: '#/components/schemas/NativeJobSpec'}
     CreateJobRequest:
       type: object
       additionalProperties: false
@@ -1763,11 +2163,76 @@ components:
       properties:
         providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
         specDigest: {$ref: '#/components/schemas/Sha256'}
-        spec: {$ref: '#/components/schemas/JobSpec'}
+        spec: {$ref: '#/components/schemas/CreateJobSpec'}
     JobBindingState: {type: string, enum: [provisioning, bound, running, finalizing, succeeded, failed, canceling, canceled, indeterminate, deleting, deleted]}
     ProviderTerminalState: {type: string, enum: [succeeded, failed, canceled, indeterminate]}
     RoleState: {type: string, enum: [waiting, running, terminated, unknown, indeterminate]}
     RunnerState: {type: string, enum: [not_started, accepted, starting, running, exited, failed, indeterminate]}
+    RuntimeLane: {type: string, enum: [hosted, native]}
+    NativeRunnerState: {type: string, enum: [starting, running, exited, killed]}
+    RunnerStopCause:
+      type: string
+      enum: [none, natural_exit, stop_requested, soft_deadline, cancel_requested, oom_killed, hard_deadline, node_lost, provider_lost, unknown]
+    ProcessExitObservation:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [kind]
+            properties: {kind: {const: not_observed}}
+          then:
+            properties: {exitCode: {type: 'null'}, signal: {type: 'null'}}
+        - if:
+            required: [kind]
+            properties: {kind: {const: exited}}
+          then:
+            properties: {exitCode: {type: integer}, signal: {type: 'null'}}
+        - if:
+            required: [kind]
+            properties: {kind: {const: signaled}}
+          then:
+            properties: {exitCode: {type: 'null'}, signal: {type: integer, minimum: 1}}
+      required: [kind, exitCode, signal]
+      properties:
+        kind: {type: string, enum: [not_observed, exited, signaled]}
+        exitCode: {$ref: '#/components/schemas/NullableInteger'}
+        signal: {$ref: '#/components/schemas/NullableInteger'}
+    ProtocolTerminalObservation:
+      type: object
+      additionalProperties: false
+      required: [observed, eventKind, stopReason, errorCode]
+      properties:
+        observed: {type: boolean}
+        eventKind: {$ref: '#/components/schemas/NullableString'}
+        stopReason: {$ref: '#/components/schemas/NullableString'}
+        errorCode: {$ref: '#/components/schemas/NullableString'}
+    NativeRunnerObservation:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [state]
+            properties: {state: {const: exited}}
+          then:
+            properties: {stopCause: {const: natural_exit}}
+        - if:
+            required: [stopCause]
+            properties:
+              stopCause: {enum: [stop_requested, soft_deadline, cancel_requested, oom_killed, hard_deadline]}
+          then:
+            properties: {state: {const: killed}}
+      required: [state, sequence, stateDigest, childPid, processExit, stopCause, protocolTerminal, childStartedAt, childFinishedAt, observedAt]
+      properties:
+        state: {$ref: '#/components/schemas/NativeRunnerState'}
+        sequence: {type: integer, minimum: 1}
+        stateDigest: {$ref: '#/components/schemas/Sha256'}
+        childPid: {$ref: '#/components/schemas/NullableInteger'}
+        processExit: {$ref: '#/components/schemas/ProcessExitObservation'}
+        stopCause: {$ref: '#/components/schemas/RunnerStopCause'}
+        protocolTerminal: {$ref: '#/components/schemas/ProtocolTerminalObservation'}
+        childStartedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        childFinishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     CredentialState: {type: string, enum: [accepted, available, acknowledged, consumed, destroyed, expired, revoked, destroy_failed, indeterminate]}
     TransferState: {type: string, enum: [registered, staging, available, streaming, completed, canceling, canceled, discarded, failed, indeterminate]}
     OperationState: {type: string, enum: [accepted, running, succeeded, failed, indeterminate]}
@@ -1910,6 +2375,241 @@ components:
         launchBundleSizeBytes: {type: integer, minimum: 0, maximum: 1048576}
         materialPaths: {type: array, uniqueItems: true, x-kcs-casefoldUnique: true, items: {$ref: '#/components/schemas/SafeRelativePath'}}
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+    NativeLaunchDescriptor:
+      type: object
+      additionalProperties: false
+      required: [executionEnvelopeRef, executionEnvelopeDigest, agentRunRef, generation, jobUid, podUid, assemblyDigest, recipeDigest, taskPath, baseManifestDigest, stagingTransferRefs, selectedModelProtocol, credentialGrantRef]
+      properties:
+        executionEnvelopeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        executionEnvelopeDigest: {$ref: '#/components/schemas/Sha256'}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        assemblyDigest: {$ref: '#/components/schemas/Sha256'}
+        recipeDigest: {$ref: '#/components/schemas/Sha256'}
+        taskPath: {type: string, const: /workspace/worktree/TASK.md}
+        baseManifestDigest: {$ref: '#/components/schemas/Sha256'}
+        stagingTransferRefs:
+          type: array
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/OpaqueRef'}
+        selectedModelProtocol: {$ref: '#/components/schemas/SelectedModelProtocol'}
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+    RunnerStartRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-native-launch-digest:
+        algorithm: sha256
+        canonicalization: rfc8785-jcs
+        value: descriptor
+        digestField: nativeLaunchDigest
+      x-kcs-relations:
+        - {left: generation, operator: '=', right: descriptor.generation}
+      required: [generation, nativeLaunchDigest, descriptor]
+      properties:
+        generation: {type: integer, minimum: 1}
+        nativeLaunchDigest: {$ref: '#/components/schemas/Sha256'}
+        descriptor: {$ref: '#/components/schemas/NativeLaunchDescriptor'}
+    NativeRunnerGenerationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, generation, agentRunRef, nativeLaunchDigest, credentialGrantRef, runnerStartMetadataDigest, runnerObservation, launcherAlive, softTimerStartedAt, softDeadlineAt, observedAt, replayed, credentialAcknowledgedAt, credentialDestroyedAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        nativeLaunchDigest: {$ref: '#/components/schemas/Sha256'}
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        runnerStartMetadataDigest: {$ref: '#/components/schemas/Sha256'}
+        runnerObservation: {$ref: '#/components/schemas/NativeRunnerObservation'}
+        launcherAlive: {type: boolean}
+        softTimerStartedAt:
+          description: KCS acceptance timestamp for startRunner; this is the sole soft-deadline timer origin.
+          allOf: [{$ref: '#/components/schemas/Timestamp'}]
+        softDeadlineAt: {$ref: '#/components/schemas/Timestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        replayed: {type: boolean}
+        credentialAcknowledgedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        credentialDestroyedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+    RunnerStopReason:
+      type: string
+      enum: [stop_requested, cancel_requested, soft_deadline]
+    RunnerStopSpec:
+      type: object
+      additionalProperties: false
+      required: [jobUid, podUid, generation, reason]
+      properties:
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        reason: {$ref: '#/components/schemas/RunnerStopReason'}
+    RunnerStopRequest:
+      type: object
+      additionalProperties: false
+      required: [stopRef, requestDigest, spec]
+      properties:
+        stopRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/RunnerStopSpec'}
+    RunnerStopSnapshot:
+      type: object
+      additionalProperties: false
+      required: [jobRef, stopRef, requestDigest, binding, generation, state, result, termSentAt, killSentAt, runnerTerminalAt, runnerObservation, observedAt, replayed]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        stopRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        binding: {$ref: '#/components/schemas/BindingIdentity'}
+        generation: {type: integer, minimum: 1}
+        state: {$ref: '#/components/schemas/ActionState'}
+        result: {type: string, enum: [already_terminal, terminated, killed, indeterminate]}
+        termSentAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        killSentAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        runnerTerminalAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        runnerObservation: {$ref: '#/components/schemas/NativeRunnerObservation'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        replayed: {type: boolean}
+    RuntimeRecipeDeliveryMode: {type: string, enum: [assembled, prebuilt]}
+    RuntimeIdentity:
+      type: object
+      additionalProperties: false
+      required: [runtimeUid, runtimeGid, launcherUid, launcherGid, experimentUid, experimentGid, terminalUid, terminalGid]
+      properties:
+        runtimeUid: {type: integer, const: 0}
+        runtimeGid: {type: integer, const: 0}
+        launcherUid: {type: integer, const: 0}
+        launcherGid: {type: integer, const: 0}
+        experimentUid: {type: integer, const: 10001}
+        experimentGid: {type: integer, const: 10001}
+        terminalUid: {type: integer, const: 10002}
+        terminalGid: {type: integer, const: 10001}
+    RuntimeRecipeMount:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if: {required: [role], properties: {role: {const: workspace}}}
+          then: {properties: {mountPath: {const: /workspace}, readOnly: {const: false}}}
+        - if: {required: [role], properties: {role: {const: platform}}}
+          then: {properties: {mountPath: {const: /opt/rc-platform}, readOnly: {const: true}}}
+        - if: {required: [role], properties: {role: {const: runner}}}
+          then: {properties: {mountPath: {const: /opt/rc-runner}, readOnly: {const: true}}}
+        - if: {required: [role], properties: {role: {const: control}}}
+          then: {properties: {mountPath: {const: /run/rc-control}, readOnly: {const: false}}}
+        - if: {required: [role], properties: {role: {const: credential}}}
+          then: {properties: {mountPath: {const: /var/run/rc/model-gateway}, readOnly: {const: true}}}
+        - if: {required: [role], properties: {role: {const: userHome}}}
+          then: {properties: {mountPath: {const: /run/rc-user/home}, readOnly: {const: false}}}
+        - if: {required: [role], properties: {role: {const: userTmp}}}
+          then: {properties: {mountPath: {const: /run/rc-user/tmp}, readOnly: {const: false}}}
+        - if: {required: [role], properties: {role: {const: terminalHome}}}
+          then: {properties: {mountPath: {const: /run/rc-terminal/home}, readOnly: {const: false}}}
+        - if: {required: [role], properties: {role: {const: terminalTmp}}}
+          then: {properties: {mountPath: {const: /run/rc-terminal/tmp}, readOnly: {const: false}}}
+      required: [role, mountPath, readOnly]
+      properties:
+        role: {type: string, enum: [workspace, platform, runner, control, credential, userHome, userTmp, terminalHome, terminalTmp]}
+        mountPath: {type: string, minLength: 1, pattern: '^/'}
+        readOnly: {type: boolean}
+    AssembledRecipeDelivery:
+      type: object
+      additionalProperties: false
+      required: [mode, transport, environmentImageDigest, platformImageVolumeDigest, runnerImageVolumeDigest, controlImageDigest]
+      properties:
+        mode: {type: string, const: assembled}
+        transport: {type: string, const: imageVolume}
+        environmentImageDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        platformImageVolumeDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        runnerImageVolumeDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        controlImageDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+    PrebuiltRecipeDelivery:
+      type: object
+      additionalProperties: false
+      required: [mode, prebuiltImageDigest, platformImageVolumeDigest, controlImageDigest]
+      properties:
+        mode: {type: string, const: prebuilt}
+        prebuiltImageDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        platformImageVolumeDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        controlImageDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+    RuntimeRecipeDelivery:
+      oneOf:
+        - {$ref: '#/components/schemas/AssembledRecipeDelivery'}
+        - {$ref: '#/components/schemas/PrebuiltRecipeDelivery'}
+    ImageFilesystemEstimate:
+      type: object
+      additionalProperties: false
+      description: >-
+        KCS admission/headroom estimate after deduplicating environment, platform,
+        and runner image layers. These bytes are not Pod ephemeral-storage usage.
+      required: [imageFsCompressedBytes, imageFsUnpackedBytes]
+      properties:
+        imageFsCompressedBytes: {type: integer, minimum: 0}
+        imageFsUnpackedBytes: {type: integer, minimum: 0}
+    ResolvedRuntimeRecipe:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [delivery]
+            properties:
+              delivery: {required: [mode], properties: {mode: {const: assembled}}}
+          then:
+            properties:
+              mounts:
+                minItems: 9
+                maxItems: 9
+                contains: {required: [role], properties: {role: {const: runner}}}
+                minContains: 1
+                maxContains: 1
+              runnerEntrypoint:
+                prefixItems: [{type: string, pattern: '^/opt/rc-runner/'}]
+          else:
+            properties: {mounts: {minItems: 8, maxItems: 8}}
+      required: [runnerRef, environmentProfileRef, recipeRef, recipeDigest, delivery, imageFilesystem, launcherCommand, runnerEntrypoint, controlCommand, launcherSocketPath, identity, mounts, supportedModelProtocols, observedAt]
+      properties:
+        runnerRef: {$ref: '#/components/schemas/OpaqueRef'}
+        environmentProfileRef: {$ref: '#/components/schemas/OpaqueRef'}
+        recipeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        recipeDigest: {$ref: '#/components/schemas/Sha256'}
+        delivery: {$ref: '#/components/schemas/RuntimeRecipeDelivery'}
+        imageFilesystem: {$ref: '#/components/schemas/ImageFilesystemEstimate'}
+        launcherCommand:
+          type: array
+          const: [/opt/rc-platform/bin/rc-native-launcher]
+          description: The runtime container's only PID 1 command.
+        runnerEntrypoint:
+          type: array
+          minItems: 1
+          prefixItems: [{type: string, pattern: '^/'}]
+          items: {type: string}
+          description: Child argv executed only by rc-native-launcher after the identity transition.
+        controlCommand:
+          type: array
+          const: [/opt/kcs/workspace-sidecar, rpc]
+        launcherSocketPath: {type: string, const: /run/rc-control/launcher.sock}
+        identity: {$ref: '#/components/schemas/RuntimeIdentity'}
+        mounts:
+          type: array
+          minItems: 8
+          maxItems: 9
+          uniqueItems: true
+          x-kcs-uniqueBy: role
+          allOf:
+            - {contains: {required: [role], properties: {role: {const: workspace}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: platform}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: control}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: credential}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: userHome}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: userTmp}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: terminalHome}}}, minContains: 1, maxContains: 1}
+            - {contains: {required: [role], properties: {role: {const: terminalTmp}}}, minContains: 1, maxContains: 1}
+          items: {$ref: '#/components/schemas/RuntimeRecipeMount'}
+        supportedModelProtocols:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/SelectedModelProtocol'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     ActionSnapshot:
       type: object
       additionalProperties: false
@@ -2001,6 +2701,41 @@ components:
         observedAt: {$ref: '#/components/schemas/Timestamp'}
         writable: {type: boolean, const: true}
         agentPaused: {type: boolean}
+    NativeTerminalSessionSnapshot:
+      type: object
+      additionalProperties: false
+      x-kcs-relations:
+        - {left: ptyRef, operator: '=', right: terminalRef}
+      required: [terminalRef, ptyRef, requestDigest, subjectRef, jobRef, jobUid, podUid, container, state, createdAt, expiresAt, observedAt, writable, runnerPaused, launcherMediated, shellCommand, effectiveUid, effectiveGid, effectiveCapabilities, noNewPrivileges, umask, cwd, home, tmpdir]
+      properties:
+        terminalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        ptyRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        container: {type: string, const: runner}
+        state: {$ref: '#/components/schemas/TerminalState'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        writable: {type: boolean, const: true}
+        runnerPaused: {type: boolean, const: true}
+        launcherMediated: {type: boolean, const: true}
+        shellCommand: {type: array, const: [/bin/sh]}
+        effectiveUid: {type: integer, const: 10002}
+        effectiveGid: {type: integer, const: 10001}
+        effectiveCapabilities: {type: array, const: []}
+        noNewPrivileges: {type: boolean, const: true}
+        umask: {type: string, const: '0002'}
+        cwd: {type: string, const: /workspace/worktree}
+        home: {type: string, const: /run/rc-terminal/home}
+        tmpdir: {type: string, const: /run/rc-terminal/tmp}
+    AnyTerminalSessionSnapshot:
+      oneOf:
+        - {$ref: '#/components/schemas/TerminalSessionSnapshot'}
+        - {$ref: '#/components/schemas/NativeTerminalSessionSnapshot'}
     JobBindingSnapshot:
       type: object
       additionalProperties: false
@@ -2071,6 +2806,189 @@ components:
         outputLossPossible: {type: boolean}
         cleanup: {$ref: '#/components/schemas/CleanupObservation'}
         gpuRelease: {$ref: '#/components/schemas/CleanupObservation'}
+    NativeObservedResources:
+      type: object
+      additionalProperties: false
+      required: [cpuMillis, memoryMiB, peakEphemeralStorageMiB, acceleratorKind, acceleratorCount]
+      properties:
+        cpuMillis: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        memoryMiB: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        peakEphemeralStorageMiB:
+          description: Peak Pod writable-layer, log, and disk-backed emptyDir usage; excludes image layers.
+          oneOf: [{type: integer, minimum: 0}, {type: 'null'}]
+        acceleratorKind:
+          oneOf: [{type: string, enum: [none, nvidia-gpu]}, {type: 'null'}]
+        acceleratorCount: {oneOf: [{type: integer, minimum: 0, maximum: 8}, {type: 'null'}]}
+    NativeAdmittedResources:
+      type: object
+      additionalProperties: false
+      x-kcs-relations:
+        - {left: cpuRequestMillis, operator: '<=', right: cpuLimitMillis}
+        - {left: memoryRequestMiB, operator: '<=', right: memoryLimitMiB}
+        - {left: ephemeralStorageRequestMiB, operator: '<=', right: ephemeralStorageLimitMiB}
+      required: [cpuRequestMillis, cpuLimitMillis, memoryRequestMiB, memoryLimitMiB, ephemeralStorageRequestMiB, ephemeralStorageLimitMiB, accelerator]
+      properties:
+        cpuRequestMillis: {type: integer, minimum: 1}
+        cpuLimitMillis: {type: integer, minimum: 1}
+        memoryRequestMiB: {type: integer, minimum: 1}
+        memoryLimitMiB: {type: integer, minimum: 1}
+        ephemeralStorageRequestMiB:
+          type: integer
+          minimum: 1
+          description: Admitted Pod request; excludes image filesystem layers.
+        ephemeralStorageLimitMiB:
+          type: integer
+          minimum: 1
+          description: Admitted Pod limit; distinct from observed peak usage and image filesystem layers.
+        accelerator: {$ref: '#/components/schemas/NativeAcceleratorRequest'}
+    RunnerRoleSnapshot:
+      type: object
+      additionalProperties: false
+      required: [containerId, imageId, state, ready, restartCount, reason, startedAt, finishedAt, requested, observed, observation]
+      properties:
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        imageId: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/RoleState'}
+        ready: {type: boolean}
+        restartCount: {type: integer, minimum: 0}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        requested: {$ref: '#/components/schemas/NativeRuntimeResources'}
+        observed: {$ref: '#/components/schemas/NativeObservedResources'}
+        observation: {$ref: '#/components/schemas/NativeRunnerObservation'}
+    ControlRoleSnapshot:
+      type: object
+      additionalProperties: false
+      required: [containerId, imageId, state, ready, restartCount, reason, startedAt, finishedAt]
+      properties:
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        imageId: {$ref: '#/components/schemas/NullableString'}
+        state: {$ref: '#/components/schemas/RoleState'}
+        ready: {type: boolean}
+        restartCount: {type: integer, minimum: 0}
+        reason: {$ref: '#/components/schemas/NullableString'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+    RecipeActivationState: {type: string, enum: [pending, active, failed, indeterminate]}
+    RecipeDeliveryFailure:
+      type: string
+      enum: [none, enospc, emptydir_evicted, image_pull, image_volume_mount, identity_mismatch, indeterminate]
+    AssembledActivationDeliveryReceipt:
+      type: object
+      additionalProperties: false
+      required: [mode, transport, environmentImageRef, environmentImageId, platformImageVolumeRef, platformImageVolumeId, runnerImageVolumeRef, runnerImageVolumeId, controlImageRef, controlImageId]
+      properties:
+        mode: {type: string, const: assembled}
+        transport: {type: string, const: imageVolume}
+        environmentImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        environmentImageId: {$ref: '#/components/schemas/NullableString'}
+        platformImageVolumeRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        platformImageVolumeId: {$ref: '#/components/schemas/NullableString'}
+        runnerImageVolumeRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        runnerImageVolumeId: {$ref: '#/components/schemas/NullableString'}
+        controlImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        controlImageId: {$ref: '#/components/schemas/NullableString'}
+    PrebuiltActivationDeliveryReceipt:
+      type: object
+      additionalProperties: false
+      required: [mode, prebuiltImageRef, prebuiltImageId, platformImageVolumeRef, platformImageVolumeId, controlImageRef, controlImageId]
+      properties:
+        mode: {type: string, const: prebuilt}
+        prebuiltImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        prebuiltImageId: {$ref: '#/components/schemas/NullableString'}
+        platformImageVolumeRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        platformImageVolumeId: {$ref: '#/components/schemas/NullableString'}
+        controlImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        controlImageId: {$ref: '#/components/schemas/NullableString'}
+    ActivationDeliveryReceipt:
+      oneOf:
+        - {$ref: '#/components/schemas/AssembledActivationDeliveryReceipt'}
+        - {$ref: '#/components/schemas/PrebuiltActivationDeliveryReceipt'}
+    RuntimeRecipeActivationReceipt:
+      type: object
+      additionalProperties: false
+      required: [activationRef, assemblyDigest, recipeRef, recipeDigest, deliveryReceipt, imageFilesystem, state, deliveryFailure, replacementPodCreated, jobUid, podUid, nodeName, requestedResources, admittedResources, observedResources, activatedAt, observedAt]
+      properties:
+        activationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        assemblyDigest: {$ref: '#/components/schemas/Sha256'}
+        recipeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        recipeDigest: {$ref: '#/components/schemas/Sha256'}
+        deliveryReceipt: {$ref: '#/components/schemas/ActivationDeliveryReceipt'}
+        imageFilesystem: {$ref: '#/components/schemas/ImageFilesystemEstimate'}
+        state: {$ref: '#/components/schemas/RecipeActivationState'}
+        deliveryFailure: {$ref: '#/components/schemas/RecipeDeliveryFailure'}
+        replacementPodCreated: {type: boolean, const: false}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        nodeName: {type: string, minLength: 1, maxLength: 128}
+        requestedResources: {$ref: '#/components/schemas/NativeRuntimeResources'}
+        admittedResources: {$ref: '#/components/schemas/NativeAdmittedResources'}
+        observedResources: {$ref: '#/components/schemas/NativeObservedResources'}
+        activatedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    NativeDeadlineSnapshot:
+      type: object
+      additionalProperties: false
+      required: [runnerDeadlineSeconds, softTimerStartedAt, softDeadlineAt, hardDeadlineSeconds, hardDeadlineAt, hardDeadlineTriggeredAt, policyDigest]
+      properties:
+        runnerDeadlineSeconds: {type: integer, minimum: 1}
+        softTimerStartedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        softDeadlineAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        hardDeadlineSeconds: {type: integer, minimum: 1}
+        hardDeadlineAt: {$ref: '#/components/schemas/Timestamp'}
+        hardDeadlineTriggeredAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        policyDigest: {$ref: '#/components/schemas/Sha256'}
+    NativeJobBindingSnapshot:
+      type: object
+      additionalProperties: false
+      required: [runtimeLane, jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, runner, control, latestRunnerGeneration, recipeActivation, deadline, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, runnerStopAction, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
+      properties:
+        runtimeLane: {type: string, const: native}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        providerHandle: {$ref: '#/components/schemas/OpaqueRef'}
+        providerRequestId: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid:
+          oneOf: [{$ref: '#/components/schemas/KubernetesUid'}, {type: 'null'}]
+        resourceVersion: {$ref: '#/components/schemas/NullableString'}
+        nodeName: {$ref: '#/components/schemas/NullableString'}
+        bindingState: {$ref: '#/components/schemas/JobBindingState'}
+        bindingReason: {$ref: '#/components/schemas/NullableString'}
+        observedPodCount: {type: integer, minimum: 0, maximum: 1}
+        podIncarnations: {type: array, maxItems: 1, uniqueItems: true, items: {$ref: '#/components/schemas/PodIncarnationSnapshot'}}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        updatedAt: {$ref: '#/components/schemas/Timestamp'}
+        startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+        runner:
+          oneOf: [{$ref: '#/components/schemas/RunnerRoleSnapshot'}, {type: 'null'}]
+        control:
+          oneOf: [{$ref: '#/components/schemas/ControlRoleSnapshot'}, {type: 'null'}]
+        latestRunnerGeneration:
+          oneOf: [{$ref: '#/components/schemas/NativeRunnerGenerationSnapshot'}, {type: 'null'}]
+        recipeActivation:
+          oneOf: [{$ref: '#/components/schemas/RuntimeRecipeActivationReceipt'}, {type: 'null'}]
+        deadline: {$ref: '#/components/schemas/NativeDeadlineSnapshot'}
+        activeOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        terminalOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        credentialObservations: {type: array, items: {$ref: '#/components/schemas/CredentialObservation'}}
+        transferObservations: {type: array, items: {$ref: '#/components/schemas/TransferObservation'}}
+        runnerStopAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        finalizeAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        cancelAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        deleteAction: {$ref: '#/components/schemas/ActionSnapshot'}
+        outputLossPossible: {type: boolean}
+        cleanup: {$ref: '#/components/schemas/CleanupObservation'}
+        gpuRelease: {$ref: '#/components/schemas/CleanupObservation'}
+    AnyJobBindingSnapshot:
+      oneOf:
+        - {$ref: '#/components/schemas/JobBindingSnapshot'}
+        - {$ref: '#/components/schemas/NativeJobBindingSnapshot'}
     JobBindingSnapshotList:
       type: object
       additionalProperties: false
@@ -2078,6 +2996,17 @@ components:
       required: [items, tombstones, nextPageToken, observedAt]
       properties:
         items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/JobBindingSnapshot'}}
+        tombstones: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/JobTombstone'}}
+        nextPageToken:
+          oneOf: [{$ref: '#/components/schemas/OpaquePageToken'}, {type: 'null'}]
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    AnyJobBindingSnapshotList:
+      type: object
+      additionalProperties: false
+      x-kcs-combinedMaxItems: {limit: 200, properties: [items, tombstones]}
+      required: [items, tombstones, nextPageToken, observedAt]
+      properties:
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/AnyJobBindingSnapshot'}}
         tombstones: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/JobTombstone'}}
         nextPageToken:
           oneOf: [{$ref: '#/components/schemas/OpaquePageToken'}, {type: 'null'}]
@@ -2101,6 +3030,29 @@ components:
         terminal: {type: boolean}
         containerId: {$ref: '#/components/schemas/NullableString'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+    NativeRoleLogs:
+      type: object
+      additionalProperties: false
+      required: [jobRef, jobUid, podUid, container, inputCursor, startCursor, nextCursor, content, truncated, terminal, containerId, observedAt]
+      properties:
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        container: {type: string, enum: [runner, control]}
+        inputCursor:
+          oneOf: [{$ref: '#/components/schemas/OpaqueCursor'}, {type: 'null'}]
+        startCursor: {$ref: '#/components/schemas/OpaqueCursor'}
+        nextCursor:
+          oneOf: [{$ref: '#/components/schemas/OpaqueCursor'}, {type: 'null'}]
+        content: {type: string, maxLength: 1048576, x-kcs-maxUtf8Bytes: 1048576}
+        truncated: {type: boolean}
+        terminal: {type: boolean}
+        containerId: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    AnyRoleLogs:
+      oneOf:
+        - {$ref: '#/components/schemas/RoleLogs'}
+        - {$ref: '#/components/schemas/NativeRoleLogs'}
     CredentialGrantSnapshot:
       type: object
       additionalProperties: false
@@ -2186,6 +3138,44 @@ components:
         consumedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         destroyedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        tombstoneExpiresAt: {$ref: '#/components/schemas/Timestamp'}
+        secretPresent: {$ref: '#/components/schemas/NullableBoolean'}
+        destroyFailureReason: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    RunnerCredentialGrantSnapshot:
+      type: object
+      additionalProperties: false
+      description: >-
+        KCS projection lifecycle only. projectionTtlSeconds and projectionExpiresAt
+        are not the model-gateway token claim lifetime.
+      required: [credentialGrantRef, kind, credentialSha256, grantMetadataDigest, agentRunRef, generation, nativeLaunchDigest, audience, projectionTtlSeconds, jobRef, jobUid, podUid, state, acceptedAt, availableAt, acknowledgedAt, ackAgentRunRef, ackGeneration, consumedAt, destroyedAt, projectionExpiresAt, tombstoneExpiresAt, secretPresent, destroyFailureReason, observedAt]
+      properties:
+        credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        kind: {type: string, const: modelGatewayToken}
+        credentialSha256: {$ref: '#/components/schemas/Sha256'}
+        grantMetadataDigest: {$ref: '#/components/schemas/Sha256'}
+        agentRunRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        nativeLaunchDigest: {$ref: '#/components/schemas/Sha256'}
+        audience: {$ref: '#/components/schemas/OpaqueRef'}
+        projectionTtlSeconds:
+          type: integer
+          minimum: 120
+          maximum: 900
+          description: KCS projection lease only; gateway claim TTL is intentionally not represented.
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        state: {$ref: '#/components/schemas/CredentialState'}
+        acceptedAt: {$ref: '#/components/schemas/Timestamp'}
+        availableAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        acknowledgedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        ackAgentRunRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        ackGeneration:
+          oneOf: [{type: integer, minimum: 1}, {type: 'null'}]
+        consumedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        destroyedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        projectionExpiresAt: {$ref: '#/components/schemas/Timestamp'}
         tombstoneExpiresAt: {$ref: '#/components/schemas/Timestamp'}
         secretPresent: {$ref: '#/components/schemas/NullableBoolean'}
         destroyFailureReason: {$ref: '#/components/schemas/NullableString'}
@@ -2376,6 +3366,48 @@ components:
         finalizeRef: {$ref: '#/components/schemas/OpaqueRef'}
         requestDigest: {$ref: '#/components/schemas/Sha256'}
         spec: {$ref: '#/components/schemas/FinalizeSpec'}
+    NativeCaptureState: {type: string, enum: [complete, failed, indeterminate]}
+    NativeCaptureBarrier:
+      type: object
+      additionalProperties: false
+      required: [captureRef, captureReceiptDigest, captureFenceRef, state, failureReason, jobUid, podUid, generation, runnerObservationSequence, runnerObservationDigest, capturedTransferRefs, observedAt]
+      properties:
+        captureRef: {$ref: '#/components/schemas/OpaqueRef'}
+        captureReceiptDigest: {$ref: '#/components/schemas/Sha256'}
+        captureFenceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        state: {$ref: '#/components/schemas/NativeCaptureState'}
+        failureReason: {$ref: '#/components/schemas/NullableString'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        runnerObservationSequence: {type: integer, minimum: 1}
+        runnerObservationDigest: {$ref: '#/components/schemas/Sha256'}
+        capturedTransferRefs:
+          type: array
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/OpaqueRef'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    NativeFinalizeSpec:
+      type: object
+      additionalProperties: false
+      required: [operationRefs, transferRefs, drainTimeoutSeconds, captureBarrier]
+      properties:
+        operationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        transferRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
+        drainTimeoutSeconds: {type: integer, minimum: 1, maximum: 86400}
+        captureBarrier: {$ref: '#/components/schemas/NativeCaptureBarrier'}
+    NativeFinalizeJobRequest:
+      type: object
+      additionalProperties: false
+      required: [finalizeRef, requestDigest, spec]
+      properties:
+        finalizeRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/NativeFinalizeSpec'}
+    AnyFinalizeJobRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/FinalizeJobRequest'}
+        - {$ref: '#/components/schemas/NativeFinalizeJobRequest'}
     CancelSpec:
       type: object
       additionalProperties: false
@@ -2419,7 +3451,7 @@ components:
       enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
     RecoveryAction:
       type: string
-      enum: [retry_same, inspect_job, inspect_grant, inspect_transfer, inspect_operation, inspect_terminal, reattach, reconcile, new_attempt, none]
+      enum: [retry_same, inspect_job, inspect_grant, inspect_runner_credential_grant, inspect_transfer, inspect_operation, inspect_terminal, reattach, reconcile, new_attempt, none]
     ErrorDetail:
       type: object
       additionalProperties: false

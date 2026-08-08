@@ -1,0 +1,36 @@
+{
+  "jobRef": "job-native-001",
+  "generation": 1,
+  "agentRunRef": "agent-run-001",
+  "nativeLaunchDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+  "credentialGrantRef": "runner-grant-001",
+  "runnerStartMetadataDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "runnerObservation": {
+    "state": "running",
+    "sequence": 1,
+    "stateDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "childPid": 42,
+    "processExit": {
+      "kind": "not_observed",
+      "exitCode": null,
+      "signal": null
+    },
+    "stopCause": "none",
+    "protocolTerminal": {
+      "observed": false,
+      "eventKind": null,
+      "stopReason": null,
+      "errorCode": null
+    },
+    "childStartedAt": "2026-08-08T09:01:00Z",
+    "childFinishedAt": null,
+    "observedAt": "2026-08-08T09:01:00Z"
+  },
+  "launcherAlive": true,
+  "softTimerStartedAt": "2026-08-08T09:01:00Z",
+  "softDeadlineAt": "2026-08-08T10:01:00Z",
+  "observedAt": "2026-08-08T09:01:00Z",
+  "replayed": false,
+  "credentialAcknowledgedAt": "2026-08-08T09:01:00Z",
+  "credentialDestroyedAt": "2026-08-08T09:01:00Z"
+}

@@ -1,0 +1,45 @@
+{
+  "runnerRef": "runner-codex",
+  "environmentProfileRef": "env-default",
+  "recipeRef": "recipe-codex-env-default-v1",
+  "recipeDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+  "delivery": {
+    "mode": "assembled",
+    "transport": "imageVolume",
+    "environmentImageDigest": "registry.example/environment@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "platformImageVolumeDigest": "registry.example/platform@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "runnerImageVolumeDigest": "registry.example/runner@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "controlImageDigest": "registry.example/control@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "imageFilesystem": {
+    "imageFsCompressedBytes": 700000000,
+    "imageFsUnpackedBytes": 1500000000
+  },
+  "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
+  "runnerEntrypoint": ["/opt/rc-runner/usr/local/bin/codex", "exec"],
+  "controlCommand": ["/opt/kcs/workspace-sidecar", "rpc"],
+  "launcherSocketPath": "/run/rc-control/launcher.sock",
+  "identity": {
+    "runtimeUid": 0,
+    "runtimeGid": 0,
+    "launcherUid": 0,
+    "launcherGid": 0,
+    "experimentUid": 10001,
+    "experimentGid": 10001,
+    "terminalUid": 10002,
+    "terminalGid": 10001
+  },
+  "mounts": [
+    {"role": "workspace", "mountPath": "/workspace", "readOnly": false},
+    {"role": "platform", "mountPath": "/opt/rc-platform", "readOnly": true},
+    {"role": "runner", "mountPath": "/opt/rc-runner", "readOnly": true},
+    {"role": "control", "mountPath": "/run/rc-control", "readOnly": false},
+    {"role": "credential", "mountPath": "/var/run/rc/model-gateway", "readOnly": true},
+    {"role": "userHome", "mountPath": "/run/rc-user/home", "readOnly": false},
+    {"role": "userTmp", "mountPath": "/run/rc-user/tmp", "readOnly": false},
+    {"role": "terminalHome", "mountPath": "/run/rc-terminal/home", "readOnly": false},
+    {"role": "terminalTmp", "mountPath": "/run/rc-terminal/tmp", "readOnly": false}
+  ],
+  "supportedModelProtocols": ["openai-responses", "openai-completions", "anthropic-messages"],
+  "observedAt": "2026-08-08T08:59:00Z"
+}

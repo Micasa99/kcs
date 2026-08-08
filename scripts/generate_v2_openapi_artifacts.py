@@ -58,6 +58,8 @@ RESPONSE_EXAMPLE_FIELDS = {
 NO_STORE_OPERATION_IDS = {
     "grantCredential",
     "inspectCredentialGrant",
+    "grantRunnerCredential",
+    "inspectRunnerCredentialGrant",
     "putTransferContent",
     "getTransferContent",
     "getCanonicalOpenApi",
@@ -73,6 +75,9 @@ MUTATION_OPERATION_IDS = {
     "createJob",
     "grantCredential",
     "startAgent",
+    "grantRunnerCredential",
+    "startRunner",
+    "stopRunner",
     "registerTransfer",
     "putTransferContent",
     "cancelTransfer",
@@ -97,6 +102,11 @@ OPERATION_AUTHORIZATION = {
     "grantCredential": "v2-private-credential-writer",
     "inspectCredentialGrant": "v2-reader",
     "startAgent": "v2-mutator",
+    "grantRunnerCredential": "v2-private-credential-writer",
+    "inspectRunnerCredentialGrant": "v2-reader",
+    "startRunner": "v2-mutator",
+    "stopRunner": "v2-mutator",
+    "resolveRuntimeRecipe": "v2-reader",
     "registerTransfer": "v2-mutator",
     "inspectTransfer": "v2-reader",
     "discardTransfer": "v2-mutator",
@@ -133,6 +143,17 @@ EXPECTED_OPERATION_LOCATIONS = {
         "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",
     ),
     "startAgent": ("post", "/api/v2/jobs/{jobRef}/agent/start"),
+    "grantRunnerCredential": (
+        "post",
+        "/api/v2/jobs/{jobRef}/runner/credential-grants",
+    ),
+    "inspectRunnerCredentialGrant": (
+        "get",
+        "/api/v2/jobs/{jobRef}/runner/credential-grants/{credentialGrantRef}",
+    ),
+    "startRunner": ("post", "/api/v2/jobs/{jobRef}/runner/start"),
+    "stopRunner": ("post", "/api/v2/jobs/{jobRef}/runner/stop"),
+    "resolveRuntimeRecipe": ("get", "/api/v2/runtime-recipes/resolve"),
     "registerTransfer": ("post", "/api/v2/jobs/{jobRef}/transfers"),
     "inspectTransfer": ("get", "/api/v2/jobs/{jobRef}/transfers/{transferRef}"),
     "discardTransfer": ("delete", "/api/v2/jobs/{jobRef}/transfers/{transferRef}"),
@@ -186,6 +207,9 @@ EXPECTED_ROOT_FEATURES = {
     "transferModes": ["direct"],
     "rangeRequests": False,
     "signedTransfers": False,
+    "nativeRunner": True,
+    "runtimeRecipeDeliveryModes": ["assembled", "prebuilt"],
+    "runtimeRecipeDeliveryDefault": "assembled.imageVolume",
 }
 EXPECTED_ROOT_LIMITS = {
     "refUtf8Bytes": 256,
@@ -205,8 +229,8 @@ EXPECTED_ROOT_LIMITS = {
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "40996905f9caf8bb67125b376de6564255623d70be09dec871772d413409deec"
-CANONICAL_OPENAPI_SHA256 = "965ec1236bab74d2306ce96c97109abc12f80971f18dc32b3bb7602bc8fed526"
+CANONICAL_X_KCS_POLICY_SHA256 = "ebd665ee1630216cd2ae4f56f59627aa524a3a91c7219bf5814b8dc6872e5acc"
+CANONICAL_OPENAPI_SHA256 = "5d47e071cf515f89ffd66837989e511819d2b1d26366d466dfe0f2eac59bac38"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -795,7 +819,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.3.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.4.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -1175,6 +1199,7 @@ def _validate_contract_extensions(document: dict[str, Any]) -> None:
     if (
         info.get("x-kcs-features") != EXPECTED_ROOT_FEATURES
         or info.get("x-kcs-limits") != EXPECTED_ROOT_LIMITS
+        or document.get("x-kcs-contract-status") != "dormant"
         or document.get("x-kcs-legacy-authorization") != expected_legacy_authorization
         or document.get("x-kcs-network-boundary") != expected_network_boundary
     ):
@@ -1239,11 +1264,13 @@ def _validate_contract_extensions(document: dict[str, Any]) -> None:
         "x-kcs-rbac-boundary": "v2-namespace-only",
         "x-kcs-legacy-proxy-access": "denied",
     }
-    credential_operation = operations.get("grantCredential", (None, None, {}))[2]
-    if any(
-        credential_operation.get(key) != value for key, value in expected_credential_privacy.items()
-    ):
-        raise ValueError("credential privacy policy declaration is invalid")
+    for operation_id in ("grantCredential", "grantRunnerCredential"):
+        credential_operation = operations.get(operation_id, (None, None, {}))[2]
+        if any(
+            credential_operation.get(key) != value
+            for key, value in expected_credential_privacy.items()
+        ):
+            raise ValueError(f"{operation_id}: credential privacy policy declaration is invalid")
 
     expected_operation_policies = {
         "createJob": {
@@ -2873,8 +2900,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.3.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.3.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.4.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.4.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")
@@ -2950,7 +2977,18 @@ def main() -> int:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--skip-package",
+        action="store_true",
+        help="freeze canonical review artifacts without replacing the served package",
+    )
     args = parser.parse_args()
+
+    source_document = _load_yaml(args.source)
+    if source_document.get("x-kcs-contract-status") == "dormant" and not args.skip_package:
+        raise SystemExit(
+            "dormant contract requires --skip-package; served package activation is forbidden"
+        )
 
     if args.check:
         with tempfile.TemporaryDirectory(prefix="kcs-v2-openapi-") as temp:
@@ -2964,7 +3002,7 @@ def main() -> int:
                 args.output_dir
             ):
                 raise SystemExit("committed generated artifacts are stale")
-            if (
+            if not args.skip_package and (
                 not DEFAULT_PACKAGE_RESOURCE.is_file()
                 or DEFAULT_PACKAGE_RESOURCE.read_bytes() != first.openapi_json.read_bytes()
             ):
@@ -2976,8 +3014,9 @@ def main() -> int:
             return 0
 
     artifacts = generate_artifacts(args.source, args.output_dir)
-    DEFAULT_PACKAGE_RESOURCE.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_PACKAGE_RESOURCE.write_bytes(artifacts.openapi_json.read_bytes())
+    if not args.skip_package:
+        DEFAULT_PACKAGE_RESOURCE.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_PACKAGE_RESOURCE.write_bytes(artifacts.openapi_json.read_bytes())
     print(f"{artifacts.sha256}  {artifacts.openapi_json.name}")
     return 0
 

@@ -1,0 +1,52 @@
+{
+  "activationRef": "activation-native-001",
+  "assemblyDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+  "recipeRef": "recipe-codex-env-default-v1",
+  "recipeDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+  "deliveryReceipt": {
+    "mode": "assembled",
+    "transport": "imageVolume",
+    "environmentImageRef": "registry.example/environment@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "environmentImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "platformImageVolumeRef": "registry.example/platform@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "platformImageVolumeId": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "runnerImageVolumeRef": "registry.example/runner@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "runnerImageVolumeId": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "controlImageRef": "registry.example/control@sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "controlImageId": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "imageFilesystem": {
+    "imageFsCompressedBytes": 700000000,
+    "imageFsUnpackedBytes": 1500000000
+  },
+  "state": "active",
+  "deliveryFailure": "none",
+  "replacementPodCreated": false,
+  "jobUid": "11111111-1111-4111-8111-111111111111",
+  "podUid": "22222222-2222-4222-8222-222222222222",
+  "nodeName": "gpu-node-01",
+  "requestedResources": {
+    "cpuMillis": 2000,
+    "memoryMiB": 4096,
+    "ephemeralStorageMiB": 4096,
+    "accelerator": {"kind": "nvidia-gpu", "count": 1}
+  },
+  "admittedResources": {
+    "cpuRequestMillis": 2000,
+    "cpuLimitMillis": 4000,
+    "memoryRequestMiB": 4096,
+    "memoryLimitMiB": 8192,
+    "ephemeralStorageRequestMiB": 4096,
+    "ephemeralStorageLimitMiB": 8192,
+    "accelerator": {"kind": "nvidia-gpu", "count": 1}
+  },
+  "observedResources": {
+    "cpuMillis": 2000,
+    "memoryMiB": 4096,
+    "peakEphemeralStorageMiB": 512,
+    "acceleratorKind": "nvidia-gpu",
+    "acceleratorCount": 1
+  },
+  "activatedAt": "2026-08-08T09:00:00Z",
+  "observedAt": "2026-08-08T09:00:00Z"
+}

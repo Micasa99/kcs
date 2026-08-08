@@ -24,6 +24,11 @@ EXPECTED_PATHS = {
     "/api/v2/jobs/{jobRef}/agent/credential-grants",
     "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}",
     "/api/v2/jobs/{jobRef}/agent/start",
+    "/api/v2/jobs/{jobRef}/runner/credential-grants",
+    "/api/v2/jobs/{jobRef}/runner/credential-grants/{credentialGrantRef}",
+    "/api/v2/jobs/{jobRef}/runner/start",
+    "/api/v2/jobs/{jobRef}/runner/stop",
+    "/api/v2/runtime-recipes/resolve",
     "/api/v2/jobs/{jobRef}/transfers",
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}",
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
@@ -52,6 +57,11 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs/{jobRef}/agent/credential-grants": {"post"},
     "/api/v2/jobs/{jobRef}/agent/credential-grants/{credentialGrantRef}": {"get"},
     "/api/v2/jobs/{jobRef}/agent/start": {"post"},
+    "/api/v2/jobs/{jobRef}/runner/credential-grants": {"post"},
+    "/api/v2/jobs/{jobRef}/runner/credential-grants/{credentialGrantRef}": {"get"},
+    "/api/v2/jobs/{jobRef}/runner/start": {"post"},
+    "/api/v2/jobs/{jobRef}/runner/stop": {"post"},
+    "/api/v2/runtime-recipes/resolve": {"get"},
     "/api/v2/jobs/{jobRef}/transfers": {"post"},
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}": {"get", "delete"},
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content": {"get", "put"},
@@ -101,7 +111,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.3.0"
+    assert openapi["info"]["version"] == "2.4.0"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {
         path: {method for method in item if method in {"get", "post", "put", "delete"}}
@@ -172,6 +182,9 @@ def test_contract_enforces_frozen_limits_and_closed_mutating_payloads() -> None:
 
     for name, schema in schemas.items():
         if name.endswith("Request"):
+            if "oneOf" in schema:
+                assert name == "AnyFinalizeJobRequest"
+                continue
             assert schema["type"] == "object", name
             assert schema["additionalProperties"] is False, name
 

@@ -1,0 +1,19 @@
+{
+  "generation": 1,
+  "nativeLaunchDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+  "descriptor": {
+    "executionEnvelopeRef": "envelope-native-001",
+    "executionEnvelopeDigest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "agentRunRef": "agent-run-001",
+    "generation": 1,
+    "jobUid": "11111111-1111-4111-8111-111111111111",
+    "podUid": "22222222-2222-4222-8222-222222222222",
+    "assemblyDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "recipeDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+    "taskPath": "/workspace/worktree/TASK.md",
+    "baseManifestDigest": "9999999999999999999999999999999999999999999999999999999999999999",
+    "stagingTransferRefs": ["transfer-input-001"],
+    "selectedModelProtocol": "openai-responses",
+    "credentialGrantRef": "runner-grant-001"
+  }
+}
