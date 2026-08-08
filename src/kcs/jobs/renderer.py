@@ -292,7 +292,7 @@ class V2JobRenderer:
                 command=["/opt/kcs/workspace-sidecar"],
                 env=self._environment(
                     {
-                        "KCS_WORKSPACE": "/workspace/worktree",
+                        "KCS_WORKSPACE": "/workspace",
                         "KCS_WORKSPACE_SOCKET": "/run/rc-control/workspace.sock",
                         "KCS_NATIVE_LAUNCHER_SOCKET": str(recipe.root["launcherSocketPath"]),
                         "KCS_NATIVE_RUNNER_STATE_PATH": "/run/rc-control/runner-state.json",

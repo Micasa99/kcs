@@ -83,7 +83,9 @@ def test_native_renderer_builds_only_runner_control_and_no_replacement(tmp_path:
         "KILL",
     }
     assert control.security_context.run_as_user == 0
-    assert {item.name: item.value for item in control.env}["TMPDIR"] == "/run/rc-control"
+    control_env = {item.name: item.value for item in control.env}
+    assert control_env["KCS_WORKSPACE"] == "/workspace"
+    assert control_env["TMPDIR"] == "/run/rc-control"
     assert all(item.name != "model-gateway-credential" for item in control.volume_mounts)
     credential = next(
         item for item in pod.volumes if item.name == "model-gateway-credential"
