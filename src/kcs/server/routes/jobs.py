@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib.resources
@@ -288,9 +289,9 @@ async def _transfer_body_file(request: Request, content_length: int) -> Path:
                 received += len(chunk)
                 if received > content_length:
                     raise TransferBytesMismatchError()
-                output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
+                await asyncio.to_thread(output.write, chunk)
+            await asyncio.to_thread(output.flush)
+            await asyncio.to_thread(os.fsync, output.fileno())
         if received != content_length:
             raise TransferBytesMismatchError()
         return path
@@ -636,11 +637,13 @@ def create_jobs_router(
         subject_ref: Annotated[str, Header(alias="KCS-Subject-Ref")],
         credential: Annotated[str, Header(alias="KCS-Terminal-Credential")],
     ) -> Response:
+        content = await _terminal_input_body(request)
         return _json_model(
-            provider.write_terminal(
+            await asyncio.to_thread(
+                provider.write_terminal,
                 job_ref,
                 terminal_ref,
-                await _terminal_input_body(request),
+                content,
                 subject_ref=subject_ref,
                 credential=credential,
             )
@@ -805,8 +808,12 @@ def create_jobs_router(
             job_uid=str(job_uid),
             pod_uid=str(pod_uid),
         )
-        result = provider.grant_runner_credential_result(
-            job_ref, metadata, await _credential_body(request)
+        credential = await _credential_body(request)
+        result = await asyncio.to_thread(
+            provider.grant_runner_credential_result,
+            job_ref,
+            metadata,
+            credential,
         )
         return _json_model(result.snapshot, status_code=201 if result.created else 200)
 
@@ -923,8 +930,12 @@ def create_jobs_router(
             job_uid=job_uid,
             pod_uid=pod_uid,
         )
-        result = provider.grant_credential_result(
-            job_ref, metadata, await _credential_body(request)
+        credential = await _credential_body(request)
+        result = await asyncio.to_thread(
+            provider.grant_credential_result,
+            job_ref,
+            metadata,
+            credential,
         )
         return _json_model(result.snapshot, status_code=201 if result.created else 200)
 
@@ -1052,7 +1063,7 @@ def create_jobs_router(
         content_sha256: Annotated[str, Header(alias="KCS-Content-SHA256", pattern=_SHA256_PATTERN)],
         content_length: Annotated[int, Header(alias="Content-Length", ge=0, le=107374182400)],
     ) -> Response:
-        transfer = provider.inspect_transfer(job_ref, transfer_ref)
+        transfer = await asyncio.to_thread(provider.inspect_transfer, job_ref, transfer_ref)
         if (
             transfer.spec.content_sha256 != content_sha256
             or content_length != transfer.spec.declared_size_bytes
@@ -1062,8 +1073,12 @@ def create_jobs_router(
         path = await _transfer_body_file(request, content_length)
         try:
             with path.open("rb") as stream:
-                snapshot = provider.stage_transfer_content(
-                    job_ref, transfer_ref, stream, content_length=content_length
+                snapshot = await asyncio.to_thread(
+                    provider.stage_transfer_content,
+                    job_ref,
+                    transfer_ref,
+                    stream,
+                    content_length=content_length,
                 )
             return _json_model(snapshot)
         finally:
