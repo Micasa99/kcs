@@ -152,6 +152,13 @@ process smokes, and local k3s are never formal deployment evidence. See
 ## Tests
 
 ```bash
-pytest tests/ -v                # 29 integration tests
-python tests/performance.py     # throughput + latency benchmarks
+pytest -q \
+  tests/jobs/test_native_m1.py \
+  tests/jobs/test_v24_hosted_compatibility.py \
+  tests/jobs/test_v2_acceptance_matrix.py \
+  tests/jobs/test_openapi_contract.py
 ```
+
+These focused contract/lifecycle checks are the pre-deploy gate. Formal acceptance is
+the real remote Journey described above and in the native runbook; a local smoke or a
+test count is not deployment evidence.

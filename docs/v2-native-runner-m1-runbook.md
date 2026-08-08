@@ -89,3 +89,28 @@ state snapshot; first verify the 31 hosted operation locations and hosted schema
 fingerprints, then deploy one API replica and run hosted smoke before admitting a
 native recipe. A failed smoke rolls back the API image/config without deleting
 managed Jobs or their state PVC.
+
+## 7. 2026-08-09 isolated MLE canary
+
+The first joint ResearchCosmos MLE success path ran in the isolated
+`rc-native-m1-20260809` canary. It used API image
+`sha256:8eee7c1e093a2672dca98e4347f407e24b00aaa7875a01f8835753c8fdcf56ac`
+from source commit `330b3d6531e1ef452367cda543d6a1e50398b1c2`, with the contract SHA named
+at the top of this runbook.
+
+One native Codex Job staged the six-file MLE workspace, ran autonomously as UID
+10001, exited 0, and remained capturable until ResearchCosmos sealed a complete
+NativeAttemptCapture and finalized the Job. During the full staging and runner path,
+the canary API Pod remained Ready with restart count 0. Runner and control logs were
+read and attested; ResearchCosmos completed its result basis, verdict, cleanup, and
+closure.
+
+This run exposed event-loop starvation caused by synchronous provider/file writes in
+async transfer routes. Those calls now run off the API event loop; the successful
+Journey used the rebuilt image above. A retained earlier canary Job and PVC were
+removed through the typed KCS delete operation after exact identity checks.
+
+The production `researchcosmos-v2` namespace was not patched, restarted, or rolled
+out and remains on v2.3. This canary closes the natural success path only. Gateway
+429, report-missing, cancel/revoke, hard-deadline/indeterminate, ENOSPC/eviction, and
+hosted/native parallel Journeys remain production gates.
