@@ -2683,6 +2683,8 @@ class V2JobProvider:
         values = {
             "identityDigest": request.request_digest,
             "cancelRef": request.cancel_ref,
+            "jobUid": str(root["jobUid"]),
+            "podUid": str(root["podUid"]),
             "requestSpec": request.spec.model_dump_json(by_alias=True),
             "payload": phase_payload("accepted", self._now(), output_loss_possible=False),
         }

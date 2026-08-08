@@ -6,6 +6,8 @@ COPY LICENSE README.md pyproject.toml ./
 COPY src ./src
 RUN python -m pip install --index-url "$PIP_INDEX_URL" --timeout 120 --disable-pip-version-check --no-cache-dir \
       setuptools==80.9.0 wheel==0.45.1 \
+    && python -m pip wheel --index-url "$PIP_INDEX_URL" --timeout 120 --disable-pip-version-check \
+      --wheel-dir=/wheels rfc8785==0.1.4 \
     && python -m pip wheel --index-url "$PIP_INDEX_URL" --timeout 120 --disable-pip-version-check --no-build-isolation \
       --no-deps --wheel-dir=/wheels .
 
@@ -20,7 +22,7 @@ COPY --from=build /wheels /tmp/wheels
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates python3-minimal python3-pip \
     && python3 -m pip install --break-system-packages --disable-pip-version-check \
-      --no-cache-dir --no-deps /tmp/wheels/kcs-*.whl \
+      --no-cache-dir --no-deps /tmp/wheels/rfc8785-*.whl /tmp/wheels/kcs-*.whl \
     && rm -rf /var/lib/apt/lists/* /tmp/wheels \
     && install -d -m 0755 /opt/kcs /run/kcs /workspace \
     && ln -s /usr/local/bin/kcs-workspace-sidecar /opt/kcs/workspace-sidecar
