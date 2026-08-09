@@ -14,6 +14,17 @@ import (
 	"time"
 )
 
+func TestChildIdentityClearsInheritedSupplementaryGroups(t *testing.T) {
+	attributes := childProcessAttributes(10002, 10001)
+	credential := attributes.Credential
+	if credential == nil || credential.Uid != 10002 || credential.Gid != 10001 {
+		t.Fatalf("child identity differs from the requested uid/gid: %+v", credential)
+	}
+	if credential.NoSetGroups || len(credential.Groups) != 0 {
+		t.Fatalf("child would retain launcher supplementary groups: %+v", credential)
+	}
+}
+
 func TestRunnerAdapterSelectionIsExplicitAndClosed(t *testing.T) {
 	t.Setenv("RC_NATIVE_RUNNER_REF", "native-lane/codex-runner@1")
 	t.Setenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL", "openai-responses")

@@ -30,7 +30,11 @@ func setNoNewPrivileges() error {
 
 func childProcessAttributes(uid, gid uint32) *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uid, Gid: gid, NoSetGroups: true},
+		// PID 1 starts as root so preserving its supplementary groups would
+		// leak group 0 (and device groups) into the experiment/terminal child.
+		// An explicit empty set makes setgroups(2) clear that inherited state
+		// before setgid/setuid.
+		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}},
 		Setpgid:    true,
 		Pdeathsig:  syscall.SIGKILL,
 	}

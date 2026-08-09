@@ -13,7 +13,7 @@ func setNoNewPrivileges() error {
 
 func childProcessAttributes(uid, gid uint32) *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uid, Gid: gid, NoSetGroups: true},
+		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}},
 		Setpgid:    true,
 	}
 }
