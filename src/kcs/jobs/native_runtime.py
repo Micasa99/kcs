@@ -338,8 +338,29 @@ class NativeRuntimeController:
                     identity,
                     {**_values(existing), "payload": _json(payload)},
                 )
+            self._complete_start_intent(job_ref, identity, digest)
             payload["replayed"] = True
             return NativeRunnerGenerationSnapshot.model_validate(payload)
+        intent, _intent_created = self._store.reserve_runtime(
+            "runner-start",
+            identity,
+            job_ref,
+            {
+                "identityDigest": digest,
+                "jobUid": str(binding["jobUid"]),
+                "podUid": str(binding["podUid"]),
+                "requestSpec": request.model_dump_json(),
+                "state": "accepted",
+            },
+        )
+        intent_values = _values(intent)
+        if (
+            intent_values.get("identityDigest") != digest
+            or intent_values.get("jobUid") != str(binding["jobUid"])
+            or intent_values.get("podUid") != str(binding["podUid"])
+            or intent_values.get("requestSpec") != request.model_dump_json()
+        ):
+            raise IdentityDigestConflict()
         grant = self.inspect_grant(job_ref, descriptor["credentialGrantRef"])
         grant_payload = grant.root
         if (
@@ -423,7 +444,20 @@ class NativeRuntimeController:
                 "payload": _json(validated.root),
             },
         )
+        self._complete_start_intent(job_ref, identity, digest)
         return validated
+
+    def _complete_start_intent(self, job_ref: str, identity: str, digest: str) -> None:
+        record = self._store.read_runtime("runner-start", job_ref, identity)
+        if record is None:
+            return
+        values = dict(_values(record))
+        if values.get("identityDigest") != digest:
+            raise IdentityDigestConflict()
+        if values.get("state") == "succeeded":
+            return
+        values["state"] = "succeeded"
+        self._store.update_runtime("runner-start", job_ref, identity, values)
 
     def refresh_generation(
         self, job_ref: str, binding: Mapping[str, Any]
@@ -582,17 +616,29 @@ class NativeRuntimeController:
         if payload.get("state") == "succeeded":
             return NativeMutationResult(payload, False)
         if payload.get("state") == "reserved":
-            reply = self._rpc(
-                binding,
-                {
-                    "command": "finalize",
-                    "requestRef": body["finalizeRef"],
-                    "generation": barrier["generation"],
-                    "captureReceiptDigest": barrier["captureReceiptDigest"],
-                },
-            )
-            if reply.get("finalized") is not True:
-                raise DependencyUnavailableError("launcher did not acknowledge finalize")
+            acknowledged = self._inspect_finalize_receipt(binding, body, barrier)
+            if not acknowledged:
+                try:
+                    reply = self._rpc(
+                        binding,
+                        {
+                            "command": "finalize",
+                            "requestRef": body["finalizeRef"],
+                            "generation": barrier["generation"],
+                            "captureReceiptDigest": barrier["captureReceiptDigest"],
+                        },
+                    )
+                except Exception:
+                    # The launcher may have durably acknowledged and exited
+                    # while the transport response was lost.  The formal
+                    # control authority retains that receipt for adoption.
+                    if not self._inspect_finalize_receipt(binding, body, barrier):
+                        raise
+                else:
+                    if reply.get("finalized") is not True:
+                        raise DependencyUnavailableError(
+                            "launcher did not acknowledge finalize"
+                        )
             payload.update(state="launcher_acknowledged", observedAt=self._now().isoformat())
             record = self._store.update_runtime(
                 "native-finalize",
@@ -620,6 +666,45 @@ class NativeRuntimeController:
             {**_values(record), "payload": _json(payload)},
         )
         return NativeMutationResult(dict(json.loads(_values(record)["payload"])), created)
+
+    def _inspect_finalize_receipt(
+        self,
+        binding: Mapping[str, Any],
+        body: Mapping[str, Any],
+        barrier: Mapping[str, Any],
+    ) -> bool:
+        """Adopt a durable control receipt after an unknown finalize outcome."""
+
+        if self._transport is None:
+            return False
+        launcher_request_digest = canonical_digest(
+            {"captureReceiptDigest": barrier["captureReceiptDigest"]}
+        )
+        try:
+            response = self._transport.rpc(
+                binding,
+                {
+                    "action": "inspectNativeFinalize",
+                    "jobUid": str(binding["jobUid"]),
+                    "podUid": str(binding["podUid"]),
+                    "finalizeRef": str(body["finalizeRef"]),
+                    "generation": int(barrier["generation"]),
+                    "requestDigest": launcher_request_digest,
+                },
+            ).header
+        except Exception:
+            return False
+        if response.get("ok") is not True or response.get("state") == "absent":
+            return False
+        if (
+            response.get("state") != "acknowledged"
+            or response.get("finalizeRef") != body["finalizeRef"]
+            or response.get("generation") != barrier["generation"]
+            or response.get("requestDigest") != launcher_request_digest
+            or response.get("captureReceiptDigest") != barrier["captureReceiptDigest"]
+        ):
+            raise StateConflictError("retained native finalize receipt differs")
+        return True
 
     def revoke_all(self, job_ref: str) -> None:
         for record in self._store.list_runtime("runner-credential", job_ref):

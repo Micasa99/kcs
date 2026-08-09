@@ -54,6 +54,7 @@ class CreateRecord:
     created_at: str
     updated_at: str
     spec_payload: Mapping[str, Any] | None = None
+    native_recipe_snapshot_json: str | None = None
     job_uid: str | None = None
     pod_uid: str | None = None
     pod_incarnations_json: str | None = None
@@ -172,6 +173,7 @@ class V2JobStore:
         spec_payload: Mapping[str, Any] | None = None,
         *,
         spec_json: str | None = None,
+        native_recipe_snapshot: Mapping[str, Any] | None = None,
     ) -> CreateReservation:
         """Atomically reserve an idempotency key before creating the Kubernetes Job.
 
@@ -180,6 +182,7 @@ class V2JobStore:
         second database.  Authorization and credential bytes are never accepted here.
         """
         stored_spec = _normalize_spec(spec_payload, spec_json)
+        stored_recipe = _normalize_snapshot(native_recipe_snapshot)
         now = _timestamp(self._clock())
         record = CreateRecord(
             provider_request_id=provider_request_id,
@@ -189,6 +192,7 @@ class V2JobStore:
             created_at=now,
             updated_at=now,
             spec_payload=stored_spec,
+            native_recipe_snapshot_json=stored_recipe,
         )
         try:
             created = self._kube.create_config_map(_config_map_body(record))
@@ -695,6 +699,16 @@ def _normalize_spec(
     return MappingProxyType(loaded)
 
 
+def _normalize_snapshot(value: Mapping[str, Any] | None) -> str | None:
+    if value is None:
+        return None
+    compact = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    decoded = json.loads(compact)
+    if not isinstance(decoded, dict):
+        raise ValueError("the native recipe snapshot must be a JSON object")
+    return compact
+
+
 def _record_name(provider_request_id: str) -> str:
     return f"kcs-v2-create-{_short_hash(provider_request_id, 32)}"
 
@@ -742,6 +756,7 @@ def _config_map_body(
         "jobUid": record.job_uid,
         "podUid": record.pod_uid,
         "podIncarnations": record.pod_incarnations_json or "[]",
+        "nativeRecipeSnapshotJson": record.native_recipe_snapshot_json,
         "finalState": record.final_state,
         "deleteRef": record.delete_ref,
         "deleteRequestDigest": record.delete_request_digest,
@@ -789,6 +804,7 @@ def _record_from_config_map(config_map: Any) -> CreateRecord:
         created_at=_required(data, "createdAt"),
         updated_at=_required(data, "updatedAt"),
         spec_payload=spec_payload,
+        native_recipe_snapshot_json=data.get("nativeRecipeSnapshotJson"),
         job_uid=data.get("jobUid"),
         pod_uid=data.get("podUid"),
         pod_incarnations_json=data.get("podIncarnations", "[]"),

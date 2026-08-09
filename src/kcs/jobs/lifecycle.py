@@ -17,6 +17,7 @@ _CAS_ATTEMPTS = 12
 _START_TRANSFER_EXCLUSIVE_KINDS = frozenset(
     {
         "agent-start",
+        "native-runner-start",
         "transfer-stage",
         "transfer-reconcile",
         "transfer-cancel",
@@ -274,7 +275,8 @@ class LifecycleGate:
                 and isinstance(close, Mapping)
                 and close.get("phase") == "succeeded"
                 and kind == "delete"
-                and close.get("kind") in {"cancel", "finalize"}
+                and close.get("kind")
+                in {"cancel", "native-cancel", "finalize", "native-finalize"}
             )
             if gate != "open" and not prior_terminal:
                 raise StateConflictError("Another lifecycle close identity is retained")
@@ -471,6 +473,18 @@ def _close_phase_ordinal(kind: str, phase: str, retained_ordinal: int) -> int:
             "credentials_revoked": 1,
             "agent_stopped": 2,
             "workspace_stopped": 3,
+            "succeeded": 4,
+        },
+        "native-finalize": {
+            "accepted": 0,
+            "launcher_acknowledged": 1,
+            "succeeded": 2,
+        },
+        "native-cancel": {
+            "accepted": 0,
+            "credentials_revoked": 1,
+            "runner_stopped": 2,
+            "collections_drained": 3,
             "succeeded": 4,
         },
         "delete": {

@@ -24,12 +24,20 @@ from .contracts import JobBindingState
 @lru_cache(maxsize=1)
 def _canonical_document() -> dict[str, Any]:
     override = os.environ.get("KCS_V2_OPENAPI_PATH")
-    candidates: list[Path] = []
     if override:
-        candidates.append(Path(override))
-    candidates.append(
+        candidate = Path(override)
+        if not candidate.is_file():
+            raise RuntimeError("KCS_V2_OPENAPI_PATH does not name a readable contract")
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("KCS_V2_OPENAPI_PATH is not a valid contract") from error
+        if value.get("info", {}).get("version") != "2.4.0":
+            raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.4 contract")
+        return value
+    candidates = [
         Path(__file__).resolve().parents[3] / "openapi/generated/kcs-v2-jobs.openapi.json"
-    )
+    ]
     for candidate in candidates:
         if candidate.is_file():
             value = json.loads(candidate.read_text(encoding="utf-8"))

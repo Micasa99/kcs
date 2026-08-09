@@ -23,6 +23,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, overload
 from uuid import UUID
 
+from kubernetes.utils.quantity import parse_quantity  # type: ignore[import-untyped]
+
 from .canonical import canonical_bytes, canonical_digest
 from .cluster_feed import ClusterFeed
 from .contracts import (
@@ -133,6 +135,7 @@ from .native_runtime import (
     NativeRuntimeController,
     RunnerCredentialGrantMetadata,
 )
+from .recipe_registry import runtime_recipe_digest
 from .renderer import credential_secret_name, runner_credential_secret_name
 from .transport import (
     AgentRpcResponse,
@@ -282,6 +285,8 @@ class V2JobStoreProtocol(Protocol):
         spec_digest: str,
         job_ref: str,
         spec_payload: Mapping[str, object],
+        *,
+        native_recipe_snapshot: Mapping[str, object] | None = None,
     ) -> object: ...
 
     def read_create(self, provider_request_id: str) -> object | None: ...
@@ -710,7 +715,18 @@ class V2JobProvider:
         ):
             raise StaleBindingError()
         if isinstance(binding, NativeJobBindingSnapshot):
-            return self._create_native_terminal(job_ref, request, binding)
+            self._assert_accepting_workspace_work(job_ref)
+            claim = self._lifecycle.claim(
+                job_ref,
+                str(binding.job_uid),
+                str(binding.pod_uid),
+                "native-terminal-create",
+                request.terminal_ref,
+            )
+            try:
+                return self._create_native_terminal(job_ref, request, binding)
+            finally:
+                claim.release()
         if self._transport is None:
             raise DependencyUnavailableError("Agent pause transport is unavailable")
         now = self._now()
@@ -907,16 +923,28 @@ class V2JobProvider:
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
         if _runtime_values(record).get("runtimeLane") == "native":
-            self._native.launcher_rpc(
-                binding,
-                {
-                    "command": "writePty",
-                    "requestRef": f"terminal-write-{terminal_ref}-{secrets.token_hex(8)}",
-                    "generation": _native_generation_from_values(self.inspect(job_ref).root),
-                    "ptyRef": terminal_ref,
-                    "contentBase64": base64.b64encode(content).decode("ascii"),
-                },
+            self._assert_accepting_workspace_work(job_ref)
+            request_ref = f"terminal-write-{terminal_ref}-{secrets.token_hex(8)}"
+            claim = self._lifecycle.claim(
+                job_ref,
+                binding["jobUid"],
+                binding["podUid"],
+                "native-terminal-write",
+                request_ref,
             )
+            try:
+                self._native.launcher_rpc(
+                    binding,
+                    {
+                        "command": "writePty",
+                        "requestRef": request_ref,
+                        "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                        "ptyRef": terminal_ref,
+                        "contentBase64": base64.b64encode(content).decode("ascii"),
+                    },
+                )
+            finally:
+                claim.release()
         else:
             self._kube.write_workspace_terminal(binding, terminal_ref, content)
         return self._touch_terminal(record)
@@ -979,17 +1007,29 @@ class V2JobProvider:
             job_ref, terminal_ref, subject_ref=subject_ref, credential=credential
         )
         if _runtime_values(record).get("runtimeLane") == "native":
-            self._native.launcher_rpc(
-                binding,
-                {
-                    "command": "resizePty",
-                    "requestRef": f"terminal-resize-{terminal_ref}-{secrets.token_hex(8)}",
-                    "generation": _native_generation_from_values(self.inspect(job_ref).root),
-                    "ptyRef": terminal_ref,
-                    "rows": rows,
-                    "columns": columns,
-                },
+            self._assert_accepting_workspace_work(job_ref)
+            request_ref = f"terminal-resize-{terminal_ref}-{secrets.token_hex(8)}"
+            claim = self._lifecycle.claim(
+                job_ref,
+                binding["jobUid"],
+                binding["podUid"],
+                "native-terminal-resize",
+                request_ref,
             )
+            try:
+                self._native.launcher_rpc(
+                    binding,
+                    {
+                        "command": "resizePty",
+                        "requestRef": request_ref,
+                        "generation": _native_generation_from_values(self.inspect(job_ref).root),
+                        "ptyRef": terminal_ref,
+                        "rows": rows,
+                        "columns": columns,
+                    },
+                )
+            finally:
+                claim.release()
         else:
             self._kube.resize_workspace_terminal(binding, terminal_ref, rows=rows, columns=columns)
         return self._touch_terminal(record)
@@ -1101,6 +1141,9 @@ class V2JobProvider:
                                 else {}
                             ),
                             "ptyRef": terminal_ref,
+                            "reason": "terminal_expired"
+                            if expired
+                            else "terminal_binding_lost",
                         },
                     )
                 else:
@@ -1108,20 +1151,7 @@ class V2JobProvider:
             except Exception:
                 cleanup_failed = True
             try:
-                if native:
-                    self._native.launcher_rpc(
-                        binding,
-                        {
-                            "command": "resume",
-                            "requestRef": f"terminal-resume-{terminal_ref}",
-                            "generation": _native_generation_from_values(
-                                current.root
-                                if isinstance(current, NativeJobBindingSnapshot)
-                                else {}
-                            ),
-                        },
-                    )
-                elif self._transport is not None:
+                if not native and self._transport is not None:
                     self._transport.resume_agent(binding)
             except Exception:
                 cleanup_failed = True
@@ -1419,6 +1449,10 @@ class V2JobProvider:
                         continue
                     lifecycle = self._lifecycle.inspect(job_ref)
                     if lifecycle is not None and lifecycle["activeClaims"]:
+                        for active_claim in lifecycle["activeClaims"]:
+                            intent = active_claim.get("intent")
+                            if isinstance(intent, Mapping):
+                                self._resume_active_lifecycle_claim(job_ref, intent)
 
                         def terminal_truth(
                             intent: Mapping[str, object], retained_job_ref: str = job_ref
@@ -1440,7 +1474,8 @@ class V2JobProvider:
                     if (
                         lifecycle is not None
                         and lifecycle["gate"] == "closing"
-                        and close_kind in {"cancel", "finalize", "delete"}
+                        and close_kind
+                        in {"cancel", "native-cancel", "finalize", "native-finalize", "delete"}
                         and not self._runtime_records(str(close_kind), job_ref)
                     ):
                         if not isinstance(close, Mapping):
@@ -1475,7 +1510,8 @@ class V2JobProvider:
                         lifecycle is not None
                         and lifecycle.get("gate") == "closing"
                         and isinstance(close, Mapping)
-                        and close.get("kind") in {"cancel", "finalize"}
+                        and close.get("kind")
+                        in {"cancel", "native-cancel", "finalize", "native-finalize"}
                     ):
                         self._resume_lifecycle_close(job_ref, close)
                 self.delete(
@@ -1626,18 +1662,39 @@ class V2JobProvider:
         if not hmac.compare_digest(request.spec_digest, canonical_digest(spec_payload)):
             raise DigestMismatchError
 
-        try:
-            rendered_job = self._renderer.render(request)
-        except RuntimeRecipeForbiddenError:
-            self._record_native_recipe_forbidden()
-            raise
         job_ref = self._renderer.job_ref(request)
-        reservation = self._reserve_create(request, job_ref, spec_payload)
+        recipe_snapshot: Mapping[str, object] | None = None
+        rendered_job: object | None = None
+        if isinstance(request, NativeCreateJobRequest):
+            existing = self._store.read_create(request.provider_request_id)
+            if existing is None:
+                native_spec = request.spec["native"]
+                try:
+                    recipe_snapshot = self._renderer.resolve_recipe(
+                        str(native_spec["runnerRef"]),
+                        str(native_spec["environmentProfileRef"]),
+                    ).wire()
+                except RuntimeRecipeForbiddenError:
+                    self._record_native_recipe_forbidden()
+                    raise
+        else:
+            rendered_job = self._renderer.render(request)
+        reservation = self._reserve_create(
+            request,
+            job_ref,
+            spec_payload,
+            native_recipe_snapshot=recipe_snapshot,
+        )
         record = _field(reservation, "record", reservation)
         created = bool(_field(reservation, "created", False))
         self._raise_if_record_conflicts(record, request.provider_request_id, request.spec_digest)
         if _is_deleted(record):
             raise TombstonedError(_tombstone_payload(record))
+        native_recipe = (
+            self._frozen_native_recipe(record)
+            if isinstance(request, NativeCreateJobRequest)
+            else None
+        )
         if str(_field(record, "state", "")) == "deleting":
             return CreateResult(snapshot=self.inspect(job_ref), created=False)
         if _optional_text(record, "indeterminate_reason") is not None:
@@ -1654,6 +1711,8 @@ class V2JobProvider:
                     else self._missing_job_snapshot(record)
                 )
                 return CreateResult(snapshot=missing, created=False)
+            if rendered_job is None:
+                rendered_job = self._renderer.render(request, native_recipe=native_recipe)
             job = self._create_or_reconcile_job(rendered_job, job_ref)
         job_uid = _required_text(job, "metadata", "uid")
         self._store.mark_created(request.provider_request_id, job_uid)
@@ -2056,7 +2115,18 @@ class V2JobProvider:
     ) -> NativeMutationResult:
         snapshot, binding = self._native_binding(job_ref)
         del snapshot
-        return self._native.grant(job_ref, binding, metadata, raw_bytes)
+        self._assert_accepting_workspace_work(job_ref)
+        claim = self._lifecycle.claim(
+            job_ref,
+            str(binding["jobUid"]),
+            str(binding["podUid"]),
+            "native-runner-credential",
+            metadata.credential_grant_ref,
+        )
+        try:
+            return self._native.grant(job_ref, binding, metadata, raw_bytes)
+        finally:
+            claim.release()
 
     def inspect_runner_credential_grant(
         self, job_ref: str, credential_grant_ref: str
@@ -2068,15 +2138,32 @@ class V2JobProvider:
         self, job_ref: str, request: RunnerStartRequest
     ) -> NativeRunnerGenerationSnapshot:
         snapshot, binding = self._native_binding(job_ref)
+        self._assert_accepting_workspace_work(job_ref)
+        claim = self._lifecycle.claim(
+            job_ref,
+            str(binding["jobUid"]),
+            str(binding["podUid"]),
+            "native-runner-start",
+            str(request.root["generation"]),
+        )
+        try:
+            return self._start_runner_unclaimed(job_ref, request, snapshot, binding)
+        finally:
+            claim.release()
+
+    def _start_runner_unclaimed(
+        self,
+        job_ref: str,
+        request: RunnerStartRequest,
+        snapshot: NativeJobBindingSnapshot,
+        binding: Mapping[str, Any],
+    ) -> NativeRunnerGenerationSnapshot:
         root = snapshot.root
         record = self._store.read_by_job_ref(job_ref)
         if record is None:
             raise JobNotFoundError()
         native_spec = _field(_field(record, "spec_payload", {}), "native", {})
-        recipe = self._renderer.resolve_recipe(
-            str(_field(native_spec, "runnerRef")),
-            str(_field(native_spec, "environmentProfileRef")),
-        )
+        recipe = self._frozen_native_recipe(record)
 
         def transfer_ready(ref: str) -> bool:
             try:
@@ -2449,7 +2536,20 @@ class V2JobProvider:
     ) -> FinalizeResult:
         """Quiesce supervisors and revoke credentials without deleting Job/Pod/log reality."""
         if isinstance(request, NativeFinalizeJobRequest):
+            if not hmac.compare_digest(
+                canonical_digest(request.root["spec"]), request.root["requestDigest"]
+            ):
+                raise DigestMismatchError()
             _snapshot, binding = self._native_binding(job_ref)
+            close = self._lifecycle.begin_close(
+                job_ref,
+                str(binding["jobUid"]),
+                str(binding["podUid"]),
+                "native-finalize",
+                request.root["finalizeRef"],
+                request.root["requestDigest"],
+                request.model_dump_json(by_alias=True),
+            )
 
             def transfers_terminal(refs: list[str]) -> bool:
                 for ref in refs:
@@ -2467,7 +2567,15 @@ class V2JobProvider:
                         return False
                 return True
 
-            result = self._native.finalize(job_ref, binding, request, transfers_terminal)
+            try:
+                result = self._native.finalize(job_ref, binding, request, transfers_terminal)
+                close.phase("succeeded", closed=True)
+            except KcsV2Error:
+                close.phase("indeterminate")
+                raise
+            except Exception as error:
+                close.phase("indeterminate")
+                raise DependencyUnavailableError("native finalize did not complete") from error
             return FinalizeResult(snapshot=self.inspect(job_ref), created=result.created)
         self.reconcile_credentials()
         self._assert_no_cancel(job_ref)
@@ -2680,13 +2788,27 @@ class V2JobProvider:
         root = snapshot.root
         if root["podUid"] is None or root["bindingState"] == "indeterminate":
             raise ReplacementPodError()
+        self._assert_not_finalizing(job_ref)
+        request_spec = request.spec.model_dump_json(by_alias=True)
+        close = self._lifecycle.begin_close(
+            job_ref,
+            str(root["jobUid"]),
+            str(root["podUid"]),
+            "native-cancel",
+            request.cancel_ref,
+            request.request_digest,
+            request_spec,
+        )
         values = {
             "identityDigest": request.request_digest,
             "cancelRef": request.cancel_ref,
             "jobUid": str(root["jobUid"]),
             "podUid": str(root["podUid"]),
-            "requestSpec": request.spec.model_dump_json(by_alias=True),
-            "payload": phase_payload("accepted", self._now(), output_loss_possible=False),
+            "requestSpec": request_spec,
+            # Native cancellation keeps control alive for capture.  Until all
+            # pre-authorized collects have terminal truth, possible output
+            # loss is the only honest initial observation.
+            "payload": phase_payload("accepted", self._now(), output_loss_possible=True),
         }
         record, created = self._store.reserve_runtime("cancel", request.cancel_ref, job_ref, values)
         retained = _runtime_values(record)
@@ -2695,45 +2817,81 @@ class V2JobProvider:
             or retained.get("cancelRef") != request.cancel_ref
         ):
             raise IdentityDigestConflict()
-        state, _output_loss, _resume = read_phase(record)
+        state, output_loss, resume_from = read_phase(record)
         if state == "succeeded":
+            close.phase("succeeded", closed=True)
             return CancelResult(snapshot=self.inspect(job_ref), created=False)
+        if state == "indeterminate" and resume_from is None:
+            return CancelResult(snapshot=self.inspect(job_ref), created=False)
+        phase = resume_from or state
         binding = {
             "runtimeLane": "native",
             "jobRef": job_ref,
             "jobUid": root["jobUid"],
             "podUid": root["podUid"],
         }
-        self._native.revoke_all(job_ref)
-        generation = self._native.refresh_generation(job_ref, binding)
-        if generation is not None and generation.root["runnerObservation"]["state"] not in {
-            "exited",
-            "killed",
-        }:
-            stop_spec = {
-                "jobUid": root["jobUid"],
-                "podUid": root["podUid"],
-                "generation": generation.root["generation"],
-                "reason": "cancel_requested",
-            }
-            stop_request = RunnerStopRequest.model_validate(
-                {
-                    "stopRef": f"runner-cancel-{request.request_digest[:24]}",
-                    "requestDigest": canonical_digest(stop_spec),
-                    "spec": stop_spec,
-                }
-            )
-            self._native.stop(job_ref, binding, stop_request)
-        updated = self._store.update_runtime(
-            "cancel",
-            job_ref,
-            request.cancel_ref,
-            {
-                **retained,
-                "payload": phase_payload("succeeded", self._now(), output_loss_possible=False),
-            },
-        )
-        del updated
+        try:
+            if phase == "accepted":
+                self._native.revoke_all(job_ref)
+                record = self._set_cancel_phase(
+                    record, "credentials_revoked", output_loss_possible=True
+                )
+                close.phase("credentials_revoked")
+                phase = "credentials_revoked"
+            if phase == "credentials_revoked":
+                generation = self._native.refresh_generation(job_ref, binding)
+                if generation is not None and generation.root["runnerObservation"]["state"] not in {
+                    "exited",
+                    "killed",
+                }:
+                    stop_spec = {
+                        "jobUid": root["jobUid"],
+                        "podUid": root["podUid"],
+                        "generation": generation.root["generation"],
+                        "reason": "cancel_requested",
+                    }
+                    stop_request = RunnerStopRequest.model_validate(
+                        {
+                            "stopRef": f"runner-cancel-{request.request_digest[:24]}",
+                            "requestDigest": canonical_digest(stop_spec),
+                            "spec": stop_spec,
+                        }
+                    )
+                    self._native.stop(job_ref, binding, stop_request)
+                record = self._set_cancel_phase(
+                    record, "runner_stopped", output_loss_possible=True
+                )
+                close.phase("runner_stopped")
+                phase = "runner_stopped"
+            if phase == "runner_stopped":
+                collect_indeterminate = self._drain_cancel_collects(job_ref, request.spec)
+                output_loss = collect_indeterminate or self._native_cancel_output_loss(
+                    job_ref, request.spec.finish_collect_transfer_refs
+                )
+                record = self._set_cancel_phase(
+                    record,
+                    "collections_drained",
+                    output_loss_possible=output_loss,
+                    collect_indeterminate=collect_indeterminate,
+                )
+                close.phase("collections_drained")
+                phase = "collections_drained"
+            if phase == "collections_drained":
+                record = self._set_cancel_phase(
+                    record, "succeeded", output_loss_possible=output_loss
+                )
+                close.phase("succeeded", closed=True)
+                phase = "succeeded"
+        except KcsV2Error as error:
+            self._set_cancel_indeterminate(record, phase, True, type(error).__name__)
+            close.phase("indeterminate")
+            raise
+        except Exception as error:
+            self._set_cancel_indeterminate(record, phase, True, type(error).__name__)
+            close.phase("indeterminate")
+            raise DependencyUnavailableError("native cancel lifecycle did not complete") from error
+        if phase != "succeeded":
+            raise DependencyUnavailableError("retained native cancel phase is indeterminate")
         return CancelResult(snapshot=self.inspect(job_ref), created=created)
 
     cancel_job = cancel
@@ -2771,7 +2929,8 @@ class V2JobProvider:
                     lifecycle is not None
                     and lifecycle.get("gate") == "closing"
                     and isinstance(retained_close, Mapping)
-                    and retained_close.get("kind") in {"cancel", "finalize"}
+                    and retained_close.get("kind")
+                    in {"cancel", "native-cancel", "finalize", "native-finalize"}
                 ):
                     self._resume_lifecycle_close(job_ref, retained_close)
             final_state = _provider_terminal_state(_field(record, "final_state", "indeterminate"))
@@ -2958,9 +3117,11 @@ class V2JobProvider:
 
     def _reserve_create(
         self,
-        request: CreateJobRequest,
+        request: CreateJobRequest | NativeCreateJobRequest,
         job_ref: str,
         spec_payload: Mapping[str, object],
+        *,
+        native_recipe_snapshot: Mapping[str, object] | None = None,
     ) -> object:
         try:
             return self._store.reserve_create(
@@ -2968,11 +3129,37 @@ class V2JobProvider:
                 request.spec_digest,
                 job_ref,
                 spec_payload,
+                native_recipe_snapshot=native_recipe_snapshot,
             )
         except KcsV2Error:
             raise
         except Exception as error:
             raise DependencyUnavailableError from error
+
+    def _frozen_native_recipe(self, record: object) -> ResolvedRuntimeRecipe:
+        raw = _field(record, "native_recipe_snapshot_json", None)
+        if not isinstance(raw, str) or not raw:
+            raise DependencyUnavailableError(
+                "native create reservation has no frozen runtime recipe"
+            )
+        try:
+            recipe = ResolvedRuntimeRecipe.model_validate_json(raw)
+        except (TypeError, ValueError) as error:
+            raise DependencyUnavailableError(
+                "native create reservation has an invalid runtime recipe"
+            ) from error
+        supplied_digest = str(recipe.root["recipeDigest"])
+        if not hmac.compare_digest(supplied_digest, runtime_recipe_digest(recipe)):
+            raise StateConflictError("frozen native runtime recipe digest differs")
+        spec = _field(record, "spec_payload", {})
+        native_spec = _field(spec, "native", {})
+        if (
+            recipe.runner_ref != str(_field(native_spec, "runnerRef", ""))
+            or recipe.environment_profile_ref
+            != str(_field(native_spec, "environmentProfileRef", ""))
+        ):
+            raise StateConflictError("frozen native runtime recipe pair differs")
+        return recipe
 
     def _live_binding(self, job_ref: str) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         binding = self.inspect(job_ref)
@@ -3029,6 +3216,22 @@ class V2JobProvider:
                 ),
             )
             return
+        if kind == "native-finalize":
+            self.finalize(
+                job_ref,
+                NativeFinalizeJobRequest.model_validate_json(request_spec),
+            )
+            return
+        if kind == "native-cancel":
+            self.cancel(
+                job_ref,
+                CancelJobRequest(
+                    cancel_ref=ref,
+                    request_digest=digest,
+                    spec=CancelSpec.model_validate_json(request_spec),
+                ),
+            )
+            return
         if kind == "delete":
             self.delete(job_ref, ref, digest)
             return
@@ -3059,6 +3262,26 @@ class V2JobProvider:
                 RunnerState.RUNNING,
                 RunnerState.EXITED,
             }
+        if kind == "native-runner-credential":
+            record = self._store.read_runtime("runner-credential", job_ref, ref)
+            if record is None:
+                # The credential controller reserves this record before
+                # creating its Secret, so absence proves no side effect.
+                return True
+            RunnerCredentialGrantSnapshot.model_validate_json(
+                _runtime_values(record)["payload"]
+            )
+            return True
+        if kind == "native-runner-start":
+            intent = self._store.read_runtime("runner-start", job_ref, ref)
+            generation = self._store.read_runtime("runner-generation", job_ref, ref)
+            if intent is None:
+                # runner-start is retained before launcher RPC.
+                return True
+            return (
+                _runtime_values(intent).get("state") == "succeeded"
+                and generation is not None
+            )
         if kind.startswith("transfer-"):
             record = self._store.read_runtime("transfer", job_ref, ref)
             if record is None:
@@ -3086,6 +3309,24 @@ class V2JobProvider:
             }
         return False
 
+    def _resume_active_lifecycle_claim(
+        self, job_ref: str, intent: Mapping[str, object]
+    ) -> None:
+        if intent.get("kind") != "native-runner-start":
+            return
+        generation_ref = str(intent.get("ref", ""))
+        if not generation_ref:
+            return
+        record = self._store.read_runtime("runner-start", job_ref, generation_ref)
+        if record is None or _runtime_values(record).get("state") == "succeeded":
+            return
+        request_spec = _runtime_values(record).get("requestSpec")
+        if not request_spec:
+            raise DependencyUnavailableError("native runner start intent is not replayable")
+        request = RunnerStartRequest.model_validate_json(request_spec)
+        snapshot, binding = self._native_binding(job_ref)
+        self._start_runner_unclaimed(job_ref, request, snapshot, binding)
+
     def _validate_job_annotations(self, record: object) -> None:
         job_ref = str(_field(record, "job_ref"))
         job = self._read_job(job_ref)
@@ -3106,7 +3347,18 @@ class V2JobProvider:
             raise StateConflictError("Job annotations differ from the create reservation")
 
     def _assert_not_finalizing(self, job_ref: str) -> None:
-        if self._runtime_records("finalize", job_ref):
+        lifecycle = self._lifecycle.inspect(job_ref)
+        close = lifecycle.get("close") if lifecycle is not None else None
+        if (
+            self._runtime_records("finalize", job_ref)
+            or self._runtime_records("native-finalize", job_ref)
+            or (
+                lifecycle is not None
+                and lifecycle.get("gate") in {"closing", "closed"}
+                and isinstance(close, Mapping)
+                and close.get("kind") in {"finalize", "native-finalize"}
+            )
+        ):
             raise StateConflictError("The provider is already quiescing this Job")
 
     def _assert_no_cancel(self, job_ref: str) -> None:
@@ -3145,6 +3397,18 @@ class V2JobProvider:
             except Exception:
                 output_loss = True
         return output_loss
+
+    def _native_cancel_output_loss(self, job_ref: str, expected_refs: list[str]) -> bool:
+        """Return false only when every requested collect has proven complete."""
+
+        for transfer_ref in expected_refs:
+            try:
+                snapshot = self._workspace_runtime.inspect_transfer(job_ref, transfer_ref)
+            except Exception:
+                return True
+            if snapshot.state is not TransferState.COMPLETED:
+                return True
+        return False
 
     def _cancel_output_loss(self, job_ref: str) -> bool:
         for record in self._store.list_runtime("transfer", job_ref):
@@ -4184,6 +4448,10 @@ class V2JobProvider:
         if pod_uid_value is None and pod is not None:
             pod_uid_value = _required_text(pod, "metadata", "uid")
         pod_uid = str(pod_uid_value) if pod_uid_value is not None else None
+        recipe = self._frozen_native_recipe(record)
+        recipe_drift = self._native_recipe_drift(job, pod, native_spec, recipe)
+        if replacement_reason is None and recipe_drift is not None:
+            replacement_reason = recipe_drift
         binding_state, binding_reason = _binding_state(job, pod, replacement_reason)
         if replacement_reason is None and pod is not None:
             statuses = {
@@ -4220,10 +4488,6 @@ class V2JobProvider:
         usage = self._pod_usage(pod) if pod is not None else {}
         runner = self._native_runner_role(native_spec, pod, latest, usage.get("runner"))
         control = self._native_control_role(pod)
-        recipe = self._renderer.resolve_recipe(
-            str(_field(native_spec, "runnerRef")),
-            str(_field(native_spec, "environmentProfileRef")),
-        )
         activation = self._native_activation(
             record,
             pod,
@@ -4387,7 +4651,6 @@ class V2JobProvider:
             latest.root["runnerObservation"] if latest else _initial_runner_observation(self._now())
         )
         resources = _field(native_spec, "resources", {})
-        accelerator = _field(resources, "accelerator", {})
         return {
             "containerId": _optional_text(status, "container_id"),
             "imageId": _optional_text(status, "image_id"),
@@ -4402,8 +4665,11 @@ class V2JobProvider:
                 "cpuMillis": None if observed is None else observed.get("cpuMillis"),
                 "memoryMiB": None if observed is None else observed.get("memoryMiB"),
                 "peakEphemeralStorageMiB": None,
-                "acceleratorKind": _field(accelerator, "kind", "none"),
-                "acceleratorCount": int(_field(accelerator, "count", 0)),
+                # The Pod request proves neither assignment nor utilization.
+                # Device facts stay not_reported until a device-scoped source
+                # is joined to this exact Pod UID.
+                "acceleratorKind": None,
+                "acceleratorCount": None,
             },
             "observation": observation,
         }
@@ -4472,9 +4738,6 @@ class V2JobProvider:
                 "controlImageRef": delivery["controlImageDigest"],
                 "controlImageId": control["imageId"] if control else None,
             }
-        cpu = int(resources["cpuMillis"])
-        memory = int(resources["memoryMiB"])
-        ephemeral = int(resources["ephemeralStorageMiB"])
         return {
             "activationRef": f"activation-{str(_field(record, 'job_ref'))}",
             "assemblyDigest": str(_field(native_spec, "assemblyDigest")),
@@ -4489,15 +4752,7 @@ class V2JobProvider:
             "podUid": _required_text(pod, "metadata", "uid"),
             "nodeName": node_name,
             "requestedResources": resources,
-            "admittedResources": {
-                "cpuRequestMillis": cpu + 250,
-                "cpuLimitMillis": min(cpu * 2, 64000) + 1000,
-                "memoryRequestMiB": memory + 256,
-                "memoryLimitMiB": min(memory * 2, 262144) + 1024,
-                "ephemeralStorageRequestMiB": ephemeral + 256,
-                "ephemeralStorageLimitMiB": min(ephemeral * 2, 262144) + 1024,
-                "accelerator": resources["accelerator"],
-            },
+            "admittedResources": self._native_admitted_resources(pod),
             "observedResources": (
                 runner["observed"]
                 if runner
@@ -4514,6 +4769,123 @@ class V2JobProvider:
             ),
             "observedAt": observed_at.isoformat(),
         }
+
+    @staticmethod
+    def _native_admitted_resources(pod: object) -> dict[str, object]:
+        containers = tuple(_path(pod, "spec", "containers") or ())
+
+        def total(section: str, resource: str) -> int:
+            value = sum(
+                (
+                    parse_quantity(
+                        str(
+                            _field(
+                                _field(_field(item, "resources", {}), section, {}),
+                                resource,
+                                "0",
+                            )
+                        )
+                    )
+                    for item in containers
+                ),
+                start=parse_quantity("0"),
+            )
+            parsed = (
+                int(value * 1000)
+                if resource == "cpu"
+                else int(value / (1024 * 1024))
+            )
+            if parsed < 1:
+                raise DependencyUnavailableError(
+                    f"native Pod has no admitted {section} {resource}"
+                )
+            return parsed
+
+        gpu_count = sum(
+            int(
+                _field(
+                    _field(_field(item, "resources", {}), "requests", {}),
+                    "nvidia.com/gpu",
+                    0,
+                )
+            )
+            for item in containers
+        )
+        return {
+            "cpuRequestMillis": total("requests", "cpu"),
+            "cpuLimitMillis": total("limits", "cpu"),
+            "memoryRequestMiB": total("requests", "memory"),
+            "memoryLimitMiB": total("limits", "memory"),
+            "ephemeralStorageRequestMiB": total("requests", "ephemeral-storage"),
+            "ephemeralStorageLimitMiB": total("limits", "ephemeral-storage"),
+            "accelerator": {
+                "kind": "nvidia-gpu" if gpu_count else "none",
+                "count": gpu_count,
+            },
+        }
+
+    @staticmethod
+    def _native_recipe_drift(
+        job: object,
+        pod: object | None,
+        native_spec: Mapping[str, Any],
+        recipe: ResolvedRuntimeRecipe,
+    ) -> str | None:
+        annotations = _path(job, "metadata", "annotations") or {}
+        expected_annotations = {
+            "researchcosmos.io/assembly-digest": str(native_spec["assemblyDigest"]),
+            "researchcosmos.io/recipe-ref": str(recipe.root["recipeRef"]),
+            "researchcosmos.io/recipe-digest": str(recipe.root["recipeDigest"]),
+        }
+        if not isinstance(annotations, Mapping) or any(
+            annotations.get(key) != value for key, value in expected_annotations.items()
+        ):
+            return "Job annotations differ from the frozen native recipe"
+        if pod is None:
+            return None
+        containers = {
+            str(_field(item, "name", "")): item
+            for item in (_path(pod, "spec", "containers") or ())
+        }
+        if set(containers) != {"runner", "control"}:
+            return "Pod container roles differ from the frozen native recipe"
+        delivery = recipe.root["delivery"]
+        runner_image = (
+            delivery["environmentImageDigest"]
+            if delivery["mode"] == "assembled"
+            else delivery["prebuiltImageDigest"]
+        )
+        if (
+            _field(containers["runner"], "image", None) != runner_image
+            or list(_field(containers["runner"], "command", ()) or ())
+            != list(recipe.root["launcherCommand"])
+            or _field(containers["control"], "image", None) != delivery["controlImageDigest"]
+            or list(_field(containers["control"], "command", ()) or ())
+            != list(recipe.root["controlCommand"])
+        ):
+            return "Pod images or commands differ from the frozen native recipe"
+        runner_mounts = {
+            (str(_field(item, "mount_path", "")), bool(_field(item, "read_only", False)))
+            for item in (_field(containers["runner"], "volume_mounts", ()) or ())
+        }
+        expected_mounts = {
+            (str(item["mountPath"]), bool(item["readOnly"])) for item in recipe.root["mounts"]
+        }
+        if runner_mounts != expected_mounts:
+            return "Pod runner mounts differ from the frozen native recipe"
+        volumes = {
+            str(_field(item, "name", "")): item for item in (_path(pod, "spec", "volumes") or ())
+        }
+        platform_ref = _path(volumes.get("rc-platform"), "image", "reference")
+        runner_ref = _path(volumes.get("rc-runner"), "image", "reference")
+        if platform_ref != delivery["platformImageVolumeDigest"] or (
+            delivery["mode"] == "assembled"
+            and runner_ref != delivery["runnerImageVolumeDigest"]
+        ):
+            return "Pod image volumes differ from the frozen native recipe"
+        if delivery["mode"] == "prebuilt" and "rc-runner" in volumes:
+            return "prebuilt native Pod unexpectedly mounts a runner image volume"
+        return None
 
     def _native_missing_job_snapshot(self, record: object) -> NativeJobBindingSnapshot:
         # A native Job that disappeared after UID assignment is intentionally

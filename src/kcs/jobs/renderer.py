@@ -68,9 +68,14 @@ class V2JobRenderer:
     ) -> ResolvedRuntimeRecipe:
         return self._recipes.resolve(runner_ref, environment_profile_ref)
 
-    def render(self, request: CreateJobRequest | NativeCreateJobRequest) -> client.V1Job:
+    def render(
+        self,
+        request: CreateJobRequest | NativeCreateJobRequest,
+        *,
+        native_recipe: ResolvedRuntimeRecipe | None = None,
+    ) -> client.V1Job:
         if isinstance(request, NativeCreateJobRequest):
-            return self._render_native(request)
+            return self._render_native(request, native_recipe=native_recipe)
         spec = request.spec
         node_selector = spec.node_selector.as_mapping()
         if node_selector != dict(self._settings.node_selector):
@@ -193,12 +198,22 @@ class V2JobRenderer:
             ),
         )
 
-    def _render_native(self, request: NativeCreateJobRequest) -> client.V1Job:
+    def _render_native(
+        self,
+        request: NativeCreateJobRequest,
+        *,
+        native_recipe: ResolvedRuntimeRecipe | None = None,
+    ) -> client.V1Job:
         spec = request.spec
         native = spec["native"]
-        recipe = self._recipes.resolve(
+        recipe = native_recipe or self._recipes.resolve(
             str(native["runnerRef"]), str(native["environmentProfileRef"])
         )
+        if (
+            recipe.runner_ref != str(native["runnerRef"])
+            or recipe.environment_profile_ref != str(native["environmentProfileRef"])
+        ):
+            raise PolicyViolationError("frozen native recipe differs from the requested pair")
         self._validate_gateway(native["modelEnv"])
         if native["selectedModelProtocol"] not in recipe.root["supportedModelProtocols"]:
             raise PolicyViolationError(
@@ -289,7 +304,7 @@ class V2JobRenderer:
                 name="control",
                 image=delivery["controlImageDigest"],
                 image_pull_policy="IfNotPresent",
-                command=["/opt/kcs/workspace-sidecar"],
+                command=list(recipe.root["controlCommand"]),
                 env=self._environment(
                     {
                         "KCS_WORKSPACE": "/workspace",
