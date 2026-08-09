@@ -198,6 +198,26 @@ class RuntimeRecipeForbiddenError(KcsV2Error):
     default_message = "The runner and environment profile pair is not registered"
 
 
+class CapabilityActivationIncompatibleError(KcsV2Error):
+    code = "CAPABILITY_ACTIVATION_INCOMPATIBLE"
+    status_code = 422
+    default_message = "The exact capability set is not deployable with this runtime assembly"
+
+
+class LiveSnapshotExpiredError(KcsV2Error):
+    code = "LIVE_SNAPSHOT_EXPIRED"
+    status_code = 410
+    recovery_action = "reattach"
+    default_message = "The immutable live workspace snapshot has expired"
+
+
+class LiveSnapshotStaleBindingError(KcsV2Error):
+    code = "STALE_BINDING"
+    status_code = 410
+    recovery_action = "inspect_job"
+    default_message = "The live workspace snapshot belongs to another Pod incarnation"
+
+
 class CapacityLimitError(KcsV2Error):
     code = "CAPACITY_LIMIT"
     status_code = 409

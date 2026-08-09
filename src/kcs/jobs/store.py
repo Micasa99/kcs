@@ -152,6 +152,17 @@ class RuntimeRecord:
     storage_name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogRecord:
+    """Immutable, job-independent resolved catalog material."""
+
+    kind: str
+    identity: str
+    digest: str
+    payload: str
+    storage_name: str | None = None
+
+
 class V2JobStore:
     """ConfigMap store for reservation-before-create and retained tombstones."""
 
@@ -487,6 +498,46 @@ class V2JobStore:
             return existing, False
         return _runtime_record_from_config_map(created), True
 
+    def reserve_catalog(
+        self,
+        kind: str,
+        identity: str,
+        digest: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[CatalogRecord, bool]:
+        """Persist immutable resolution output without a Job owner reference."""
+
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        existing = self.read_catalog(kind, identity)
+        if existing is not None:
+            if existing.digest != digest or existing.payload != encoded:
+                raise IdentityDigestConflict()
+            return existing, False
+        record = CatalogRecord(kind, identity, digest, encoded)
+        try:
+            created = self._kube.create_config_map(_catalog_config_map_body(record))
+        except Exception as exc:
+            if _status(exc) != 409:
+                raise
+            existing = self.read_catalog(kind, identity)
+            if (
+                existing is None
+                or existing.digest != digest
+                or existing.payload != encoded
+            ):
+                raise IdentityDigestConflict() from exc
+            return existing, False
+        return _catalog_record_from_config_map(created), True
+
+    def read_catalog(self, kind: str, identity: str) -> CatalogRecord | None:
+        value = self._kube.read_config_map(_catalog_record_name(kind, identity))
+        if value is None:
+            return None
+        record = _catalog_record_from_config_map(value)
+        if record.kind != kind or record.identity != identity:
+            raise DependencyUnavailableError("catalog record hash collision")
+        return record
+
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> RuntimeRecord | None:
         config_map = self._kube.read_config_map(_runtime_record_name(kind, job_ref, identity))
         if config_map is None:
@@ -717,6 +768,10 @@ def _runtime_record_name(kind: str, job_ref: str, identity: str) -> str:
     return f"kcs-v2-{kind}-{_short_hash(f'{job_ref}:{identity}', 32)}"
 
 
+def _catalog_record_name(kind: str, identity: str) -> str:
+    return f"kcs-v2-catalog-{kind}-{_short_hash(identity, 32)}"
+
+
 def _legacy_runtime_record_name(kind: str, identity: str) -> str:
     return f"kcs-v2-{kind}-{_short_hash(identity, 32)}"
 
@@ -888,6 +943,42 @@ def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:
         values=MappingProxyType(values),
         resource_version=_value(metadata, "resource_version")
         or _value(metadata, "resourceVersion"),
+        storage_name=_value(metadata, "name"),
+    )
+
+
+def _catalog_config_map_body(record: CatalogRecord) -> dict[str, object]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": _catalog_record_name(record.kind, record.identity),
+            "labels": {
+                MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+                RECORD_KIND_LABEL: f"catalog-{record.kind}",
+            },
+            "ownerReferences": [],
+        },
+        "data": {
+            "recordVersion": _RECORD_VERSION,
+            "kind": record.kind,
+            "identity": record.identity,
+            "digest": record.digest,
+            "payload": record.payload,
+        },
+    }
+
+
+def _catalog_record_from_config_map(config_map: Any) -> CatalogRecord:
+    data = _data(config_map)
+    if data.get("recordVersion") != _RECORD_VERSION:
+        raise DependencyUnavailableError("unsupported ConfigMap catalog record version")
+    metadata = _value(config_map, "metadata")
+    return CatalogRecord(
+        kind=_required(data, "kind"),
+        identity=_required(data, "identity"),
+        digest=_required(data, "digest"),
+        payload=_required(data, "payload"),
         storage_name=_value(metadata, "name"),
     )
 

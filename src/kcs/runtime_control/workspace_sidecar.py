@@ -22,6 +22,7 @@ import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any, NoReturn
@@ -43,6 +44,9 @@ _MAX_OPERATION_RESULT = 256 * 1024 * 1024
 _MAX_STAGE_TREE_ENTRIES = 4096
 _MAX_CAPTURE_TREE_FILES = 4096
 _MAX_CAPTURE_TREE_BYTES = 128 * 1024 * 1024
+_MAX_LIVE_SNAPSHOT_ENTRIES = 2000
+_MAX_LIVE_SNAPSHOT_BYTES = 16 * 1024 * 1024
+_MAX_LIVE_CONTENT_RANGE = 1024 * 1024
 _WORKSPACE_TREE_SCHEMA = "cosmos.workspace-tree/1"
 _ENTRY_MODE_BITS = {
     "read_only": 0o444,
@@ -162,7 +166,13 @@ def _workspace_tree_digest(entries: list[dict[str, object]]) -> str:
 class RuntimeControlSidecar:
     """Production control authority; no network listener is created."""
 
-    def __init__(self, workspace: Path, control_state_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        control_state_dir: Path | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         self.workspace = workspace.resolve(strict=True)
         self._private = _private_directory(self.workspace, ".kcs")
@@ -176,12 +186,16 @@ class RuntimeControlSidecar:
             )
         self._control_state = _secure_directory(control_state_dir)
         self._finalize_receipts = _private_directory(self._control_state, "finalize-receipts")
+        self._base_manifests = _private_directory(self._control_state, "base-manifests")
+        self._live_snapshots = _private_directory(self._control_state, "live-snapshots")
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._transfers: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, dict[str, Any]] = {}
         self._operation_claims: dict[str, dict[str, str]] = {}
         self._operation_fences: dict[str, dict[str, str]] = {}
         self._operation_lock = RLock()
         self._finalize_lock = RLock()
+        self._live_snapshot_lock = RLock()
         self._stage_installs = 0
         self._operation_side_effects = 0
         self._native_state_generation = 0
@@ -216,7 +230,15 @@ class RuntimeControlSidecar:
                 },
                 None,
             )
-        write_workspace_response(response_path, response, response_body)
+        try:
+            write_workspace_response(response_path, response, response_body)
+        finally:
+            if (
+                response_body is not None
+                and response_body.parent == self._control_state
+                and response_body.name.startswith(".live-range-")
+            ):
+                response_body.unlink(missing_ok=True)
 
     def stats(self) -> dict[str, int]:
         return {
@@ -264,6 +286,16 @@ class RuntimeControlSidecar:
             return self._native_launcher(request), None
         if action == "inspectNativeFinalize":
             return self._inspect_native_finalize(request), None
+        if action == "createLiveWorkspaceSnapshot":
+            return self._create_live_workspace_snapshot(request), None
+        if action == "inspectLiveWorkspaceSnapshot":
+            return self._inspect_live_workspace_snapshot(request), None
+        if action == "releaseLiveWorkspaceSnapshot":
+            return self._release_live_workspace_snapshot(request), None
+        if action == "readLiveWorkspaceContent":
+            return self._read_live_workspace_content(request)
+        if action == "getLiveWorkspaceDiff":
+            return self._get_live_workspace_diff(request), None
         if action == "shutdown":
             retained = self._acknowledged_finalize_receipt()
             self._commit_native_finalize(retained)
@@ -465,6 +497,15 @@ class RuntimeControlSidecar:
             result["payload"]["runnerObservation"] = self._read_native_state(
                 request["jobUid"], request["podUid"], generation
             )
+        if command == "start":
+            descriptor = command_payload.get("descriptor")
+            if not isinstance(descriptor, Mapping) or not _is_hex_digest(
+                descriptor.get("baseManifestDigest")
+            ):
+                raise _RpcRejectedError(
+                    "DEPENDENCY_UNAVAILABLE", "native start descriptor has no base manifest"
+                )
+            self._bind_latest_base_manifest(str(descriptor["baseManifestDigest"]))
         if command == "finalize":
             if result["state"] != "completed":
                 raise _RpcRejectedError(
@@ -1682,6 +1723,20 @@ class RuntimeControlSidecar:
                 }
             )
         staged_tree_digest = _workspace_tree_digest(observed)
+        self._write_base_manifest(
+            {
+                "treeDigest": declared_tree_digest,
+                "entries": [
+                    {
+                        "path": str(item["path"]),
+                        "sizeBytes": int(item["size"]),
+                        "contentSha256": str(item["sha256"]),
+                        "mode": _ENTRY_MODE_BITS[str(item["mode"])],
+                    }
+                    for item in entries
+                ],
+            }
+        )
         identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
         return {
             "ok": True,
@@ -1766,6 +1821,573 @@ class RuntimeControlSidecar:
             },
             "observations": [],
         }
+
+    def _write_base_manifest(self, manifest: Mapping[str, Any]) -> None:
+        tree_digest = manifest.get("treeDigest")
+        if not _is_hex_digest(tree_digest):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace base digest is invalid")
+        payload = dict(manifest)
+        _atomic_json(self._base_manifest_path(str(tree_digest)), payload)
+        _atomic_json(self._base_manifests / "latest.json", payload)
+
+    def _bind_latest_base_manifest(self, base_manifest_digest: str) -> None:
+        latest = _read_json(self._base_manifests / "latest.json", "workspace base manifest")
+        target = self._base_manifest_path(base_manifest_digest)
+        if target.exists():
+            retained = _read_json(target, "workspace base manifest")
+            if retained != latest:
+                raise _RpcRejectedError(
+                    "IDENTITY_CONFLICT", "base manifest digest was bound to another tree"
+                )
+            return
+        _atomic_json(target, latest)
+
+    def _base_manifest_path(self, digest: str) -> Path:
+        if not _is_hex_digest(digest):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace base digest is invalid")
+        return self._base_manifests / f"{digest}.json"
+
+    def _create_live_workspace_snapshot(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, object]:
+        expected = {
+            "action",
+            "snapshotRef",
+            "requestDigest",
+            "jobRef",
+            "jobUid",
+            "podUid",
+            "generation",
+            "baseManifestDigest",
+            "ttlSeconds",
+            "maximumEntries",
+            "maximumBytes",
+        }
+        if set(request) != expected:
+            raise _RpcRejectedError("INVALID_REQUEST", "live snapshot request is not closed")
+        identity = self._live_snapshot_identity(request)
+        ttl = request.get("ttlSeconds")
+        maximum_entries = request.get("maximumEntries")
+        maximum_bytes = request.get("maximumBytes")
+        if (
+            type(ttl) is not int
+            or not 1 <= ttl <= 300
+            or type(maximum_entries) is not int
+            or not 1 <= maximum_entries <= _MAX_LIVE_SNAPSHOT_ENTRIES
+            or type(maximum_bytes) is not int
+            or not 1 <= maximum_bytes <= _MAX_LIVE_SNAPSHOT_BYTES
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "live snapshot bounds are invalid")
+        base_manifest = _read_json(
+            self._base_manifest_path(identity["baseManifestDigest"]),
+            "workspace base manifest",
+        )
+        target = self._live_snapshot_path(identity["snapshotRef"])
+        with self._live_snapshot_lock:
+            if target.exists():
+                retained = self._load_live_snapshot(identity["snapshotRef"])
+                self._match_live_snapshot(retained, identity)
+                self._require_live_snapshot_readable(retained)
+                return {"ok": True, "snapshot": self._public_live_snapshot(retained)}
+            sequence = self._next_live_snapshot_sequence()
+            created_at = self._live_now()
+            expires_at = created_at + timedelta(seconds=ttl)
+            partial = Path(
+                tempfile.mkdtemp(dir=self._live_snapshots, prefix=".partial-live-")
+            )
+            os.chmod(partial, 0o700)
+            blobs = _private_directory(partial, "blobs")
+            try:
+                scan = self._freeze_live_tree(
+                    blobs,
+                    maximum_entries=maximum_entries,
+                    maximum_bytes=maximum_bytes,
+                )
+                public_without_digest = {
+                    **identity,
+                    "sequence": sequence,
+                    "state": "ready",
+                    "entries": scan["entries"],
+                    "truncated": scan["truncated"],
+                    "omissions": scan["omissions"],
+                    "createdAt": _timestamp(created_at),
+                    "expiresAt": _timestamp(expires_at),
+                }
+                digest_payload = {
+                    key: value
+                    for key, value in public_without_digest.items()
+                    if key != "state"
+                }
+                snapshot_digest = hashlib.sha256(rfc8785.dumps(digest_payload)).hexdigest()
+                public = {
+                    **public_without_digest,
+                    "snapshotDigest": snapshot_digest,
+                    "observedAt": _timestamp(created_at),
+                }
+                manifest = {
+                    "manifestVersion": 1,
+                    "snapshot": public,
+                    "observedPaths": scan["observedPaths"],
+                    "baseManifest": base_manifest,
+                }
+                _atomic_json(partial / "manifest.json", manifest)
+                os.replace(partial, target)
+                _fsync_directory(self._live_snapshots)
+            finally:
+                if partial.exists():
+                    shutil.rmtree(partial)
+        return {"ok": True, "snapshot": public}
+
+    def _inspect_live_workspace_snapshot(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, object]:
+        identity = self._live_existing_identity(request, "inspectLiveWorkspaceSnapshot")
+        with self._live_snapshot_lock:
+            retained = self._load_live_snapshot(identity["snapshotRef"])
+            self._match_live_snapshot(retained, identity)
+            self._require_live_snapshot_readable(retained)
+            return {"ok": True, "snapshot": self._public_live_snapshot(retained)}
+
+    def _release_live_workspace_snapshot(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, object]:
+        identity = self._live_existing_identity(request, "releaseLiveWorkspaceSnapshot")
+        with self._live_snapshot_lock:
+            retained = self._load_live_snapshot(identity["snapshotRef"])
+            self._match_live_snapshot(retained, identity)
+            self._require_live_snapshot_readable(retained)
+            public = dict(retained["snapshot"])
+            public["state"] = "released"
+            public["observedAt"] = _timestamp(self._live_now())
+            retained["snapshot"] = public
+            blobs = self._live_snapshot_path(identity["snapshotRef"]) / "blobs"
+            if blobs.exists():
+                shutil.rmtree(blobs)
+            _atomic_json(
+                self._live_snapshot_path(identity["snapshotRef"]) / "manifest.json",
+                retained,
+            )
+            return {"ok": True, "snapshot": public}
+
+    def _read_live_workspace_content(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, object], Path | None]:
+        expected = {
+            "action",
+            "snapshotRef",
+            "requestDigest",
+            "jobRef",
+            "jobUid",
+            "podUid",
+            "generation",
+            "baseManifestDigest",
+            "path",
+            "offset",
+            "limitBytes",
+        }
+        if set(request) != expected:
+            raise _RpcRejectedError("INVALID_REQUEST", "live content request is not closed")
+        identity = self._live_snapshot_identity(request)
+        relative = request.get("path")
+        try:
+            validate_safe_relative_path(str(relative))
+        except (TypeError, ValueError) as error:
+            raise _RpcRejectedError("UNSAFE_PATH", "live content path is unsafe") from error
+        offset, limit = request.get("offset"), request.get("limitBytes")
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(limit) is not int
+            or not 1 <= limit <= _MAX_LIVE_CONTENT_RANGE
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "live content range is invalid")
+        with self._live_snapshot_lock:
+            retained = self._load_live_snapshot(identity["snapshotRef"])
+            self._match_live_snapshot(retained, identity)
+            self._require_live_snapshot_readable(retained)
+            public = retained["snapshot"]
+            entry = next(
+                (item for item in public["entries"] if item["path"] == relative), None
+            )
+            if not isinstance(entry, dict):
+                raise _RpcRejectedError("NOT_FOUND", "snapshot entry was not found")
+            if entry.get("kind") != "file" or not _is_hex_digest(
+                entry.get("contentSha256")
+            ):
+                raise _RpcRejectedError("UNSAFE_PATH", "snapshot entry is not a file")
+            total = int(entry["sizeBytes"])
+            if offset > total:
+                raise _RpcRejectedError("INVALID_REQUEST", "live content offset exceeds file")
+            blob = (
+                self._live_snapshot_path(identity["snapshotRef"])
+                / "blobs"
+                / str(entry["contentSha256"])
+            )
+            if not blob.is_file() or blob.is_symlink():
+                raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "snapshot blob is unavailable")
+            descriptor, raw = tempfile.mkstemp(dir=self._control_state, prefix=".live-range-")
+            ranged = Path(raw)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with blob.open("rb") as source, os.fdopen(descriptor, "wb") as output:
+                    source.seek(offset)
+                    content = source.read(limit)
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                end = offset + len(content)
+                return (
+                    {
+                        "ok": True,
+                        "snapshotDigest": public["snapshotDigest"],
+                        "contentSha256": entry["contentSha256"],
+                        "sequence": public["sequence"],
+                        "offset": offset,
+                        "endOffset": end,
+                        "totalSize": total,
+                        "sizeBytes": len(content),
+                    },
+                    ranged if content else None,
+                )
+            finally:
+                if ranged.exists() and ranged.stat().st_size == 0:
+                    ranged.unlink(missing_ok=True)
+
+    def _get_live_workspace_diff(self, request: Mapping[str, Any]) -> dict[str, object]:
+        expected = {
+            "action",
+            "snapshotRef",
+            "requestDigest",
+            "jobRef",
+            "jobUid",
+            "podUid",
+            "generation",
+            "baseManifestDigest",
+            "pageToken",
+            "pageSize",
+        }
+        if set(request) != expected:
+            raise _RpcRejectedError("INVALID_REQUEST", "live diff request is not closed")
+        identity = self._live_snapshot_identity(request)
+        page_size = request.get("pageSize")
+        if type(page_size) is not int or not 1 <= page_size <= 200:
+            raise _RpcRejectedError("INVALID_REQUEST", "live diff page size is invalid")
+        with self._live_snapshot_lock:
+            retained = self._load_live_snapshot(identity["snapshotRef"])
+            self._match_live_snapshot(retained, identity)
+            self._require_live_snapshot_readable(retained)
+            public = retained["snapshot"]
+            items = _live_diff_items(retained)
+            offset = _decode_live_page_token(
+                request.get("pageToken"), str(public["snapshotDigest"])
+            )
+            if offset > len(items):
+                raise _RpcRejectedError("INVALID_PAGE_TOKEN", "live diff page is invalid")
+            selected = items[offset : offset + page_size]
+            next_offset = offset + len(selected)
+            next_token = (
+                _encode_live_page_token(str(public["snapshotDigest"]), next_offset)
+                if next_offset < len(items)
+                else None
+            )
+            return {
+                "ok": True,
+                "page": {
+                    "snapshotRef": public["snapshotRef"],
+                    "snapshotDigest": public["snapshotDigest"],
+                    "sequence": public["sequence"],
+                    "items": selected,
+                    "nextPageToken": next_token,
+                    "observedAt": _timestamp(self._live_now()),
+                },
+            }
+
+    def _freeze_live_tree(
+        self,
+        blobs: Path,
+        *,
+        maximum_entries: int,
+        maximum_bytes: int,
+    ) -> dict[str, Any]:
+        worktree = self.workspace / "worktree"
+        entries: list[dict[str, Any]] = []
+        omissions: list[dict[str, str]] = []
+        observed: list[str] = []
+        total = 0
+        if not worktree.exists():
+            return {
+                "entries": entries,
+                "omissions": omissions,
+                "observedPaths": observed,
+                "truncated": False,
+            }
+        root_fd = os.open(
+            worktree,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        stack: list[tuple[str, int]] = [("", root_fd)]
+        try:
+            while stack:
+                prefix, directory_fd = stack.pop()
+                try:
+                    names = sorted(os.listdir(directory_fd))
+                    folded: dict[str, list[str]] = {}
+                    for name in names:
+                        folded.setdefault(unicodedata.normalize("NFC", name).casefold(), []).append(
+                            name
+                        )
+                    collision = {
+                        name for group in folded.values() if len(group) > 1 for name in group
+                    }
+                    pending_directories: list[tuple[str, int]] = []
+                    for name in names:
+                        relative = f"{prefix}/{name}" if prefix else name
+                        try:
+                            validate_safe_relative_path(relative)
+                        except ValueError as error:
+                            raise _RpcRejectedError(
+                                "UNSAFE_PATH", "worktree contains an unrepresentable path"
+                            ) from error
+                        observed.append(relative)
+                        if name in collision:
+                            _append_live_omission(omissions, relative, "unsafe_path")
+                            continue
+                        try:
+                            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        except OSError:
+                            _append_live_omission(omissions, relative, "unreadable")
+                            continue
+                        if len(entries) >= maximum_entries:
+                            _append_live_omission(omissions, relative, "entry_limit")
+                            continue
+                        mode = stat.S_IMODE(before.st_mode)
+                        if stat.S_ISLNK(before.st_mode):
+                            try:
+                                target = os.readlink(name, dir_fd=directory_fd)
+                            except OSError:
+                                _append_live_omission(omissions, relative, "unreadable")
+                                continue
+                            if not target or len(target.encode("utf-8")) > 4096:
+                                _append_live_omission(omissions, relative, "unsafe_path")
+                                continue
+                            entries.append(
+                                {
+                                    "path": relative,
+                                    "kind": "symlink",
+                                    "mode": mode,
+                                    "sizeBytes": len(target.encode("utf-8")),
+                                    "contentSha256": None,
+                                    "symlinkTarget": target,
+                                }
+                            )
+                            continue
+                        if stat.S_ISDIR(before.st_mode):
+                            try:
+                                child = os.open(
+                                    name,
+                                    os.O_RDONLY
+                                    | getattr(os, "O_DIRECTORY", 0)
+                                    | getattr(os, "O_NOFOLLOW", 0),
+                                    dir_fd=directory_fd,
+                                )
+                            except OSError:
+                                _append_live_omission(omissions, relative, "unreadable")
+                                continue
+                            entries.append(
+                                {
+                                    "path": relative,
+                                    "kind": "directory",
+                                    "mode": mode,
+                                    "sizeBytes": 0,
+                                    "contentSha256": None,
+                                    "symlinkTarget": None,
+                                }
+                            )
+                            pending_directories.append((relative, child))
+                            continue
+                        if not stat.S_ISREG(before.st_mode):
+                            _append_live_omission(omissions, relative, "unsafe_path")
+                            continue
+                        if before.st_size > maximum_bytes - total:
+                            _append_live_omission(omissions, relative, "byte_limit")
+                            continue
+                        descriptor = -1
+                        try:
+                            descriptor = os.open(
+                                name,
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=directory_fd,
+                            )
+                            opened = os.fstat(descriptor)
+                            content = bytearray()
+                            while chunk := os.read(descriptor, min(_COPY_CHUNK, maximum_bytes + 1)):
+                                content.extend(chunk)
+                                if len(content) > maximum_bytes - total:
+                                    break
+                            after = os.fstat(descriptor)
+                        except OSError:
+                            _append_live_omission(omissions, relative, "unreadable")
+                            continue
+                        finally:
+                            if descriptor >= 0:
+                                os.close(descriptor)
+                        if len(content) > maximum_bytes - total:
+                            _append_live_omission(omissions, relative, "byte_limit")
+                            continue
+                        if (
+                            opened.st_dev,
+                            opened.st_ino,
+                            opened.st_size,
+                            opened.st_mtime_ns,
+                        ) != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        ) or len(content) != after.st_size:
+                            _append_live_omission(
+                                omissions, relative, "changed_during_snapshot"
+                            )
+                            continue
+                        digest = hashlib.sha256(content).hexdigest()
+                        blob = blobs / digest
+                        if not blob.exists():
+                            with blob.open("xb") as output:
+                                os.chmod(blob, 0o600, follow_symlinks=False)
+                                output.write(content)
+                                output.flush()
+                                os.fsync(output.fileno())
+                        total += len(content)
+                        entries.append(
+                            {
+                                "path": relative,
+                                "kind": "file",
+                                "mode": mode,
+                                "sizeBytes": len(content),
+                                "contentSha256": digest,
+                                "symlinkTarget": None,
+                            }
+                        )
+                    stack.extend(reversed(pending_directories))
+                finally:
+                    os.close(directory_fd)
+        finally:
+            for _prefix, descriptor in stack:
+                os.close(descriptor)
+        entries.sort(key=lambda item: str(item["path"]))
+        omissions.sort(key=lambda item: str(item["path"]))
+        return {
+            "entries": entries,
+            "omissions": omissions,
+            "observedPaths": sorted(observed),
+            "truncated": bool(omissions),
+        }
+
+    def _live_snapshot_identity(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        result = {
+            key: request.get(key)
+            for key in (
+                "snapshotRef",
+                "requestDigest",
+                "jobRef",
+                "jobUid",
+                "podUid",
+                "generation",
+                "baseManifestDigest",
+            )
+        }
+        if (
+            any(not isinstance(result[key], str) or not result[key] for key in (
+                "snapshotRef",
+                "jobRef",
+                "jobUid",
+                "podUid",
+            ))
+            or not _is_hex_digest(result["requestDigest"])
+            or not _is_hex_digest(result["baseManifestDigest"])
+            or type(result["generation"]) is not int
+            or result["generation"] < 1
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "live snapshot identity is invalid")
+        return result
+
+    def _live_existing_identity(
+        self, request: Mapping[str, Any], action: str
+    ) -> dict[str, Any]:
+        expected = {
+            "action",
+            "snapshotRef",
+            "requestDigest",
+            "jobRef",
+            "jobUid",
+            "podUid",
+            "generation",
+            "baseManifestDigest",
+        }
+        if set(request) != expected or request.get("action") != action:
+            raise _RpcRejectedError("INVALID_REQUEST", "live snapshot request is not closed")
+        return self._live_snapshot_identity(request)
+
+    def _live_snapshot_path(self, snapshot_ref: str) -> Path:
+        return self._live_snapshots / hashlib.sha256(snapshot_ref.encode()).hexdigest()
+
+    def _load_live_snapshot(self, snapshot_ref: str) -> dict[str, Any]:
+        path = self._live_snapshot_path(snapshot_ref) / "manifest.json"
+        if not path.is_file() or path.is_symlink():
+            raise _RpcRejectedError("NOT_FOUND", "live snapshot was not found")
+        value = _read_json(path, "live workspace snapshot")
+        if (
+            value.get("manifestVersion") != 1
+            or not isinstance(value.get("snapshot"), dict)
+            or value["snapshot"].get("snapshotRef") != snapshot_ref
+            or not isinstance(value.get("observedPaths"), list)
+            or not isinstance(value.get("baseManifest"), dict)
+        ):
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "live snapshot manifest is malformed"
+            )
+        return value
+
+    @staticmethod
+    def _match_live_snapshot(
+        retained: Mapping[str, Any], identity: Mapping[str, Any]
+    ) -> None:
+        snapshot = retained["snapshot"]
+        if any(snapshot.get(key) != value for key, value in identity.items()):
+            raise _RpcRejectedError("IDENTITY_CONFLICT", "live snapshot identity differs")
+
+    def _require_live_snapshot_readable(self, retained: Mapping[str, Any]) -> None:
+        snapshot = retained["snapshot"]
+        if snapshot.get("state") == "released":
+            raise _RpcRejectedError("STATE_CONFLICT", "live snapshot has been released")
+        expires_at = snapshot.get("expiresAt")
+        if not isinstance(expires_at, str) or self._live_now() >= _parse_timestamp(expires_at):
+            raise _RpcRejectedError("LIVE_SNAPSHOT_EXPIRED", "live snapshot has expired")
+        if snapshot.get("state") != "ready":
+            raise _RpcRejectedError("STATE_CONFLICT", "live snapshot is not readable")
+
+    def _public_live_snapshot(self, retained: Mapping[str, Any]) -> dict[str, Any]:
+        public = dict(retained["snapshot"])
+        public["observedAt"] = _timestamp(self._live_now())
+        return public
+
+    def _next_live_snapshot_sequence(self) -> int:
+        path = self._live_snapshots / "sequence"
+        try:
+            retained = int(path.read_text(encoding="ascii")) if path.exists() else 0
+        except (OSError, ValueError) as error:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "live snapshot sequence is invalid"
+            ) from error
+        sequence = retained + 1
+        _atomic_bytes(path, f"{sequence}\n".encode("ascii"))
+        return sequence
+
+    def _live_now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None:
+            raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "control clock is naive")
+        return value.astimezone(UTC)
 
     def _read_workspace_file(self, raw_path: str) -> bytes:
         parent_fd, target_name = self._open_parent(raw_path, create=False)
@@ -2459,6 +3081,167 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    _atomic_bytes(
+        path,
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8"),
+    )
+
+
+def _atomic_bytes(path: Path, content: bytes) -> None:
+    descriptor, raw = tempfile.mkstemp(dir=path.parent, prefix=".partial-")
+    partial = Path(raw)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(partial, path)
+        _fsync_directory(path.parent)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _read_json(path: Path, subject: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", f"{subject} is unavailable") from error
+    if not isinstance(value, dict):
+        raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", f"{subject} is malformed")
+    return value
+
+
+def _timestamp(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "control timestamp is naive")
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        result = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "timestamp is malformed") from error
+    if result.tzinfo is None:
+        raise _RpcRejectedError("DEPENDENCY_UNAVAILABLE", "timestamp is malformed")
+    return result.astimezone(UTC)
+
+
+def _append_live_omission(
+    omissions: list[dict[str, str]], path: str, reason: str
+) -> None:
+    if len(omissions) < _MAX_LIVE_SNAPSHOT_ENTRIES:
+        omissions.append({"path": path, "reason": reason})
+
+
+def _live_diff_items(retained: Mapping[str, Any]) -> list[dict[str, Any]]:
+    snapshot = retained["snapshot"]
+    current = {str(item["path"]): item for item in snapshot["entries"]}
+    base = {
+        str(item["path"]): item
+        for item in retained["baseManifest"].get("entries", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    omitted = [
+        str(item["path"])
+        for item in snapshot["omissions"]
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    ]
+
+    def is_omitted(path: str) -> bool:
+        return any(path == prefix or path.startswith(f"{prefix}/") for prefix in omitted)
+
+    result: list[dict[str, Any]] = []
+    for path in sorted(set(base) | set(current)):
+        before = base.get(path)
+        after = current.get(path)
+        if before is None and after is not None:
+            result.append(
+                {
+                    "path": path,
+                    "change": "added",
+                    "baseSha256": None,
+                    "snapshotSha256": after.get("contentSha256"),
+                    "sizeBytes": int(after["sizeBytes"]),
+                }
+            )
+            continue
+        if before is not None and after is None:
+            if is_omitted(path):
+                continue
+            result.append(
+                {
+                    "path": path,
+                    "change": "deleted",
+                    "baseSha256": before.get("contentSha256"),
+                    "snapshotSha256": None,
+                    "sizeBytes": int(before.get("sizeBytes", 0)),
+                }
+            )
+            continue
+        assert before is not None and after is not None
+        before_digest = before.get("contentSha256")
+        after_digest = after.get("contentSha256")
+        if after.get("kind") != "file":
+            result.append(
+                {
+                    "path": path,
+                    "change": "type_changed",
+                    "baseSha256": before_digest,
+                    "snapshotSha256": after_digest,
+                    "sizeBytes": int(after["sizeBytes"]),
+                }
+            )
+        elif before_digest != after_digest:
+            result.append(
+                {
+                    "path": path,
+                    "change": "modified",
+                    "baseSha256": before_digest,
+                    "snapshotSha256": after_digest,
+                    "sizeBytes": int(after["sizeBytes"]),
+                }
+            )
+    return result
+
+
+def _encode_live_page_token(snapshot_digest: str, offset: int) -> str:
+    encoded = json.dumps(
+        {"digest": snapshot_digest, "offset": offset},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+
+
+def _decode_live_page_token(value: object, snapshot_digest: str) -> int:
+    if value is None:
+        return 0
+    if not isinstance(value, str) or not value:
+        raise _RpcRejectedError("INVALID_PAGE_TOKEN", "live diff page token is invalid")
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(f"{value}{padding}"))
+    except (ValueError, json.JSONDecodeError) as error:
+        raise _RpcRejectedError(
+            "INVALID_PAGE_TOKEN", "live diff page token is invalid"
+        ) from error
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"digest", "offset"}
+        or decoded["digest"] != snapshot_digest
+        or type(decoded["offset"]) is not int
+        or decoded["offset"] < 0
+    ):
+        raise _RpcRejectedError("INVALID_PAGE_TOKEN", "live diff page token is invalid")
+    return int(decoded["offset"])
 
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes:

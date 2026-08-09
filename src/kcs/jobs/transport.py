@@ -379,4 +379,8 @@ def _response_body_bound(header: Mapping[str, object]) -> int:
         value = header.get("authorizedMaxSizeBytes", 0)
         if type(value) is int and 0 <= value <= 107374182400:
             return value
+    if header.get("action") == "readLiveWorkspaceContent":
+        value = header.get("limitBytes", 0)
+        if type(value) is int and 1 <= value <= 1048576:
+            return value
     return 0

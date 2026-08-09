@@ -118,6 +118,19 @@ from .lifecycle import (
     phase_payload,
     read_phase,
 )
+from .live_workspace import (
+    LiveContentRange,
+    LiveSnapshotResult,
+    LiveWorkspaceRuntime,
+)
+from .m2_contracts import (
+    CapabilityActivationPlan,
+    LiveWorkspaceDiffPage,
+    LiveWorkspaceSnapshot,
+    LiveWorkspaceSnapshotRequest,
+    ResolvedRuntimeAssembly,
+    RuntimeAssemblyResolutionRequest,
+)
 from .native_contracts import (
     AnyJobBindingSnapshotList,
     DevSessionCreateRequest,
@@ -141,6 +154,7 @@ from .native_runtime import (
 )
 from .recipe_registry import runtime_recipe_digest
 from .renderer import credential_secret_name, runner_credential_secret_name
+from .runtime_assembly import RuntimeAssemblyResolver
 from .transport import (
     AgentRpcResponse,
     AgentRpcTransportProtocol,
@@ -324,6 +338,16 @@ class V2JobStoreProtocol(Protocol):
         self, kind: str, identity: str, job_ref: str, values: Mapping[str, str]
     ) -> tuple[object, bool]: ...
 
+    def reserve_catalog(
+        self,
+        kind: str,
+        identity: str,
+        digest: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[object, bool]: ...
+
+    def read_catalog(self, kind: str, identity: str) -> object | None: ...
+
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> object | None: ...
 
     def list_runtime(
@@ -435,6 +459,7 @@ class V2JobProvider:
         observability: V2ObservabilityProtocol | None = None,
         hosted_admission: bool = True,
         openvscode_image_ref: str | None = None,
+        runtime_assembly_resolver: RuntimeAssemblyResolver | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -456,6 +481,7 @@ class V2JobProvider:
         self._workspace_transport = workspace_transport
         self._observability = observability
         self._hosted_admission = hosted_admission
+        self._runtime_assembly_resolver = runtime_assembly_resolver
         self._cluster_feed = ClusterFeed(kube, clock=self._clock)
         self._lifecycle = LifecycleGate(store)
         self._startup_reconcile = False
@@ -465,6 +491,12 @@ class V2JobProvider:
             self._live_binding,
             self._assert_accepting_workspace_work,
             self._now,
+        )
+        self._live_workspace = LiveWorkspaceRuntime(
+            store,
+            workspace_transport,
+            self._native_live_binding,
+            clock=self._clock,
         )
         self._native = NativeRuntimeController(
             store,
@@ -2166,6 +2198,125 @@ class V2JobProvider:
             self._record_native_recipe_forbidden()
             raise
 
+    def resolve_runtime_assembly(
+        self,
+        request: RuntimeAssemblyResolutionRequest | Mapping[str, Any],
+    ) -> ResolvedRuntimeAssembly:
+        """Resolve exact catalog pins; RC cannot submit image or command fields."""
+
+        if self._runtime_assembly_resolver is None:
+            raise DependencyUnavailableError("runtime assembly registry is not configured")
+        resolved = self._runtime_assembly_resolver.resolve(request)
+        wire = resolved.wire()
+        plan = CapabilityActivationPlan.model_validate(wire["capabilityActivation"])
+        plan_wire = plan.wire()
+        self._store.reserve_catalog(
+            "activation-plan",
+            str(plan_wire["planRef"]),
+            str(plan_wire["planDigest"]),
+            plan_wire,
+        )
+        stable = _stable_runtime_assembly(wire)
+        self._store.reserve_catalog(
+            "runtime-assembly",
+            str(wire["assemblyDigest"]),
+            str(wire["assemblyDigest"]),
+            stable,
+        )
+        return self.runtime_assembly_by_digest(str(wire["assemblyDigest"]))
+
+    def runtime_assembly_by_digest(self, assembly_digest: str) -> ResolvedRuntimeAssembly:
+        """Read restart-durable exact assembly bytes for create/renderer verification."""
+
+        record = self._store.read_catalog("runtime-assembly", assembly_digest)
+        if record is None:
+            raise JobNotFoundError("The resolved runtime assembly was not found")
+        if _field(record, "digest", None) != assembly_digest:
+            raise IdentityDigestConflict()
+        try:
+            payload = json.loads(str(_field(record, "payload")))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise DependencyUnavailableError("retained runtime assembly is invalid") from error
+        if not isinstance(payload, dict) or payload.get("assemblyDigest") != assembly_digest:
+            raise DependencyUnavailableError("retained runtime assembly identity differs")
+        observed_at = self._now().isoformat()
+        recipe = payload.get("recipe")
+        if not isinstance(recipe, dict):
+            raise DependencyUnavailableError("retained runtime assembly recipe is invalid")
+        recipe["observedAt"] = observed_at
+        payload["observedAt"] = observed_at
+        try:
+            return ResolvedRuntimeAssembly.model_validate(payload)
+        except ValueError as error:
+            raise DependencyUnavailableError("retained runtime assembly is invalid") from error
+
+    def capability_activation_plan(
+        self, plan_ref: str, plan_digest: str
+    ) -> CapabilityActivationPlan:
+        """Return one exact restart-durable plan for native Job rendering."""
+
+        record = self._store.read_catalog("activation-plan", plan_ref)
+        if record is None:
+            raise JobNotFoundError("The capability activation plan was not found")
+        if _field(record, "digest", None) != plan_digest:
+            raise IdentityDigestConflict()
+        try:
+            plan = CapabilityActivationPlan.model_validate_json(str(_field(record, "payload")))
+        except (TypeError, ValueError) as error:
+            raise DependencyUnavailableError("retained capability activation plan is invalid") from error
+        if plan.root["planRef"] != plan_ref or plan.root["planDigest"] != plan_digest:
+            raise IdentityDigestConflict()
+        return plan
+
+    def create_live_workspace_snapshot(
+        self,
+        job_ref: str,
+        request: LiveWorkspaceSnapshotRequest | Mapping[str, Any],
+    ) -> LiveSnapshotResult:
+        return self._live_workspace.create(job_ref, request)
+
+    def inspect_live_workspace_snapshot(
+        self, job_ref: str, snapshot_ref: str
+    ) -> LiveWorkspaceSnapshot:
+        return self._live_workspace.inspect(job_ref, snapshot_ref)
+
+    def release_live_workspace_snapshot(
+        self, job_ref: str, snapshot_ref: str
+    ) -> LiveWorkspaceSnapshot:
+        return self._live_workspace.release(job_ref, snapshot_ref)
+
+    def read_live_workspace_content(
+        self,
+        job_ref: str,
+        snapshot_ref: str,
+        path: str,
+        *,
+        offset: int = 0,
+        limit_bytes: int = 1048576,
+    ) -> LiveContentRange:
+        return self._live_workspace.read_content(
+            job_ref,
+            snapshot_ref,
+            path,
+            offset=offset,
+            limit_bytes=limit_bytes,
+        )
+
+    def get_live_workspace_diff(
+        self,
+        job_ref: str,
+        snapshot_ref: str,
+        *,
+        page_token: str | None = None,
+        page_size: int = DEFAULT_PAGE_SIZE,
+    ) -> LiveWorkspaceDiffPage:
+        return self._live_workspace.diff(
+            job_ref,
+            snapshot_ref,
+            page_token=page_token,
+            page_size=page_size,
+        )
+
     def _record_native_recipe_forbidden(self) -> None:
         with self._native_metrics_lock:
             self._native_recipe_forbidden_total += 1
@@ -2265,6 +2416,12 @@ class V2JobProvider:
             "jobUid": root["jobUid"],
             "podUid": root["podUid"],
         }
+
+    def _native_live_binding(self, job_ref: str) -> NativeJobBindingSnapshot:
+        """Return the exact live native binding used by workspace snapshots."""
+
+        snapshot, _binding = self._native_binding(job_ref)
+        return snapshot
 
     def grant_credential(
         self, job_ref: str, metadata: CredentialGrantMetadata, raw_bytes: bytes
@@ -5356,6 +5513,17 @@ class V2JobProvider:
         if value.tzinfo is None:
             raise RuntimeError("provider clock must return an aware datetime")
         return value.astimezone(UTC)
+
+
+def _stable_runtime_assembly(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove observations while retaining the exact digest-bearing assembly."""
+
+    stable = json.loads(json.dumps(value))
+    stable.pop("observedAt", None)
+    recipe = stable.get("recipe")
+    if isinstance(recipe, dict):
+        recipe.pop("observedAt", None)
+    return stable
 
 
 def _field(value: object, name: str, default: object = _MISSING) -> Any:
