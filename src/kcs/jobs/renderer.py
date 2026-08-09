@@ -586,6 +586,9 @@ class V2JobRenderer:
                 name="openvscode",
                 image=runtime_image,
                 image_pull_policy="IfNotPresent",
+                # OpenVSCode 1.109 has no positional/default-folder CLI
+                # contract. Product supplies the standard `?folder=` web
+                # query so every browser entry opens the frozen worktree.
                 command=[
                     "/opt/rc-dev/openvscode/bin/openvscode-server",
                     "--host",
@@ -602,7 +605,6 @@ class V2JobRenderer:
                     "/run/rc-terminal/home/.openvscode-user",
                     "--extensions-dir",
                     "/run/rc-terminal/home/.openvscode-extensions",
-                    "/workspace/worktree",
                 ],
                 env=self._environment(
                     {

@@ -224,6 +224,7 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
     assert json.loads(runner_env["RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON"]) == [TOOL_DISCOVERY]
     sidecars = {item.name: item for item in pod.init_containers}
     assert sidecars["openvscode"].restart_policy == "Always"
+    assert "/workspace/worktree" not in sidecars["openvscode"].command
     assert sidecars["relay"].restart_policy == "Always"
     assert sidecars["openvscode"].security_context.run_as_user == 10002
     assert sidecars["relay"].security_context.run_as_user == 0
