@@ -47,18 +47,22 @@ deleted and that inspect/log/event/Pod/ConfigMap surfaces contain no token bytes
 The required order is create → stage → grantRunnerCredential → startRunner ACK →
 runner running/exited/killed → capture while both containers live →
 finalizeJob(captureBarrier) → durable launcher finalize receipt → control
-`commitFinalize` → launcher/control exit → Job terminal. `backoffLimit=0`; a second Pod UID is a
-contract failure. Soft deadline starts only at the successful start ACK and stops
-the child, not launcher/control. Hard deadline, eviction, node loss, or ENOSPC may
-destroy the Pod and must set output-loss/indeterminate facts rather than simulate a
-runner result.
+`commitFinalize` → launcher/control exit → Job terminal. `backoffLimit=0`; a second
+Pod UID is a contract failure. Soft deadline starts only at the successful start ACK
+and stops the child, not launcher/control. Hard deadline, eviction, node loss, or
+ENOSPC may destroy the Pod and must set output-loss/indeterminate facts rather than
+simulate a runner result.
 
 The production control durably records the launcher's finalize acknowledgement
 before replying to the API. The private control action `inspectNativeFinalize`
 reconciles the exact
 jobUID/podUID/finalizeRef/generation and launcher request digest after an API ACK
 loss. The control process accepts shutdown only after such a receipt exists and the
-launcher socket has stopped accepting connections.
+control has sent `commitFinalize` with the retained `finalizeReceipt.receiptDigest`
+and verified its committed ACK. If that ACK is interrupted, control validates the
+exact committed `/run/rc-control/finalize-receipt.json` identity; it never infers
+commit from a missing launcher socket. Only then may control wait for launcher exit
+and shut down.
 
 Use `GET /api/v2/jobs/{jobRef}`, `GET /api/v2/events`, and bounded runner/control logs
 for diagnosis. The launcher state file and socket are private platform surfaces;

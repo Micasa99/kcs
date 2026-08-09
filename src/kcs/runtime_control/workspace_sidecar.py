@@ -39,6 +39,7 @@ _MAX_RPC_HEADER = 4 * 1024 * 1024
 _MAX_NATIVE_FRAME = 131072
 _EXPERIMENT_UID = 10001
 _EXPERIMENT_GID = 10001
+_NATIVE_FINALIZE_RECEIPT_PATH = "/run/rc-control/finalize-receipt.json"
 
 
 class _RpcRejectedError(Exception):
@@ -154,13 +155,9 @@ class RuntimeControlSidecar:
         if action == "inspectNativeFinalize":
             return self._inspect_native_finalize(request), None
         if action == "shutdown":
-            if not self._has_acknowledged_finalize():
-                raise _RpcRejectedError(
-                    "PRECONDITION_FAILED",
-                    "native finalize receipt is not durably acknowledged",
-                )
-            if os.environ.get("KCS_NATIVE_LAUNCHER_SOCKET"):
-                self._wait_for_native_launcher_exit()
+            retained = self._acknowledged_finalize_receipt()
+            self._commit_native_finalize(retained)
+            self._wait_for_native_launcher_exit()
             self.shutdown_requested = True
             return {"ok": True, "state": "stopped", "supervisorAlive": False}, None
         return self._handle_extension(request, body)
@@ -202,6 +199,7 @@ class RuntimeControlSidecar:
                 "inspect",
                 "stop",
                 "finalize",
+                "commitFinalize",
                 "createPty",
                 "writePty",
                 "readPty",
@@ -232,11 +230,15 @@ class RuntimeControlSidecar:
         ):
             raise _RpcRejectedError("INVALID_REQUEST", "native launcher identity is invalid")
         if command == "finalize":
-            capture_digest = command_payload.get("captureReceiptDigest")
-            if not isinstance(capture_digest, str) or len(capture_digest) != 64:
+            raw_capture_digest = command_payload.get("captureReceiptDigest")
+            if set(command_payload) != {"captureReceiptDigest"} or not _is_hex_digest(
+                raw_capture_digest
+            ):
                 raise _RpcRejectedError(
                     "INVALID_REQUEST", "native finalize capture receipt digest is invalid"
                 )
+            assert isinstance(raw_capture_digest, str)
+            capture_digest = raw_capture_digest.lower()
             retained = self._load_finalize_receipt(request_ref)
             if retained is not None:
                 self._match_finalize_receipt(
@@ -247,12 +249,20 @@ class RuntimeControlSidecar:
                     generation=generation,
                     request_digest=request_digest,
                 )
-                if retained["captureReceiptDigest"] != capture_digest:
+                if retained["captureReceiptDigest"].lower() != capture_digest:
                     raise _RpcRejectedError(
                         "IDENTITY_CONFLICT",
                         "retained native finalize capture digest differs",
                     )
                 return {"ok": True, "result": dict(retained["launcherResult"])}
+        if command == "commitFinalize":
+            finalize_receipt_digest = command_payload.get("finalizeReceiptDigest")
+            if set(command_payload) != {"finalizeReceiptDigest"} or not _is_hex_digest(
+                finalize_receipt_digest
+            ):
+                raise _RpcRejectedError(
+                    "INVALID_REQUEST", "native finalize commit receipt digest is invalid"
+                )
         payload = {
             "schemaVersion": 1,
             "command": command,
@@ -336,16 +346,20 @@ class RuntimeControlSidecar:
                 request["jobUid"], request["podUid"], generation
             )
         if command == "finalize":
-            if (
-                result["state"] != "completed"
-                or set(result["payload"]) != {"finalized", "launcherAlive"}
-                or result["payload"].get("finalized") is not True
-                or type(result["payload"].get("launcherAlive")) is not bool
-            ):
+            if result["state"] != "completed":
                 raise _RpcRejectedError(
                     "DEPENDENCY_UNAVAILABLE",
                     "native launcher finalize acknowledgement is invalid",
                 )
+            finalize_receipt = _validate_finalize_launcher_result(
+                result["payload"],
+                job_uid=str(request["jobUid"]),
+                pod_uid=str(request["podUid"]),
+                finalize_ref=request_ref,
+                request_digest=request_digest,
+                generation=generation,
+                capture_receipt_digest=capture_digest,
+            )
             self._write_finalize_receipt(
                 {
                     "schemaVersion": 1,
@@ -355,10 +369,26 @@ class RuntimeControlSidecar:
                     "finalizeRef": request_ref,
                     "requestDigest": request_digest,
                     "generation": generation,
-                    "captureReceiptDigest": command_payload["captureReceiptDigest"],
+                    "captureReceiptDigest": capture_digest,
+                    "finalizeReceiptDigest": finalize_receipt["receiptDigest"],
                     "launcherResult": result["payload"],
                     "observedAt": result["observedAt"],
                 }
+            )
+        if command == "commitFinalize":
+            if result["state"] != "completed":
+                raise _RpcRejectedError(
+                    "DEPENDENCY_UNAVAILABLE",
+                    "native launcher finalize commit acknowledgement is invalid",
+                )
+            _validate_commit_launcher_result(
+                result["payload"],
+                job_uid=str(request["jobUid"]),
+                pod_uid=str(request["podUid"]),
+                generation=generation,
+                commit_ref=request_ref,
+                commit_digest=request_digest,
+                finalize_receipt_digest=str(command_payload["finalizeReceiptDigest"]),
             )
         return {"ok": True, "result": result["payload"]}
 
@@ -461,6 +491,7 @@ class RuntimeControlSidecar:
             "requestDigest",
             "generation",
             "captureReceiptDigest",
+            "finalizeReceiptDigest",
             "launcherResult",
             "observedAt",
         }
@@ -476,16 +507,26 @@ class RuntimeControlSidecar:
             or len(value["requestDigest"]) != 64
             or type(value["generation"]) is not int
             or value["generation"] < 0
-            or not isinstance(value["captureReceiptDigest"], str)
-            or len(value["captureReceiptDigest"]) != 64
+            or not _is_hex_digest(value["captureReceiptDigest"])
+            or not _is_hex_digest(value["finalizeReceiptDigest"])
             or not isinstance(value["launcherResult"], dict)
-            or set(value["launcherResult"]) != {"finalized", "launcherAlive"}
-            or value["launcherResult"].get("finalized") is not True
-            or type(value["launcherResult"].get("launcherAlive")) is not bool
             or not isinstance(value["observedAt"], str)
         ):
             raise _RpcRejectedError(
                 "DEPENDENCY_UNAVAILABLE", "native finalize receipt is malformed"
+            )
+        finalize_receipt = _validate_finalize_launcher_result(
+            value["launcherResult"],
+            job_uid=value["jobUid"],
+            pod_uid=value["podUid"],
+            finalize_ref=value["finalizeRef"],
+            request_digest=value["requestDigest"],
+            generation=value["generation"],
+            capture_receipt_digest=value["captureReceiptDigest"],
+        )
+        if finalize_receipt["receiptDigest"] != value["finalizeReceiptDigest"]:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE", "native finalize receipt digest differs"
             )
         return value
 
@@ -544,12 +585,182 @@ class RuntimeControlSidecar:
             finally:
                 partial.unlink(missing_ok=True)
 
-    def _has_acknowledged_finalize(self) -> bool:
+    def _acknowledged_finalize_receipt(self) -> dict[str, Any]:
         with self._finalize_lock:
             paths = tuple(self._finalize_receipts.glob("*.json"))
-            for path in paths:
-                self._read_finalize_receipt_path(path)
-        return bool(paths)
+            receipts = tuple(self._read_finalize_receipt_path(path) for path in paths)
+        if not receipts:
+            raise _RpcRejectedError(
+                "PRECONDITION_FAILED",
+                "native finalize receipt is not durably acknowledged",
+            )
+        if len(receipts) != 1:
+            raise _RpcRejectedError(
+                "STATE_CONFLICT",
+                "multiple native finalize receipts prevent shutdown",
+            )
+        return receipts[0]
+
+    def _commit_native_finalize(self, retained: Mapping[str, Any]) -> None:
+        finalize_receipt_digest = str(retained["finalizeReceiptDigest"])
+        commit_payload = {"finalizeReceiptDigest": finalize_receipt_digest}
+        commit_digest = hashlib.sha256(rfc8785.dumps(commit_payload)).hexdigest()
+        commit_ref = (
+            "commit-"
+            + hashlib.sha256(
+                rfc8785.dumps(
+                    {
+                        "finalizeRef": retained["finalizeRef"],
+                        "finalizeReceiptDigest": finalize_receipt_digest,
+                    }
+                )
+            ).hexdigest()
+        )
+        request: dict[str, object] = {
+            "action": "nativeLauncher",
+            "jobUid": retained["jobUid"],
+            "podUid": retained["podUid"],
+            "frame": {
+                "command": "commitFinalize",
+                "requestRef": commit_ref,
+                "requestDigest": commit_digest,
+                "generation": retained["generation"],
+                "payload": commit_payload,
+            },
+        }
+        try:
+            response = self._native_launcher(request)
+        except _RpcRejectedError as error:
+            if error.code != "DEPENDENCY_UNAVAILABLE":
+                raise
+            committed = self._read_launcher_finalize_receipt()
+            self._match_committed_launcher_receipt(
+                committed,
+                retained=retained,
+                commit_ref=commit_ref,
+                commit_digest=commit_digest,
+            )
+            if not self._native_launcher_accepting():
+                return
+            try:
+                response = self._native_launcher(request)
+            except _RpcRejectedError as retry_error:
+                if retry_error.code != "DEPENDENCY_UNAVAILABLE":
+                    raise
+                committed = self._read_launcher_finalize_receipt()
+                self._match_committed_launcher_receipt(
+                    committed,
+                    retained=retained,
+                    commit_ref=commit_ref,
+                    commit_digest=commit_digest,
+                )
+                if self._native_launcher_accepting():
+                    raise
+                return
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE",
+                "native launcher finalize commit acknowledgement is invalid",
+            )
+        self._match_committed_public_receipt(
+            result,
+            retained=retained,
+            commit_ref=commit_ref,
+            commit_digest=commit_digest,
+        )
+
+    @staticmethod
+    def _match_committed_public_receipt(
+        result: Mapping[str, Any],
+        *,
+        retained: Mapping[str, Any],
+        commit_ref: str,
+        commit_digest: str,
+    ) -> None:
+        finalize_receipt = result.get("finalizeReceipt")
+        if (
+            not isinstance(finalize_receipt, dict)
+            or finalize_receipt.get("requestRef") != retained["finalizeRef"]
+            or finalize_receipt.get("requestDigest") != retained["requestDigest"]
+            or finalize_receipt.get("captureReceiptDigest") != retained["captureReceiptDigest"]
+            or finalize_receipt.get("receiptDigest") != retained["finalizeReceiptDigest"]
+            or finalize_receipt.get("commitRequestRef") != commit_ref
+            or finalize_receipt.get("commitRequestDigest") != commit_digest
+        ):
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE",
+                "native launcher committed receipt identity differs",
+            )
+
+    @staticmethod
+    def _match_committed_launcher_receipt(
+        committed: Mapping[str, Any],
+        *,
+        retained: Mapping[str, Any],
+        commit_ref: str,
+        commit_digest: str,
+    ) -> None:
+        if (
+            committed.get("state") != "committed"
+            or committed.get("requestRef") != retained["finalizeRef"]
+            or committed.get("requestDigest") != retained["requestDigest"]
+            or committed.get("captureReceiptDigest") != retained["captureReceiptDigest"]
+            or committed.get("receiptDigest") != retained["finalizeReceiptDigest"]
+            or committed.get("jobUid") != retained["jobUid"]
+            or committed.get("podUid") != retained["podUid"]
+            or committed.get("generation") != retained["generation"]
+            or committed.get("commitRequestRef") != commit_ref
+            or committed.get("commitRequestDigest") != commit_digest
+        ):
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE",
+                "native launcher retained commit identity differs",
+            )
+
+    @staticmethod
+    def _native_launcher_accepting() -> bool:
+        socket_path = os.environ.get("KCS_NATIVE_LAUNCHER_SOCKET", "/run/rc-control/launcher.sock")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.2)
+                connection.connect(socket_path)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_launcher_finalize_receipt() -> dict[str, Any]:
+        path = Path(
+            os.environ.get("KCS_NATIVE_FINALIZE_RECEIPT_PATH", _NATIVE_FINALIZE_RECEIPT_PATH)
+        )
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_gid != os.getegid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > 131072
+            ):
+                raise _RpcRejectedError(
+                    "DEPENDENCY_UNAVAILABLE",
+                    "native launcher finalize receipt is unsafe",
+                )
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                raw = source.read(131073)
+            value = json.loads(raw)
+        except _RpcRejectedError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _RpcRejectedError(
+                "DEPENDENCY_UNAVAILABLE",
+                "native launcher finalize receipt is unavailable",
+            ) from error
+        _validate_launcher_finalize_receipt_file(value)
+        assert isinstance(value, dict)
+        return value
 
     def _read_native_state(
         self, job_uid: object, pod_uid: object, generation: int
@@ -1590,6 +1801,268 @@ def _public_transfer(value: Mapping[str, Any]) -> dict[str, object]:
             "snapshotPath",
         }
     }
+
+
+def _is_hex_digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _finalize_receipt_digest(
+    *,
+    request_ref: str,
+    request_digest: str,
+    capture_receipt_digest: str,
+    job_uid: str,
+    pod_uid: str,
+    generation: int,
+    accepted_at: str,
+) -> str:
+    identity = {
+        "schemaVersion": 1,
+        "requestRef": request_ref,
+        "requestDigest": request_digest,
+        "captureReceiptDigest": capture_receipt_digest,
+        "jobUid": job_uid,
+        "podUid": pod_uid,
+        "generation": generation,
+        "acceptedAt": accepted_at,
+    }
+    # Go's encoding/json uses struct field order and escapes these HTML/line
+    # separator code points.  The launcher receipt digest is over those bytes,
+    # rather than over JCS.
+    encoded = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+    encoded = (
+        encoded.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _validate_public_finalize_receipt(
+    value: object,
+    *,
+    job_uid: str,
+    pod_uid: str,
+    generation: int,
+    state: str,
+) -> dict[str, Any]:
+    expected = {
+        "requestRef",
+        "requestDigest",
+        "captureReceiptDigest",
+        "receiptDigest",
+        "state",
+        "acceptedAt",
+        "commitRequestRef",
+        "commitRequestDigest",
+        "committedAt",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or not isinstance(value["requestRef"], str)
+        or not value["requestRef"]
+        or not _is_hex_digest(value["requestDigest"])
+        or not _is_hex_digest(value["captureReceiptDigest"])
+        or not _is_hex_digest(value["receiptDigest"])
+        or value["state"] != state
+        or not isinstance(value["acceptedAt"], str)
+        or not value["acceptedAt"]
+        or (
+            state == "accepted"
+            and (
+                value["commitRequestRef"] is not None
+                or value["commitRequestDigest"] is not None
+                or value["committedAt"] is not None
+            )
+        )
+        or (
+            state == "committed"
+            and (
+                not isinstance(value["commitRequestRef"], str)
+                or not value["commitRequestRef"]
+                or not _is_hex_digest(value["commitRequestDigest"])
+                or not isinstance(value["committedAt"], str)
+                or not value["committedAt"]
+            )
+        )
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE", "native launcher finalize receipt is invalid"
+        )
+    actual = _finalize_receipt_digest(
+        request_ref=value["requestRef"],
+        request_digest=value["requestDigest"],
+        capture_receipt_digest=value["captureReceiptDigest"],
+        job_uid=job_uid,
+        pod_uid=pod_uid,
+        generation=generation,
+        accepted_at=value["acceptedAt"],
+    )
+    if not hmac.compare_digest(value["receiptDigest"].lower(), actual):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE", "native launcher finalize receipt digest differs"
+        )
+    return value
+
+
+def _validate_finalize_launcher_result(
+    value: object,
+    *,
+    job_uid: str,
+    pod_uid: str,
+    finalize_ref: str,
+    request_digest: str,
+    generation: int,
+    capture_receipt_digest: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"finalized", "launcherAlive", "finalizeReceipt"}
+        or value["finalized"] is not True
+        or value["launcherAlive"] is not True
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE",
+            "native launcher finalize acknowledgement is invalid",
+        )
+    receipt = _validate_public_finalize_receipt(
+        value["finalizeReceipt"],
+        job_uid=job_uid,
+        pod_uid=pod_uid,
+        generation=generation,
+        state="accepted",
+    )
+    if (
+        receipt["requestRef"] != finalize_ref
+        or receipt["requestDigest"] != request_digest
+        or receipt["captureReceiptDigest"] != capture_receipt_digest
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE",
+            "native launcher finalize acknowledgement identity differs",
+        )
+    return receipt
+
+
+def _validate_commit_launcher_result(
+    value: object,
+    *,
+    job_uid: str,
+    pod_uid: str,
+    generation: int,
+    commit_ref: str,
+    commit_digest: str,
+    finalize_receipt_digest: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"committed", "launcherAlive", "finalizeReceipt"}
+        or value["committed"] is not True
+        or value["launcherAlive"] is not False
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE",
+            "native launcher finalize commit acknowledgement is invalid",
+        )
+    receipt = _validate_public_finalize_receipt(
+        value["finalizeReceipt"],
+        job_uid=job_uid,
+        pod_uid=pod_uid,
+        generation=generation,
+        state="committed",
+    )
+    if (
+        receipt["receiptDigest"] != finalize_receipt_digest
+        or receipt["commitRequestRef"] != commit_ref
+        or receipt["commitRequestDigest"] != commit_digest
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE",
+            "native launcher finalize commit acknowledgement identity differs",
+        )
+    return receipt
+
+
+def _validate_launcher_finalize_receipt_file(value: object) -> None:
+    expected = {
+        "schemaVersion",
+        "requestRef",
+        "requestDigest",
+        "captureReceiptDigest",
+        "jobUid",
+        "podUid",
+        "generation",
+        "receiptDigest",
+        "state",
+        "acceptedAt",
+        "commitRequestRef",
+        "commitRequestDigest",
+        "committedAt",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value["schemaVersion"] != 1
+        or not isinstance(value["requestRef"], str)
+        or not value["requestRef"]
+        or not _is_hex_digest(value["requestDigest"])
+        or not _is_hex_digest(value["captureReceiptDigest"])
+        or not isinstance(value["jobUid"], str)
+        or not value["jobUid"]
+        or not isinstance(value["podUid"], str)
+        or not value["podUid"]
+        or type(value["generation"]) is not int
+        or value["generation"] < 0
+        or not _is_hex_digest(value["receiptDigest"])
+        or value["state"] not in {"accepted", "committed"}
+        or not isinstance(value["acceptedAt"], str)
+        or not value["acceptedAt"]
+        or (
+            value["state"] == "accepted"
+            and (
+                value["commitRequestRef"] is not None
+                or value["commitRequestDigest"] is not None
+                or value["committedAt"] is not None
+            )
+        )
+        or (
+            value["state"] == "committed"
+            and (
+                not isinstance(value["commitRequestRef"], str)
+                or not value["commitRequestRef"]
+                or not _is_hex_digest(value["commitRequestDigest"])
+                or not isinstance(value["committedAt"], str)
+                or not value["committedAt"]
+            )
+        )
+    ):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE", "native launcher finalize receipt is malformed"
+        )
+    actual = _finalize_receipt_digest(
+        request_ref=value["requestRef"],
+        request_digest=value["requestDigest"],
+        capture_receipt_digest=value["captureReceiptDigest"],
+        job_uid=value["jobUid"],
+        pod_uid=value["podUid"],
+        generation=value["generation"],
+        accepted_at=value["acceptedAt"],
+    )
+    if not hmac.compare_digest(value["receiptDigest"].lower(), actual):
+        raise _RpcRejectedError(
+            "DEPENDENCY_UNAVAILABLE",
+            "native launcher finalize receipt digest differs",
+        )
 
 
 def _fsync_directory(path: Path) -> None:

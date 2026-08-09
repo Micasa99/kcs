@@ -20,7 +20,8 @@ LABEL org.opencontainers.image.source="https://github.com/TitiSkywalker/kcs" \
       io.researchcosmos.kcs.role="runtime-control"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    KCS_CONTROL_STATE_DIR=/run/rc-control/control-state
+    KCS_CONTROL_STATE_DIR=/run/rc-control/control-state \
+    KCS_NATIVE_FINALIZE_RECEIPT_PATH=/run/rc-control/finalize-receipt.json
 COPY --from=build /wheels /tmp/wheels
 RUN python -m pip install --disable-pip-version-check --no-cache-dir --no-deps \
       /tmp/wheels/rfc8785-*.whl /tmp/wheels/kcs-*.whl \
