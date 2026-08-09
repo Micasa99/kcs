@@ -36,6 +36,7 @@ class V2RuntimeSettings:
     prometheus_timeout_seconds: float = 3.0
     event_db_path: Path = DEFAULT_EVENT_DB_PATH
     native_recipe_registry_path: Path | None = None
+    native_capability_registry_path: Path | None = None
     native_openvscode_image_volume: str | None = None
     native_dev_session_relay_image: str | None = None
     model_gateway_openai_base_url: str | None = None
@@ -107,6 +108,15 @@ class V2RuntimeSettings:
             and not native_recipe_registry_path.is_absolute()
         ):
             raise ValueError("KCS_V2_NATIVE_RECIPE_REGISTRY must be absolute")
+        capability_path_raw = environ.get("KCS_V2_NATIVE_CAPABILITY_REGISTRY")
+        native_capability_registry_path = (
+            Path(capability_path_raw) if capability_path_raw else None
+        )
+        if (
+            native_capability_registry_path is not None
+            and not native_capability_registry_path.is_absolute()
+        ):
+            raise ValueError("KCS_V2_NATIVE_CAPABILITY_REGISTRY must be absolute")
 
         native_openvscode_image_volume = _optional_image_digest(
             environ.get("KCS_V2_OPENVSCODE_IMAGE_VOLUME"),
@@ -155,6 +165,7 @@ class V2RuntimeSettings:
             prometheus_timeout_seconds=prometheus_timeout_seconds,
             event_db_path=event_db_path,
             native_recipe_registry_path=native_recipe_registry_path,
+            native_capability_registry_path=native_capability_registry_path,
             native_openvscode_image_volume=native_openvscode_image_volume,
             native_dev_session_relay_image=native_dev_session_relay_image,
             model_gateway_openai_base_url=openai_base,

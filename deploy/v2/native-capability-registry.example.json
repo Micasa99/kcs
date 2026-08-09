@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "capabilities": [
+    {
+      "kind": "skill",
+      "capabilityRef": "research/native-autonomous-research@1.13.0",
+      "materialDigest": "abac22c519ef731f9081a5254bab4058d4812595bc289f2176fc19fbbc39dbab",
+      "imageVolumeDigest": "10.255.250.1:5000/researchcosmos/rc-skill-native-autonomous-research@sha256:5a1337ea61a5560ec51ec99acc2b14f6d1c26927f72e8678d2db6e3d53414c91",
+      "sourcePath": "/",
+      "targetPath": "/opt/rc-skills/native-autonomous-research",
+      "runnerDiscoveryPath": "/opt/rc-skills/native-autonomous-research",
+      "runnerRefs": ["native-lane/codex-runner@1"],
+      "environmentProfileRefs": ["research/python-analysis@1.13.0"],
+      "modelProtocols": ["openai-responses"]
+    },
+    {
+      "kind": "tool",
+      "capabilityRef": "native-lane/evidence-manifest-validator@1",
+      "materialDigest": "71a557aa6cefe1f7291dd42b512e632ef4885298adb54adfaf6598bdb9b5a0f0",
+      "imageVolumeDigest": "10.255.250.1:5000/researchcosmos/rc-tool-evidence-manifest@sha256:2146de21593d5fdc2201ad927b3c27bca0ad61a4fa76d17df3792b74ed011cc4",
+      "sourcePath": "/",
+      "targetPath": "/opt/rc-tools/evidence-manifest",
+      "runnerDiscoveryPath": "/opt/rc-tools/evidence-manifest/rc-evidence-manifest",
+      "runnerRefs": ["native-lane/codex-runner@1"],
+      "environmentProfileRefs": ["research/python-analysis@1.13.0"],
+      "modelProtocols": ["openai-responses"]
+    }
+  ]
+}

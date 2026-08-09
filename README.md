@@ -142,11 +142,11 @@ production activation is a separate owner checkpoint. See
 `docs/v2-native-runner-m1-runbook.md` and
 `docs/v2-native-runner-oci-behavior-appendix.md`.
 
-The additive OpenAPI 2.5 M2 contract is frozen as `dormant`: generated review
-artifacts exist, but the served/package contract remains 2.4 until the implementation
-lane activates it. The M2 freeze adds immutable live-workspace snapshots, a scoped
-OpenVSCode relay, exact Skill/Tool activation, and explicit cursor-gap errors; it does
-not add another PTY or runtime fallback. See
+The additive OpenAPI 2.5 M2 contract is active in source and package at SHA-256
+`89fe3c925c1b5f8d97d60b3fb3998e0ac361a4c0fea30dc3d377e9b89d8089e9`.
+It adds immutable live-workspace snapshots, a scoped OpenVSCode relay, exact
+Skill/Tool activation, and explicit cursor-gap errors; it does not add another PTY
+or runtime fallback. Production activation remains an operator checkpoint. See
 `docs/v2-native-runner-m2-probe-evidence.md`.
 
 `scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation

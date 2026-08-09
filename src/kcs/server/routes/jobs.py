@@ -69,6 +69,13 @@ from kcs.jobs.errors import (
     PayloadTooLargeError,
     TransferBytesMismatchError,
 )
+from kcs.jobs.m2_contracts import (
+    LiveWorkspaceDiffPage,
+    LiveWorkspaceSnapshot,
+    LiveWorkspaceSnapshotRequest,
+    ResolvedRuntimeAssembly,
+    RuntimeAssemblyResolutionRequest,
+)
 from kcs.jobs.native_contracts import (
     AnyJobBindingSnapshotList,
     DevSessionCreateRequest,
@@ -458,6 +465,151 @@ def create_jobs_router(
         ],
     ) -> Response:
         return _json_model(provider.resolve_runtime_recipe(runner_ref, environment_profile_ref))
+
+    @router.post(
+        "/api/v2/runtime-assemblies/resolve",
+        operation_id="resolveRuntimeAssembly",
+        tags=["Runtime assemblies"],
+        response_model=ResolvedRuntimeAssembly,
+        responses=_error_responses(400, 401, 403, 422, 500, 503),
+    )
+    def resolve_runtime_assembly(
+        payload: RuntimeAssemblyResolutionRequest,
+    ) -> Response:
+        return _json_model(provider.resolve_runtime_assembly(payload))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots",
+        operation_id="createLiveWorkspaceSnapshot",
+        tags=["Live workspace"],
+        status_code=201,
+        response_model=LiveWorkspaceSnapshot,
+        responses=_error_responses(
+            200, 400, 401, 403, 404, 409, 410, 413, 415, 422, 500, 503, 504
+        ),
+    )
+    def create_live_workspace_snapshot(
+        job_ref: Annotated[
+            str,
+            ApiPath(
+                alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN
+            ),
+        ],
+        payload: LiveWorkspaceSnapshotRequest,
+    ) -> Response:
+        result = provider.create_live_workspace_snapshot(job_ref, payload)
+        response = _json_model(
+            result.snapshot, status_code=201 if result.created else 200
+        )
+        response.headers["ETag"] = str(result.snapshot.root["snapshotDigest"])
+        return response
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}",
+        operation_id="inspectLiveWorkspaceSnapshot",
+        tags=["Live workspace"],
+        response_model=LiveWorkspaceSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_live_workspace_snapshot(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        snapshot_ref: Annotated[
+            str, ApiPath(alias="snapshotRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+    ) -> Response:
+        snapshot = provider.inspect_live_workspace_snapshot(job_ref, snapshot_ref)
+        response = _json_model(snapshot)
+        response.headers["ETag"] = str(snapshot.root["snapshotDigest"])
+        return response
+
+    @router.delete(
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}",
+        operation_id="releaseLiveWorkspaceSnapshot",
+        tags=["Live workspace"],
+        response_model=LiveWorkspaceSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def release_live_workspace_snapshot(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        snapshot_ref: Annotated[
+            str, ApiPath(alias="snapshotRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+    ) -> Response:
+        snapshot = provider.release_live_workspace_snapshot(job_ref, snapshot_ref)
+        response = _json_model(snapshot)
+        response.headers["ETag"] = str(snapshot.root["snapshotDigest"])
+        return response
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/content",
+        operation_id="readLiveWorkspaceContent",
+        tags=["Live workspace"],
+        response_class=Response,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 413, 422, 500, 503),
+    )
+    def read_live_workspace_content(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        snapshot_ref: Annotated[
+            str, ApiPath(alias="snapshotRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        path: Annotated[str, Query(min_length=1, max_length=4096)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit_bytes: Annotated[
+            int, Query(alias="limitBytes", ge=1, le=1048576)
+        ] = 1048576,
+    ) -> Response:
+        result = provider.read_live_workspace_content(
+            job_ref,
+            snapshot_ref,
+            path,
+            offset=offset,
+            limit_bytes=limit_bytes,
+        )
+        content_range = (
+            "bytes */0"
+            if result.total_size == 0
+            else f"bytes {result.offset}-{result.end_offset - 1}/{result.total_size}"
+        )
+        return Response(
+            content=result.content,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "ETag": result.snapshot_digest,
+                "Content-Range": content_range,
+                "KCS-Content-SHA256": result.content_sha256,
+                "KCS-Snapshot-Sequence": str(result.sequence),
+            },
+        )
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/diff",
+        operation_id="getLiveWorkspaceDiff",
+        tags=["Live workspace"],
+        response_model=LiveWorkspaceDiffPage,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 500, 503),
+    )
+    def get_live_workspace_diff(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        snapshot_ref: Annotated[
+            str, ApiPath(alias="snapshotRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        page_token: Annotated[
+            str | None, Query(alias="pageToken", pattern=_OPAQUE_TOKEN_PATTERN)
+        ] = None,
+        page_size: Annotated[
+            int, Query(alias="pageSize", ge=1, le=MAX_PAGE_SIZE)
+        ] = DEFAULT_PAGE_SIZE,
+    ) -> Response:
+        page = provider.get_live_workspace_diff(
+            job_ref,
+            snapshot_ref,
+            page_token=page_token,
+            page_size=page_size,
+        )
+        response = _json_model(page)
+        response.headers["ETag"] = str(page.root["snapshotDigest"])
+        return response
 
     @router.post(
         "/api/v2/jobs/{jobRef}/dev-sessions",

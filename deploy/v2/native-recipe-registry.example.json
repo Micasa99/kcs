@@ -3,10 +3,10 @@
   "recipes": [
     {
       "recipe": {
-        "runnerRef": "runner-codex",
-        "environmentProfileRef": "env-default",
-        "recipeRef": "recipe-codex-env-default-v1",
-        "recipeDigest": "c216d9e07861b7f16b2277317983be1615b4ee120abb0ea18eb046619bac509a",
+        "runnerRef": "native-lane/codex-runner@1",
+        "environmentProfileRef": "research/python-analysis@1.13.0",
+        "recipeRef": "recipe-native-lane-codex-python-analysis-v1",
+        "recipeDigest": "4c064b4cd8e9d8a51e25cb45ded930e9d2785403ee4b92a1cb5984b72917ba63",
         "delivery": {
           "mode": "assembled",
           "transport": "imageVolume",
@@ -20,7 +20,7 @@
           "imageFsUnpackedBytes": 1500000000
         },
         "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
-        "runnerEntrypoint": ["/opt/rc-runner/usr/local/bin/codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],
+        "runnerEntrypoint": ["/opt/rc-runner/bin/codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],
         "controlCommand": ["/opt/kcs/workspace-sidecar", "serve"],
         "launcherSocketPath": "/run/rc-control/launcher.sock",
         "identity": {
@@ -44,11 +44,7 @@
           {"role": "terminalHome", "mountPath": "/run/rc-terminal/home", "readOnly": false},
           {"role": "terminalTmp", "mountPath": "/run/rc-terminal/tmp", "readOnly": false}
         ],
-        "supportedModelProtocols": [
-          "openai-responses",
-          "openai-completions",
-          "anthropic-messages"
-        ],
+        "supportedModelProtocols": ["openai-responses"],
         "observedAt": "2026-08-08T08:59:00Z"
       },
       "requires": ["linux-amd64", "workspace-rw", "model-gateway"],

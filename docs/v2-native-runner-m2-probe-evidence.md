@@ -1,15 +1,16 @@
 # Native Runner M2 remote probe evidence
 
-Status: **closed for contract freeze, not service activation**. Probes ran on the
+Status: **remote probes closed; source implementation active; production unchanged**.
+Probes ran on the
 real KCS/GPU cluster in the isolated namespace
 `rc-native-m2-v25-20260809`. Production `researchcosmos-v2` was not changed. Raw
 HTTP exchanges, Pod/Job YAML, Kubernetes events, runner/control logs, and checksum
 manifests remain on `RCkcs2` under `kcs-m2-evidence/`.
 
-The canonical dormant OpenAPI 2.5 SHA-256 is
-`a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408`.
-The served OpenAPI 2.4 package remains
-`3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f`.
+The canonical active OpenAPI 2.5 SHA-256 is
+`89fe3c925c1b5f8d97d60b3fb3998e0ac361a4c0fea30dc3d377e9b89d8089e9`.
+The production deployment remains an explicit operator checkpoint and was not
+changed by this implementation.
 
 ## Findings
 
@@ -31,6 +32,12 @@ The served OpenAPI 2.4 package remains
   `10.255.250.1:5000/researchcosmos/rc-dev-session-relay@sha256:9742fecb2cbe9a69c6b91b37cac8b6a2e50ef98aabbd0c1842e570099e9540d0`;
   relay binary SHA-256
   `283b40e50478461b32bce9f33123ae7c4415a570ef83e2d5caff9361e759c696`.
+- Active, source-rebuildable relay image:
+  `10.255.250.1:5000/researchcosmos/rc-dev-session-relay@sha256:7c684bc24bd04b2dd883b56c40d3df9674e01b1d292aaa4d3084ce3008ebaa04`;
+  its auditable Go source and pinned builder are under `native/dev_session_relay/`.
+- Active capability images are the exact registry entries in
+  `deploy/v2/native-capability-registry.example.json`; the deployed registry remains
+  deny-by-default until an operator explicitly copies those reviewed entries.
 - Skill image:
   `10.255.250.1:5000/researchcosmos/rc-skill-reproducible-probe@sha256:ff8a774d304e226403a49067a877c7bc42d2202b4fbfcb41f4f679bcefb9c2f6`;
   material SHA-256

@@ -8,6 +8,7 @@ import json
 from kubernetes import client  # type: ignore[import-untyped]
 
 from .contracts import CreateJobRequest
+from .m2_contracts import CapabilityActivationPlan
 from .native_contracts import NativeCreateJobRequest, ResolvedRuntimeRecipe
 from .policy import PolicyViolationError
 from .recipe_registry import NativeRecipeRegistry
@@ -80,9 +81,14 @@ class V2JobRenderer:
         request: CreateJobRequest | NativeCreateJobRequest,
         *,
         native_recipe: ResolvedRuntimeRecipe | None = None,
+        activation_plan: CapabilityActivationPlan | None = None,
     ) -> client.V1Job:
         if isinstance(request, NativeCreateJobRequest):
-            return self._render_native(request, native_recipe=native_recipe)
+            return self._render_native(
+                request,
+                native_recipe=native_recipe,
+                activation_plan=activation_plan,
+            )
         spec = request.spec
         node_selector = spec.node_selector.as_mapping()
         if node_selector != dict(self._settings.node_selector):
@@ -210,6 +216,7 @@ class V2JobRenderer:
         request: NativeCreateJobRequest,
         *,
         native_recipe: ResolvedRuntimeRecipe | None = None,
+        activation_plan: CapabilityActivationPlan | None = None,
     ) -> client.V1Job:
         spec = request.spec
         native = spec["native"]
@@ -250,12 +257,24 @@ class V2JobRenderer:
             "researchcosmos.io/recipe-digest": str(recipe.root["recipeDigest"]),
             "researchcosmos.io/hard-deadline-seconds": str(hard_deadline),
         }
+        if activation_plan is not None:
+            annotations.update(
+                {
+                    "researchcosmos.io/capability-plan-ref": str(
+                        activation_plan.root["planRef"]
+                    ),
+                    "researchcosmos.io/capability-plan-digest": str(
+                        activation_plan.root["planDigest"]
+                    ),
+                }
+            )
         volumes = self._native_volumes(
             job_ref,
             recipe,
             labels,
             workspace_size_gib=int(spec["sharedWorkspace"]["sizeLimitGiB"]),
             ephemeral_storage_mib=int(native["resources"]["ephemeralStorageMiB"]),
+            activation_plan=activation_plan,
         )
         runtime_mounts = [
             client.V1VolumeMount(name=WORKSPACE_VOLUME, mount_path="/workspace"),
@@ -282,6 +301,19 @@ class V2JobRenderer:
             runtime_image = delivery["environmentImageDigest"]
         else:
             runtime_image = delivery["prebuiltImageDigest"]
+        activation_mounts = (
+            list(activation_plan.root["mounts"]) if activation_plan is not None else []
+        )
+        for mount in activation_mounts:
+            source_path = str(mount["sourcePath"])
+            runtime_mounts.append(
+                client.V1VolumeMount(
+                    name=activation_volume_name(mount),
+                    mount_path=str(mount["targetPath"]),
+                    read_only=True,
+                    sub_path=(source_path.lstrip("/") or None),
+                )
+            )
         model_env = dict(native["modelEnv"])
         launcher_env = {
             **model_env,
@@ -296,6 +328,30 @@ class V2JobRenderer:
                 native["resources"]["ephemeralStorageMiB"]
             ),
         }
+        if activation_plan is not None:
+            launcher_env.update(
+                {
+                    "RC_NATIVE_CAPABILITY_PLAN_DIGEST": str(
+                        activation_plan.root["planDigest"]
+                    ),
+                    "RC_NATIVE_SKILL_DISCOVERY_PATHS_JSON": json.dumps(
+                        [
+                            str(item["runnerDiscoveryPath"])
+                            for item in activation_mounts
+                            if item["kind"] == "skill"
+                        ],
+                        separators=(",", ":"),
+                    ),
+                    "RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON": json.dumps(
+                        [
+                            str(item["runnerDiscoveryPath"])
+                            for item in activation_mounts
+                            if item["kind"] == "tool"
+                        ],
+                        separators=(",", ":"),
+                    ),
+                }
+            )
         containers = [
             client.V1Container(
                 name="runner",
@@ -385,6 +441,7 @@ class V2JobRenderer:
         *,
         workspace_size_gib: int,
         ephemeral_storage_mib: int,
+        activation_plan: CapabilityActivationPlan | None,
     ) -> list[client.V1Volume]:
         delivery = recipe.root["delivery"]
         if ephemeral_storage_mib < 512:
@@ -478,6 +535,17 @@ class V2JobRenderer:
                     ),
                 ]
             )
+        if activation_plan is not None:
+            for mount in activation_plan.root["mounts"]:
+                volumes.append(
+                    client.V1Volume(
+                        name=activation_volume_name(mount),
+                        image=client.V1ImageVolumeSource(
+                            reference=str(mount["imageVolumeDigest"]),
+                            pull_policy="IfNotPresent",
+                        ),
+                    )
+                )
         return volumes
 
     def _native_dev_session_sidecars(
@@ -678,3 +746,14 @@ class V2JobRenderer:
         if gpu:
             resources["nvidia.com/gpu"] = str(gpu)
         return client.V1ResourceRequirements(requests=dict(resources), limits=dict(resources))
+
+
+def activation_volume_name(mount: dict[str, object]) -> str:
+    identity = ":".join(
+        (
+            str(mount["kind"]),
+            str(mount["capabilityRef"]),
+            str(mount["materialDigest"]),
+        )
+    )
+    return f"rc-cap-{_short_hash(identity, 24)}"

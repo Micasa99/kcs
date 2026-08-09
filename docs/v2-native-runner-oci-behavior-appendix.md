@@ -1,12 +1,10 @@
 # KCS OpenAPI 2.5 native-runner OCI behavior appendix
 
-Status: **M1 implemented; M2 dormant freeze**. The implementation branch serves
-OpenAPI 2.4.0 at SHA-256
-`3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f` and implements
-the native provider/renderer/launcher path. OpenAPI 2.5.0 at SHA-256
-`a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408` freezes M2 as
-`dormant`; it is generated for review but is not packaged, served, or deployed.
-Production `researchcosmos-v2` is unchanged.
+Status: **M1 and M2 implemented in source; production unchanged**. The
+implementation branch packages and serves OpenAPI 2.5.0 at SHA-256
+`89fe3c925c1b5f8d97d60b3fb3998e0ac361a4c0fea30dc3d377e9b89d8089e9`.
+Production `researchcosmos-v2` remains an explicit operator checkpoint and was not
+changed by this implementation.
 
 ## 1. Delivery selection and immutable image roles
 
@@ -106,8 +104,9 @@ Frozen implementation requirement:
   it disappears with that child. Credential bytes never enter PodSpec/container
   env, API observations, events, logs, receipts, control, or terminal shells.
 - before spawning a native CLI, the launcher resolves a closed declarative adapter by
-  the exact recipe-owned `RC_NATIVE_RUNNER_REF`. M1 declares `runner-codex`
-  (`codex-responses-v1`, `codex-jsonl`) and `runner-pi` (`pi-models-v1`, `pi-jsonl`),
+  the exact recipe-owned `RC_NATIVE_RUNNER_REF`. The active registry declares
+  `native-lane/codex-runner@1` (`codex-responses-v1`, `codex-jsonl`) and
+  `native-lane/pi-runner@1` (`pi-models-v1`, `pi-jsonl`),
   including the exact executable, supported model protocols, prompt delivery, private
   configuration writer, and terminal trace events. Codex receives an exact
   `model_providers.*` Responses configuration and Pi receives an exact `models.json`.

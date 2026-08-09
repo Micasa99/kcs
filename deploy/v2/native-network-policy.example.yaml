@@ -14,7 +14,15 @@ spec:
   policyTypes:
     - Ingress
     - Egress
-  ingress: []
+  ingress:
+    # Only the KCS API may enter the Pod-scoped credential relay. OpenVSCode
+    # itself stays on loopback:3000 and is never selected by this rule.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kcs-v2-api
+      ports:
+        - {protocol: TCP, port: 8080}
   egress:
     - to:
         - namespaceSelector:

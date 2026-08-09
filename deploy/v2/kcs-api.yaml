@@ -61,6 +61,18 @@ spec:
               value: /var/lib/kcs-v2/events.sqlite3
             - name: KCS_V2_NATIVE_RECIPE_REGISTRY
               value: /etc/kcs/native/recipes.json
+            - name: KCS_V2_NATIVE_CAPABILITY_REGISTRY
+              value: /etc/kcs/native/capabilities.json
+            - name: KCS_V2_OPENVSCODE_IMAGE_VOLUME
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: openvscode-image-volume
+            - name: KCS_V2_DEV_SESSION_RELAY_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: dev-session-relay-image
             - name: KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL
               valueFrom:
                 configMapKeyRef:
@@ -154,6 +166,8 @@ spec:
             items:
               - key: recipes.json
                 path: recipes.json
+              - key: capabilities.json
+                path: capabilities.json
 ---
 apiVersion: v1
 kind: Service

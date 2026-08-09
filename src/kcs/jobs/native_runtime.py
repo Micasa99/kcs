@@ -296,6 +296,24 @@ class NativeRuntimeController:
             or descriptor["recipeDigest"] != recipe["recipeDigest"]
         ):
             raise PreconditionFailedError()
+        activation = native_spec.get("capabilityActivation")
+        if isinstance(activation, Mapping):
+            if (
+                descriptor.get("capabilityActivationPlanRef")
+                != activation["planRef"]
+                or descriptor.get("capabilityActivationPlanDigest")
+                != activation["planDigest"]
+            ):
+                raise PreconditionFailedError(
+                    "runner start capability plan differs from the Native Job"
+                )
+        elif (
+            descriptor.get("capabilityActivationPlanRef") is not None
+            or descriptor.get("capabilityActivationPlanDigest") is not None
+        ):
+            raise PreconditionFailedError(
+                "runner start declared a capability plan absent from the Native Job"
+            )
         if descriptor["selectedModelProtocol"] not in recipe["supportedModelProtocols"]:
             raise PreconditionFailedError("selected model protocol is not supported by recipe")
         if any(not transfer_ready(ref) for ref in descriptor["stagingTransferRefs"]):

@@ -15,26 +15,26 @@ import (
 )
 
 func TestRunnerAdapterSelectionIsExplicitAndClosed(t *testing.T) {
-	t.Setenv("RC_NATIVE_RUNNER_REF", "runner-codex")
+	t.Setenv("RC_NATIVE_RUNNER_REF", "native-lane/codex-runner@1")
 	t.Setenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL", "openai-responses")
-	adapter, err := resolveRunnerAdapter([]string{"/opt/rc-runner/usr/local/bin/codex", "exec"})
+	adapter, err := resolveRunnerAdapter([]string{"/opt/rc-runner/bin/codex", "exec"})
 	if err != nil || adapter.TraceSchema != "codex-jsonl" {
 		t.Fatalf("codex declaration not selected: adapter=%+v err=%v", adapter, err)
 	}
 
-	t.Setenv("RC_NATIVE_RUNNER_REF", "runner-unknown")
+	t.Setenv("RC_NATIVE_RUNNER_REF", "native-lane/unknown-runner@1")
 	if _, err := resolveRunnerAdapter([]string{"/opt/rc-runner/usr/local/bin/unknown"}); err == nil || err.Error() != "runner_adapter_unsupported" {
 		t.Fatalf("unknown runner was not rejected with the typed error: %v", err)
 	}
 
-	t.Setenv("RC_NATIVE_RUNNER_REF", "runner-codex")
+	t.Setenv("RC_NATIVE_RUNNER_REF", "native-lane/codex-runner@1")
 	if _, err := resolveRunnerAdapter([]string{"/usr/local/bin/codex"}); err == nil || err.Error() != "runner_entrypoint_mismatch" {
 		t.Fatalf("undeclared executable path was accepted: %v", err)
 	}
 
-	t.Setenv("RC_NATIVE_RUNNER_REF", "runner-pi")
+	t.Setenv("RC_NATIVE_RUNNER_REF", "native-lane/pi-runner@1")
 	t.Setenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL", "anthropic-messages")
-	if _, err := resolveRunnerAdapter([]string{"/opt/rc-runner/usr/local/bin/pi"}); err != nil {
+	if _, err := resolveRunnerAdapter([]string{"/opt/rc-runner/bin/pi"}); err != nil {
 		t.Fatalf("pi declaration should remain supported: %v", err)
 	}
 }
@@ -56,24 +56,69 @@ func TestRunnerImageCanDeclareAnEnvironmentOnlyAdapter(t *testing.T) {
 }
 
 func TestRunnerSpecificEnvironmentIsOwnedByAdapter(t *testing.T) {
-	codex := strings.Join(childEnvironment(runnerAdapters["runner-codex"], "token"), "\n")
+	codexEnv, err := childEnvironment(runnerAdapters["native-lane/codex-runner@1"], "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := strings.Join(codexEnv, "\n")
+	if !strings.HasPrefix(codex, "PATH=/opt/rc-runner/bin:") {
+		t.Fatalf("exact runner image bin directory is not first in PATH: %s", codex)
+	}
 	if !strings.Contains(codex, "CODEX_HOME=") || strings.Contains(codex, "PI_CODING_AGENT_DIR=") {
 		t.Fatalf("codex environment leaked another runner's configuration: %s", codex)
 	}
-	pi := strings.Join(childEnvironment(runnerAdapters["runner-pi"], "token"), "\n")
+	piEnv, err := childEnvironment(runnerAdapters["native-lane/pi-runner@1"], "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pi := strings.Join(piEnv, "\n")
 	if !strings.Contains(pi, "PI_CODING_AGENT_DIR=") || strings.Contains(pi, "CODEX_HOME=") {
 		t.Fatalf("pi environment leaked another runner's configuration: %s", pi)
 	}
 	custom := runnerAdapter{Configuration: "environment-only-v1"}
-	generic := strings.Join(childEnvironment(custom, "token"), "\n")
+	genericEnv, err := childEnvironment(custom, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generic := strings.Join(genericEnv, "\n")
 	if strings.Contains(generic, "CODEX_HOME=") || strings.Contains(generic, "PI_CODING_AGENT_DIR=") {
 		t.Fatalf("generic adapter inherited a built-in runner's configuration: %s", generic)
 	}
 }
 
+func TestExactToolDiscoveryPathsExtendChildPATH(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "metrics", "bin")
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(root, "evidence", "rc-evidence")
+	if err := os.MkdirAll(filepath.Dir(executable), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0555); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal([]string{directory, executable, executable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := toolSearchPaths(string(raw), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{directory, filepath.Dir(executable)}
+	if strings.Join(paths, "|") != strings.Join(want, "|") {
+		t.Fatalf("unexpected exact tool search paths: got=%v want=%v", paths, want)
+	}
+	if _, err := toolSearchPaths(`["/tmp/not-an-activation-mount"]`, root); err == nil {
+		t.Fatal("tool path outside its exact activation mount was accepted")
+	}
+}
+
 func TestTrajectoryRecorderPreservesRawStreamsAndSessionLines(t *testing.T) {
 	directory := t.TempDir()
-	adapter := runnerAdapters["runner-codex"]
+	adapter := runnerAdapters["native-lane/codex-runner@1"]
 	recorder, err := newTrajectoryRecorderWithOwnership(
 		filepath.Join(directory, "stdout.raw"),
 		filepath.Join(directory, "stderr.raw"),

@@ -398,7 +398,14 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 		return nil, err
 	}
 	prompt := "Begin the work now and continue autonomously until the task is complete or a concrete blocker is proven. Use your native shell and file tools; do not stop after describing what you intend to do. First read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ", then inspect the actual workspace, implement the work, run relevant verification, and leave all requested outputs in the workspace. Report observed results and blockers honestly."
+	if os.Getenv("RC_NATIVE_CAPABILITY_PLAN_DIGEST") != "" {
+		prompt += " Platform-curated Skill and Tool materials are mounted read-only; inspect the exact paths declared in RC_NATIVE_SKILL_DISCOVERY_PATHS_JSON and RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON when they are relevant."
+	}
 	argv = adapter.withPrompt(argv, prompt)
+	childEnv, err := childEnvironment(adapter, string(token))
+	if err != nil {
+		return nil, err
+	}
 	recorder, err := newTrajectoryRecorder(rawStdoutPath, rawStderrPath, sessionPath, adapter)
 	if err != nil {
 		return nil, errors.New("trajectory_open_failed")
@@ -409,7 +416,7 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	cmd.Stdout = recorder.stdout
 	cmd.Stderr = recorder.stderr
 	cmd.Stdin = nil
-	cmd.Env = childEnvironment(adapter, string(token))
+	cmd.Env = childEnv
 	cmd.SysProcAttr = childProcessAttributes(10001, 10001)
 	started := now()
 	l.generation = frame.Generation
@@ -686,7 +693,12 @@ func (l *launcher) readTerminal(frame request) (map[string]any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if payload.Cursor < s.base {
-		return nil, errors.New("pty_cursor_stale")
+		return map[string]any{
+			"cursorGap": map[string]int{
+				"requestedCursor":        payload.Cursor,
+				"earliestRetainedCursor": s.base,
+			},
+		}, nil
 	}
 	start := payload.Cursor - s.base
 	if start > len(s.output) {
@@ -873,8 +885,26 @@ func preparePaths() error {
 	return os.Chown(worktree, 10001, 10001)
 }
 
-func childEnvironment(adapter runnerAdapter, token string) []string {
-	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "RC_NATIVE_RUNNER_REF=" + os.Getenv("RC_NATIVE_RUNNER_REF"), "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+func childEnvironment(adapter runnerAdapter, token string) ([]string, error) {
+	searchPaths, err := toolSearchPaths(
+		os.Getenv("RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON"),
+		"/opt/rc-tools",
+	)
+	if err != nil {
+		return nil, err
+	}
+	pathEntries := append([]string{
+		"/opt/rc-runner/bin",
+		"/opt/rc-runner/usr/local/bin",
+		"/opt/rc-runner/usr/bin",
+	}, searchPaths...)
+	pathEntries = append(pathEntries, "/usr/local/bin", "/usr/bin", "/bin")
+	values := []string{"PATH=" + strings.Join(pathEntries, ":"), "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "RC_NATIVE_RUNNER_REF=" + os.Getenv("RC_NATIVE_RUNNER_REF"), "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+	for _, name := range []string{"RC_NATIVE_CAPABILITY_PLAN_DIGEST", "RC_NATIVE_SKILL_DISCOVERY_PATHS_JSON", "RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON"} {
+		if value := os.Getenv(name); value != "" {
+			values = append(values, name+"="+value)
+		}
+	}
 	values = append(values, adapter.environment()...)
 	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
 	if strings.HasPrefix(protocol, "anthropic-") {
@@ -882,7 +912,44 @@ func childEnvironment(adapter runnerAdapter, token string) []string {
 	} else {
 		values = append(values, "OPENAI_API_KEY="+token)
 	}
-	return values
+	return values, nil
+}
+
+func toolSearchPaths(raw string, root string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var declared []string
+	if err := json.Unmarshal([]byte(raw), &declared); err != nil {
+		return nil, errors.New("tool_discovery_paths_invalid")
+	}
+	root = filepath.Clean(root)
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(declared))
+	for _, declaredPath := range declared {
+		clean := filepath.Clean(declaredPath)
+		relative, err := filepath.Rel(root, clean)
+		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			return nil, errors.New("tool_discovery_path_outside_mount")
+		}
+		info, err := os.Stat(clean)
+		if err != nil {
+			return nil, errors.New("tool_discovery_path_unavailable")
+		}
+		searchPath := clean
+		if !info.IsDir() {
+			if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+				return nil, errors.New("tool_discovery_path_not_executable")
+			}
+			searchPath = filepath.Dir(clean)
+		}
+		if _, duplicate := seen[searchPath]; duplicate {
+			continue
+		}
+		seen[searchPath] = struct{}{}
+		result = append(result, searchPath)
+	}
+	return result, nil
 }
 
 func readCredential() ([]byte, error) {

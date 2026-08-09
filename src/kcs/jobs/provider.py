@@ -84,6 +84,7 @@ from .errors import (
     CredentialActiveError,
     CredentialDestroyFailedError,
     CredentialExpiredError,
+    CursorGapError,
     DependencyTimeoutError,
     DependencyUnavailableError,
     DigestMismatchError,
@@ -153,8 +154,12 @@ from .native_runtime import (
     RunnerCredentialGrantMetadata,
 )
 from .recipe_registry import runtime_recipe_digest
-from .renderer import credential_secret_name, runner_credential_secret_name
-from .runtime_assembly import RuntimeAssemblyResolver
+from .renderer import (
+    activation_volume_name,
+    credential_secret_name,
+    runner_credential_secret_name,
+)
+from .runtime_assembly import RuntimeAssemblyResolver, capability_activation_receipt
 from .transport import (
     AgentRpcResponse,
     AgentRpcTransportProtocol,
@@ -197,7 +202,13 @@ class V2JobRendererProtocol(Protocol):
 
     def job_ref(self, request: CreateJobRequest | NativeCreateJobRequest) -> str: ...
 
-    def render(self, request: CreateJobRequest | NativeCreateJobRequest) -> object: ...
+    def render(
+        self,
+        request: CreateJobRequest | NativeCreateJobRequest,
+        *,
+        native_recipe: ResolvedRuntimeRecipe | None = None,
+        activation_plan: CapabilityActivationPlan | None = None,
+    ) -> object: ...
 
     def resolve_recipe(
         self, runner_ref: str, environment_profile_ref: str
@@ -513,6 +524,7 @@ class V2JobProvider:
         )
         self._native_metrics_lock = threading.Lock()
         self._native_recipe_forbidden_total = 0
+        self._m2_metrics: collections.Counter[str] = collections.Counter()
         self._terminal_lifecycle_lock = threading.RLock()
         self.reconcile_credentials()
         self.reconcile_terminals()
@@ -548,9 +560,12 @@ class V2JobProvider:
     def dev_session_relay_target(
         self, job_ref: str, dev_session_ref: str, credential: str, path: str
     ) -> DevSessionRelayTarget:
-        return self._dev_sessions.relay_target(
-            job_ref, dev_session_ref, credential, path
-        )
+        try:
+            return self._dev_sessions.relay_target(job_ref, dev_session_ref, credential, path)
+        except KcsV2Error as error:
+            if error.code == "DEV_SESSION_RELAY_DOWN":
+                self._record_m2_metric("dev_session_relay_down_total")
+            raise
 
     def capacity(self) -> CapacitySnapshot:
         """Return a fresh, read-only projection of Kubernetes Node capacity."""
@@ -599,6 +614,19 @@ class V2JobProvider:
         collection_errors = 0
         with self._native_metrics_lock:
             recipe_forbidden_total = self._native_recipe_forbidden_total
+            m2_metrics = getattr(self, "_m2_metrics", collections.Counter()).copy()
+        list_runtime = getattr(self._store, "list_runtime", None)
+        active_terminals = 0
+        active_dev_sessions = 0
+        if callable(list_runtime):
+            active_terminals = sum(
+                _runtime_values(record).get("state") in {"opening", "ready"}
+                for record in list_runtime("terminal")
+            )
+            active_dev_sessions = sum(
+                _runtime_values(record).get("state") in {"opening", "ready"}
+                for record in list_runtime("dev-session")
+            )
         for record in self._store.list_create():
             if not _is_native_record(record) or _is_deleted(record):
                 continue
@@ -618,9 +646,10 @@ class V2JobProvider:
                     stops[str(stop_action["state"])] += 1
                 activation = values.get("recipeActivation")
                 if isinstance(activation, Mapping):
-                    activations[
-                        (str(activation["state"]), str(activation["deliveryFailure"]))
-                    ] += 1
+                    activations[(str(activation["state"]), str(activation["deliveryFailure"]))] += 1
+                capability_activation = values.get("capabilityActivation")
+                if isinstance(capability_activation, Mapping):
+                    m2_metrics[f"capability_activation_state_{capability_activation['state']}"] += 1
                 for credential in values.get("credentialObservations", []):
                     if isinstance(credential, Mapping):
                         credentials[str(credential["state"])] += 1
@@ -662,6 +691,36 @@ class V2JobProvider:
             "# HELP kcs_native_recipe_forbidden_total Rejected unregistered runtime recipe resolutions.",
             "# TYPE kcs_native_recipe_forbidden_total counter",
             f"kcs_native_recipe_forbidden_total {recipe_forbidden_total}",
+            "# HELP kcs_m2_active_terminals Current attachable terminal sessions.",
+            "# TYPE kcs_m2_active_terminals gauge",
+            f"kcs_m2_active_terminals {active_terminals}",
+            "# HELP kcs_m2_active_dev_sessions Current attachable developer sessions.",
+            "# TYPE kcs_m2_active_dev_sessions gauge",
+            f"kcs_m2_active_dev_sessions {active_dev_sessions}",
+            "# HELP kcs_m2_live_operations_total Bounded live-workspace operations.",
+            "# TYPE kcs_m2_live_operations_total counter",
+            f"kcs_m2_live_operations_total {m2_metrics['live_operations_total']}",
+            "# HELP kcs_m2_live_latency_seconds_sum Live-workspace operation latency.",
+            "# TYPE kcs_m2_live_latency_seconds_sum counter",
+            f"kcs_m2_live_latency_seconds_sum {m2_metrics['live_latency_seconds_sum']}",
+            "# HELP kcs_m2_live_bytes_total Live-workspace bytes returned.",
+            "# TYPE kcs_m2_live_bytes_total counter",
+            f"kcs_m2_live_bytes_total {m2_metrics['live_bytes_total']}",
+            "# HELP kcs_m2_cursor_gap_total Terminal reads outside retention.",
+            "# TYPE kcs_m2_cursor_gap_total counter",
+            f"kcs_m2_cursor_gap_total {m2_metrics['cursor_gap_total']}",
+            "# HELP kcs_m2_dev_session_relay_down_total Relay dependency failures.",
+            "# TYPE kcs_m2_dev_session_relay_down_total counter",
+            f"kcs_m2_dev_session_relay_down_total {m2_metrics['dev_session_relay_down_total']}",
+            "# HELP kcs_m2_capability_activation_failures_total Rejected exact activation resolutions.",
+            "# TYPE kcs_m2_capability_activation_failures_total counter",
+            f"kcs_m2_capability_activation_failures_total {m2_metrics['capability_activation_failures_total']}",
+            "# HELP kcs_m2_capability_activations Current activation receipts by state.",
+            "# TYPE kcs_m2_capability_activations gauge",
+            *(
+                f'kcs_m2_capability_activations{{state="{state}"}} {m2_metrics[f"capability_activation_state_{state}"]}'
+                for state in ("ready", "failed", "indeterminate")
+            ),
         ]
         return "\n".join(lines) + "\n"
 
@@ -1068,6 +1127,18 @@ class V2JobProvider:
                     "limitBytes": limit_bytes,
                 },
             )
+            gap = result.get("cursorGap")
+            if isinstance(gap, Mapping):
+                try:
+                    self._record_m2_metric("cursor_gap_total")
+                    raise CursorGapError(
+                        int(gap["requestedCursor"]),
+                        int(gap["earliestRetainedCursor"]),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise DependencyUnavailableError(
+                        "native terminal returned an invalid cursor gap"
+                    ) from error
             try:
                 content = base64.b64decode(str(result["contentBase64"]), validate=True)
                 next_cursor = int(result["nextCursor"])
@@ -1230,9 +1301,7 @@ class V2JobProvider:
                                 else {}
                             ),
                             "ptyRef": terminal_ref,
-                            "reason": "terminal_expired"
-                            if expired
-                            else "terminal_binding_lost",
+                            "reason": "terminal_expired" if expired else "terminal_binding_lost",
                         },
                     )
                 else:
@@ -1764,14 +1833,34 @@ class V2JobProvider:
             existing = self._store.read_create(request.provider_request_id)
             if existing is None:
                 native_spec = request.spec["native"]
-                try:
-                    recipe_snapshot = self._renderer.resolve_recipe(
-                        str(native_spec["runnerRef"]),
-                        str(native_spec["environmentProfileRef"]),
-                    ).wire()
-                except RuntimeRecipeForbiddenError:
-                    self._record_native_recipe_forbidden()
-                    raise
+                selection = native_spec.get("capabilityActivation")
+                if isinstance(selection, Mapping):
+                    assembly = self.runtime_assembly_by_digest(str(native_spec["assemblyDigest"]))
+                    assembly_root = assembly.root
+                    assembly_recipe = assembly_root["recipe"]
+                    assembly_plan = assembly_root["capabilityActivation"]
+                    if (
+                        assembly_recipe["runnerRef"] != native_spec["runnerRef"]
+                        or assembly_recipe["environmentProfileRef"]
+                        != native_spec["environmentProfileRef"]
+                        or assembly_root["selectedModelProtocol"]
+                        != native_spec["selectedModelProtocol"]
+                        or assembly_plan["planRef"] != selection["planRef"]
+                        or assembly_plan["planDigest"] != selection["planDigest"]
+                    ):
+                        raise StateConflictError(
+                            "native create differs from the resolved runtime assembly"
+                        )
+                    recipe_snapshot = dict(assembly_recipe)
+                else:
+                    try:
+                        recipe_snapshot = self._renderer.resolve_recipe(
+                            str(native_spec["runnerRef"]),
+                            str(native_spec["environmentProfileRef"]),
+                        ).wire()
+                    except RuntimeRecipeForbiddenError:
+                        self._record_native_recipe_forbidden()
+                        raise
         else:
             rendered_job = self._renderer.render(request)
         reservation = self._reserve_create(
@@ -1787,6 +1876,11 @@ class V2JobProvider:
             raise TombstonedError(_tombstone_payload(record))
         native_recipe = (
             self._frozen_native_recipe(record)
+            if isinstance(request, NativeCreateJobRequest)
+            else None
+        )
+        activation_plan = (
+            self._native_activation_plan(record)
             if isinstance(request, NativeCreateJobRequest)
             else None
         )
@@ -1807,7 +1901,11 @@ class V2JobProvider:
                 )
                 return CreateResult(snapshot=missing, created=False)
             if rendered_job is None:
-                rendered_job = self._renderer.render(request, native_recipe=native_recipe)
+                rendered_job = self._renderer.render(
+                    request,
+                    native_recipe=native_recipe,
+                    activation_plan=activation_plan,
+                )
             job = self._create_or_reconcile_job(rendered_job, job_ref)
         job_uid = _required_text(job, "metadata", "uid")
         self._store.mark_created(request.provider_request_id, job_uid)
@@ -2206,7 +2304,12 @@ class V2JobProvider:
 
         if self._runtime_assembly_resolver is None:
             raise DependencyUnavailableError("runtime assembly registry is not configured")
-        resolved = self._runtime_assembly_resolver.resolve(request)
+        try:
+            resolved = self._runtime_assembly_resolver.resolve(request)
+        except KcsV2Error as error:
+            if error.code == "CAPABILITY_ACTIVATION_INCOMPATIBLE":
+                self._record_m2_metric("capability_activation_failures_total")
+            raise
         wire = resolved.wire()
         plan = CapabilityActivationPlan.model_validate(wire["capabilityActivation"])
         plan_wire = plan.wire()
@@ -2263,7 +2366,9 @@ class V2JobProvider:
         try:
             plan = CapabilityActivationPlan.model_validate_json(str(_field(record, "payload")))
         except (TypeError, ValueError) as error:
-            raise DependencyUnavailableError("retained capability activation plan is invalid") from error
+            raise DependencyUnavailableError(
+                "retained capability activation plan is invalid"
+            ) from error
         if plan.root["planRef"] != plan_ref or plan.root["planDigest"] != plan_digest:
             raise IdentityDigestConflict()
         return plan
@@ -2273,17 +2378,29 @@ class V2JobProvider:
         job_ref: str,
         request: LiveWorkspaceSnapshotRequest | Mapping[str, Any],
     ) -> LiveSnapshotResult:
-        return self._live_workspace.create(job_ref, request)
+        started = time.monotonic()
+        try:
+            return self._live_workspace.create(job_ref, request)
+        finally:
+            self._record_live_operation(started)
 
     def inspect_live_workspace_snapshot(
         self, job_ref: str, snapshot_ref: str
     ) -> LiveWorkspaceSnapshot:
-        return self._live_workspace.inspect(job_ref, snapshot_ref)
+        started = time.monotonic()
+        try:
+            return self._live_workspace.inspect(job_ref, snapshot_ref)
+        finally:
+            self._record_live_operation(started)
 
     def release_live_workspace_snapshot(
         self, job_ref: str, snapshot_ref: str
     ) -> LiveWorkspaceSnapshot:
-        return self._live_workspace.release(job_ref, snapshot_ref)
+        started = time.monotonic()
+        try:
+            return self._live_workspace.release(job_ref, snapshot_ref)
+        finally:
+            self._record_live_operation(started)
 
     def read_live_workspace_content(
         self,
@@ -2294,13 +2411,19 @@ class V2JobProvider:
         offset: int = 0,
         limit_bytes: int = 1048576,
     ) -> LiveContentRange:
-        return self._live_workspace.read_content(
-            job_ref,
-            snapshot_ref,
-            path,
-            offset=offset,
-            limit_bytes=limit_bytes,
-        )
+        started = time.monotonic()
+        try:
+            result = self._live_workspace.read_content(
+                job_ref,
+                snapshot_ref,
+                path,
+                offset=offset,
+                limit_bytes=limit_bytes,
+            )
+            self._record_m2_metric("live_bytes_total", len(result.content))
+            return result
+        finally:
+            self._record_live_operation(started)
 
     def get_live_workspace_diff(
         self,
@@ -2310,12 +2433,24 @@ class V2JobProvider:
         page_token: str | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> LiveWorkspaceDiffPage:
-        return self._live_workspace.diff(
-            job_ref,
-            snapshot_ref,
-            page_token=page_token,
-            page_size=page_size,
-        )
+        started = time.monotonic()
+        try:
+            return self._live_workspace.diff(
+                job_ref,
+                snapshot_ref,
+                page_token=page_token,
+                page_size=page_size,
+            )
+        finally:
+            self._record_live_operation(started)
+
+    def _record_live_operation(self, started: float) -> None:
+        self._record_m2_metric("live_operations_total")
+        self._record_m2_metric("live_latency_seconds_sum", max(0.0, time.monotonic() - started))
+
+    def _record_m2_metric(self, name: str, value: float | int = 1) -> None:
+        with self._native_metrics_lock:
+            self._m2_metrics[name] += value
 
     def _record_native_recipe_forbidden(self) -> None:
         with self._native_metrics_lock:
@@ -3080,9 +3215,7 @@ class V2JobProvider:
                         }
                     )
                     self._native.stop(job_ref, binding, stop_request)
-                record = self._set_cancel_phase(
-                    record, "runner_stopped", output_loss_possible=True
-                )
+                record = self._set_cancel_phase(record, "runner_stopped", output_loss_possible=True)
                 close.phase("runner_stopped")
                 phase = "runner_stopped"
             if phase == "runner_stopped":
@@ -3376,13 +3509,23 @@ class V2JobProvider:
             raise StateConflictError("frozen native runtime recipe digest differs")
         spec = _field(record, "spec_payload", {})
         native_spec = _field(spec, "native", {})
-        if (
-            recipe.runner_ref != str(_field(native_spec, "runnerRef", ""))
-            or recipe.environment_profile_ref
-            != str(_field(native_spec, "environmentProfileRef", ""))
+        if recipe.runner_ref != str(
+            _field(native_spec, "runnerRef", "")
+        ) or recipe.environment_profile_ref != str(
+            _field(native_spec, "environmentProfileRef", "")
         ):
             raise StateConflictError("frozen native runtime recipe pair differs")
         return recipe
+
+    def _native_activation_plan(self, record: object) -> CapabilityActivationPlan | None:
+        spec = _field(record, "spec_payload", {})
+        native_spec = _field(spec, "native", {})
+        selection = _field(native_spec, "capabilityActivation", None)
+        if not isinstance(selection, Mapping):
+            return None
+        return self.capability_activation_plan(
+            str(selection["planRef"]), str(selection["planDigest"])
+        )
 
     def _live_binding(self, job_ref: str) -> JobBindingSnapshot | NativeJobBindingSnapshot:
         binding = self.inspect(job_ref)
@@ -3497,9 +3640,7 @@ class V2JobProvider:
                 # The credential controller reserves this record before
                 # creating its Secret, so absence proves no side effect.
                 return True
-            RunnerCredentialGrantSnapshot.model_validate_json(
-                _runtime_values(record)["payload"]
-            )
+            RunnerCredentialGrantSnapshot.model_validate_json(_runtime_values(record)["payload"])
             return True
         if kind == "native-runner-start":
             intent = self._store.read_runtime("runner-start", job_ref, ref)
@@ -3507,10 +3648,7 @@ class V2JobProvider:
             if intent is None:
                 # runner-start is retained before launcher RPC.
                 return True
-            return (
-                _runtime_values(intent).get("state") == "succeeded"
-                and generation is not None
-            )
+            return _runtime_values(intent).get("state") == "succeeded" and generation is not None
         if kind.startswith("transfer-"):
             record = self._store.read_runtime("transfer", job_ref, ref)
             if record is None:
@@ -3538,9 +3676,7 @@ class V2JobProvider:
             }
         return False
 
-    def _resume_active_lifecycle_claim(
-        self, job_ref: str, intent: Mapping[str, object]
-    ) -> None:
+    def _resume_active_lifecycle_claim(self, job_ref: str, intent: Mapping[str, object]) -> None:
         if intent.get("kind") != "native-runner-start":
             return
         generation_ref = str(intent.get("ref", ""))
@@ -4725,6 +4861,12 @@ class V2JobProvider:
             recipe,
             observed_at,
         )
+        capability_activation = self._native_capability_activation(
+            record,
+            pod,
+            latest,
+            observed_at,
+        )
         post_ack_delivery_loss = _native_post_ack_delivery_loss(activation, latest)
         if post_ack_delivery_loss is not None:
             # A delivery failure before start ACK is deterministic.  The same
@@ -4820,6 +4962,7 @@ class V2JobProvider:
             "control": control,
             "latestRunnerGeneration": latest.root if latest else None,
             "recipeActivation": activation,
+            "capabilityActivation": capability_activation,
             "deadline": deadline_payload,
             "activeOperationRefs": sorted(
                 ref for ref, state in operation_states if state in _OPERATION_ACTIVE_STATES
@@ -5019,15 +5162,9 @@ class V2JobProvider:
                 ),
                 start=parse_quantity("0"),
             )
-            parsed = (
-                int(value * 1000)
-                if resource == "cpu"
-                else int(value / (1024 * 1024))
-            )
+            parsed = int(value * 1000) if resource == "cpu" else int(value / (1024 * 1024))
             if parsed < 1:
-                raise DependencyUnavailableError(
-                    f"native Pod has no admitted {section} {resource}"
-                )
+                raise DependencyUnavailableError(f"native Pod has no admitted {section} {resource}")
             return parsed
 
         gpu_count = sum(
@@ -5053,8 +5190,8 @@ class V2JobProvider:
             },
         }
 
-    @staticmethod
     def _native_recipe_drift(
+        self,
         job: object,
         pod: object | None,
         native_spec: Mapping[str, Any],
@@ -5073,8 +5210,7 @@ class V2JobProvider:
         if pod is None:
             return None
         containers = {
-            str(_field(item, "name", "")): item
-            for item in (_path(pod, "spec", "containers") or ())
+            str(_field(item, "name", "")): item for item in (_path(pod, "spec", "containers") or ())
         }
         if set(containers) != {"runner", "control"}:
             return "Pod container roles differ from the frozen native recipe"
@@ -5100,6 +5236,11 @@ class V2JobProvider:
         expected_mounts = {
             (str(item["mountPath"]), bool(item["readOnly"])) for item in recipe.root["mounts"]
         }
+        activation_plan = self._native_activation_plan_for_spec(native_spec)
+        if activation_plan is not None:
+            expected_mounts.update(
+                (str(item["targetPath"]), True) for item in activation_plan.root["mounts"]
+            )
         if runner_mounts != expected_mounts:
             return "Pod runner mounts differ from the frozen native recipe"
         volumes = {
@@ -5108,13 +5249,87 @@ class V2JobProvider:
         platform_ref = _path(volumes.get("rc-platform"), "image", "reference")
         runner_ref = _path(volumes.get("rc-runner"), "image", "reference")
         if platform_ref != delivery["platformImageVolumeDigest"] or (
-            delivery["mode"] == "assembled"
-            and runner_ref != delivery["runnerImageVolumeDigest"]
+            delivery["mode"] == "assembled" and runner_ref != delivery["runnerImageVolumeDigest"]
         ):
             return "Pod image volumes differ from the frozen native recipe"
         if delivery["mode"] == "prebuilt" and "rc-runner" in volumes:
             return "prebuilt native Pod unexpectedly mounts a runner image volume"
+        if activation_plan is not None:
+            if (
+                annotations.get("researchcosmos.io/capability-plan-ref")
+                != activation_plan.root["planRef"]
+                or annotations.get("researchcosmos.io/capability-plan-digest")
+                != activation_plan.root["planDigest"]
+            ):
+                return "Job annotations differ from the frozen capability activation plan"
+            for mount in activation_plan.root["mounts"]:
+                volume = volumes.get(activation_volume_name(mount))
+                if _path(volume, "image", "reference") != mount["imageVolumeDigest"]:
+                    return "Pod capability ImageVolume differs from the frozen activation plan"
         return None
+
+    def _native_activation_plan_for_spec(
+        self, native_spec: Mapping[str, Any]
+    ) -> CapabilityActivationPlan | None:
+        selection = _field(native_spec, "capabilityActivation", None)
+        if not isinstance(selection, Mapping):
+            return None
+        return self.capability_activation_plan(
+            str(selection["planRef"]), str(selection["planDigest"])
+        )
+
+    def _native_capability_activation(
+        self,
+        record: object,
+        pod: object | None,
+        latest: NativeRunnerGenerationSnapshot | None,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        native_spec = _field(_field(record, "spec_payload", {}), "native", {})
+        plan = self._native_activation_plan_for_spec(native_spec)
+        if plan is None or pod is None:
+            return None
+        volumes = {
+            str(_field(item, "name", "")): item for item in (_path(pod, "spec", "volumes") or ())
+        }
+        runner = next(
+            (
+                item
+                for item in (_path(pod, "spec", "containers") or ())
+                if _field(item, "name", "") == "runner"
+            ),
+            None,
+        )
+        runner_mounts = {
+            str(_field(item, "mount_path", "")): item
+            for item in (_field(runner, "volume_mounts", ()) or ())
+        }
+        observed_mounts: dict[str, dict[str, Any]] = {}
+        for expected in plan.root["mounts"]:
+            target = str(expected["targetPath"])
+            volume = volumes.get(activation_volume_name(expected))
+            mount = runner_mounts.get(target)
+            reference = _path(volume, "image", "reference")
+            observed_mounts[target] = {
+                "imageVolumeRef": reference or str(expected["imageVolumeDigest"]),
+                # PodStatus has no CRI ID for an ImageVolume. The exact digest
+                # remains observable in PodSpec; keep imageVolumeId nullable.
+                "imageVolumeId": None,
+                "verified": (
+                    reference == expected["imageVolumeDigest"]
+                    and mount is not None
+                    and bool(_field(mount, "read_only", False))
+                ),
+            }
+        generation = int(latest.root["generation"]) if latest is not None else 1
+        return capability_activation_receipt(
+            plan,
+            job_uid=str(_field(record, "job_uid")),
+            pod_uid=_required_text(pod, "metadata", "uid"),
+            generation=generation,
+            observed_mounts=observed_mounts,
+            observed_at=observed_at,
+        ).wire()
 
     def _native_missing_job_snapshot(self, record: object) -> NativeJobBindingSnapshot:
         # A native Job that disappeared after UID assignment is intentionally
@@ -5871,10 +6086,7 @@ def _prometheus_counter_lines(
     label: str,
     values: Mapping[str, int],
 ) -> list[str]:
-    return [
-        f'{metric}{{{label}="{value}"}} {count}'
-        for value, count in sorted(values.items())
-    ]
+    return [f'{metric}{{{label}="{value}"}} {count}' for value, count in sorted(values.items())]
 
 
 def _binding_state(

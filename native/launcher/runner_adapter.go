@@ -42,9 +42,9 @@ type runnerAdapterDocument struct {
 }
 
 var runnerAdapters = map[string]runnerAdapter{
-	"runner-codex": {
-		RunnerRef:      "runner-codex",
-		Executable:     "/opt/rc-runner/usr/local/bin/codex",
+	"native-lane/codex-runner@1": {
+		RunnerRef:      "native-lane/codex-runner@1",
+		Executable:     "/opt/rc-runner/bin/codex",
 		PromptDelivery: "last-argument",
 		Configuration:  "codex-responses-v1",
 		TraceSchema:    "codex-jsonl",
@@ -55,9 +55,9 @@ var runnerAdapters = map[string]runnerAdapter{
 			"error":          {StopReason: "runner_reported_error"},
 		},
 	},
-	"runner-pi": {
-		RunnerRef:      "runner-pi",
-		Executable:     "/opt/rc-runner/usr/local/bin/pi",
+	"native-lane/pi-runner@1": {
+		RunnerRef:      "native-lane/pi-runner@1",
+		Executable:     "/opt/rc-runner/bin/pi",
 		PromptDelivery: "last-argument",
 		Configuration:  "pi-models-v1",
 		TraceSchema:    "pi-jsonl",

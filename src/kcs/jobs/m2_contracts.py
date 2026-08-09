@@ -1,8 +1,7 @@
-"""Typed models for the frozen, additive KCS 2.5 M2 surfaces.
+"""Typed models for the active, additive KCS 2.5 M2 surfaces.
 
-The production package is activated by the KCS integration owner.  This module
-deliberately reads the generated 2.5 review contract so the provider services in
-this commit can be reviewed and tested without changing the served OpenAPI bytes.
+The generated and packaged canonical document is the single schema authority.
+Production deployment remains a separate operator checkpoint.
 """
 
 from __future__ import annotations

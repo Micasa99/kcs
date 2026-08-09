@@ -55,7 +55,12 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         from kcs.jobs.kube import V2KubeAdapter
         from kcs.jobs.observability import EventStore, PrometheusClient, V2Observability
         from kcs.jobs.provider import V2JobProvider
+        from kcs.jobs.recipe_registry import NativeRecipeRegistry
         from kcs.jobs.renderer import V2JobRenderer
+        from kcs.jobs.runtime_assembly import (
+            NativeCapabilityRegistry,
+            RuntimeAssemblyResolver,
+        )
         from kcs.jobs.settings import V2RuntimeSettings
         from kcs.jobs.store import V2JobStore
         from kcs.jobs.transport import ExecRpcTransport, ExecWorkspaceRpcTransport
@@ -83,16 +88,23 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             ),
             EventStore(settings.event_db_path),
         )
+        recipes = NativeRecipeRegistry(settings.native_recipe_registry_path)
+        renderer = V2JobRenderer(settings, recipes)
+        assembly_resolver = RuntimeAssemblyResolver(
+            recipes,
+            NativeCapabilityRegistry(settings.native_capability_registry_path),
+        )
         _v2_provider = V2JobProvider(
             kube,
             V2JobStore(kube),
-            V2JobRenderer(settings),
+            renderer,
             namespace=settings.namespace,
             transport=ExecRpcTransport(kube.exec_supervisor_rpc),
             workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
             observability=observability,
             hosted_admission=False,
             openvscode_image_ref=settings.native_openvscode_image_volume,
+            runtime_assembly_resolver=assembly_resolver,
         )
     return _v2_provider
 
