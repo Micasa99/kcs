@@ -567,6 +567,13 @@ class V2JobProvider:
                 self._record_m2_metric("dev_session_relay_down_total")
             raise
 
+    def observe_dev_session_relay_ready(
+        self, job_ref: str, dev_session_ref: str, credential: str
+    ) -> DevSessionSnapshot:
+        return self._dev_sessions.observe_relay_ready(
+            job_ref, dev_session_ref, credential
+        )
+
     def capacity(self) -> CapacitySnapshot:
         """Return a fresh, read-only projection of Kubernetes Node capacity."""
         return self._cluster_feed.capacity()

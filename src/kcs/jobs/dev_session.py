@@ -230,6 +230,20 @@ class DevSessionService:
             raise DevSessionRelayDownError() from error
         return DevSessionRelayTarget(host=host, port=port, path=path)
 
+    def observe_relay_ready(
+        self, job_ref: str, dev_session_ref: str, credential: str
+    ) -> DevSessionSnapshot:
+        """Publish ``ready`` only after the projected credential worked end to end."""
+
+        record = self._access(job_ref, dev_session_ref, credential)
+        values = dict(record.values)
+        if values.get("state") == "opening":
+            values.update(state="ready", observedAt=self._now().isoformat())
+            record = self._store.update_runtime(
+                "dev-session", job_ref, dev_session_ref, values
+            )
+        return self._snapshot(record)
+
     def reconcile(self) -> int:
         changed = 0
         now = self._now()
@@ -281,7 +295,14 @@ class DevSessionService:
                 _relay_id, relay_ready = self._kube.pod_container_image_id(
                     record.job_ref, values["podUid"], "relay"
                 )
-                state = "ready" if ide_ready and relay_ready else "opening"
+                if not (ide_ready and relay_ready):
+                    state = "opening"
+                elif state != "ready":
+                    # Container readiness does not prove that kubelet has projected
+                    # the newly created or rotated credential.  The relay route
+                    # promotes this record only after an authenticated request
+                    # reaches loopback OpenVSCode.
+                    state = "opening"
             except Exception:
                 state = "lost"
         payload: dict[str, Any] = {

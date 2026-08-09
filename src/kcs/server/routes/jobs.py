@@ -754,14 +754,14 @@ def create_jobs_router(
                 timeout=(3, 30),
             )
             upstream.raw.decode_content = False
-            body = upstream.raw.read(8 * 1024 * 1024 + 1)
         except requests.RequestException as error:
             raise DevSessionRelayDownError() from error
-        finally:
-            if "upstream" in locals():
-                upstream.close()
-        if len(body) > 8 * 1024 * 1024 or upstream.status_code in {401, 410, 429, 503}:
+        if upstream.status_code in {401, 410, 429, 503}:
+            upstream.close()
             raise DevSessionRelayDownError()
+        provider.observe_dev_session_relay_ready(
+            job_ref, dev_session_ref, credential
+        )
         headers = {
             name: value
             for name, value in upstream.headers.items()
@@ -779,11 +779,18 @@ def create_jobs_router(
             )
         headers["Cache-Control"] = "no-store"
         media_type = headers.pop("Content-Type", headers.pop("content-type", None))
-        return Response(
-            content=body,
+        def relay_chunks() -> Iterator[bytes]:
+            try:
+                yield from upstream.raw.stream(64 * 1024, decode_content=False)
+            finally:
+                upstream.close()
+
+        return StreamingResponse(
+            relay_chunks(),
             status_code=upstream.status_code,
             media_type=media_type,
             headers=headers,
+            background=BackgroundTask(upstream.close),
         )
 
     @router.post(
@@ -1692,6 +1699,12 @@ def install_dev_session_websocket(
                 close_timeout=3,
                 max_size=8 * 1024 * 1024,
             ) as upstream:
+                await asyncio.to_thread(
+                    provider.observe_dev_session_relay_ready,
+                    job_ref,
+                    dev_session_ref,
+                    credential,
+                )
                 await websocket.accept(subprotocol=upstream.subprotocol)
 
                 async def browser_to_relay() -> None:
