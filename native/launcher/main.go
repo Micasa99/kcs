@@ -838,10 +838,13 @@ func preparePaths() error {
 	// Only the platform-owned root is normalized here.  Files installed by
 	// staging are handed to the experiment identity at the staging boundary;
 	// arbitrary project files and symlinks are never recursively rewritten.
-	if err := os.Chown(worktree, 10001, 10001); err != nil {
+	// Apply the collaborative mode while the platform identity still owns the
+	// freshly created root.  After ownership moves to the experiment identity,
+	// this deliberately capability-minimal launcher no longer has CAP_FOWNER.
+	if err := os.Chmod(worktree, 02775); err != nil {
 		return err
 	}
-	return os.Chmod(worktree, 02775)
+	return os.Chown(worktree, 10001, 10001)
 }
 
 func childEnvironment(adapter runnerAdapter, token string) []string {
