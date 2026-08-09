@@ -44,7 +44,8 @@ deleted and that inspect/log/event/Pod/ConfigMap surfaces contain no token bytes
 
 The required order is create → stage → grantRunnerCredential → startRunner ACK →
 runner running/exited/killed → capture while both containers live →
-finalizeJob(captureBarrier) → Job terminal. `backoffLimit=0`; a second Pod UID is a
+finalizeJob(captureBarrier) → durable launcher finalize receipt → control
+`commitFinalize` → launcher/control exit → Job terminal. `backoffLimit=0`; a second Pod UID is a
 contract failure. Soft deadline starts only at the successful start ACK and stops
 the child, not launcher/control. Hard deadline, eviction, node loss, or ENOSPC may
 destroy the Pod and must set output-loss/indeterminate facts rather than simulate a
@@ -53,6 +54,12 @@ runner result.
 Use `GET /api/v2/jobs/{jobRef}`, `GET /api/v2/events`, and bounded runner/control logs
 for diagnosis. The launcher state file and socket are private platform surfaces;
 never use root kube-exec as the terminal implementation.
+
+The launcher no longer exits on the initial `finalize` ACK. Control must retain the
+returned `finalizeReceipt.receiptDigest`, then send the internal `commitFinalize`
+command with `finalizeReceiptDigest`; only its ACK commits launcher exit. On retry,
+reconcile `/run/rc-control/finalize-receipt.json` and repeat the exact identity. Do not
+restore the former 500 ms exit timer or infer finalize success from socket loss.
 
 ## 4. Isolated canary
 

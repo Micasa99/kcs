@@ -102,12 +102,20 @@ Frozen implementation requirement:
   short-lived protocol secret only into the native agent child process environment;
   it disappears with that child. Credential bytes never enter PodSpec/container
   env, API observations, events, logs, receipts, control, or terminal shells.
-- before spawning a known native CLI, the launcher writes only non-secret routing
-  material into the private agent home: Codex receives an exact `model_providers.*`
-  Responses configuration and Pi receives an exact `models.json` for the selected
-  protocol. API-key fields name child environment variables; token bytes are never
-  serialized into either file. Other registered CLIs may consume the frozen model
-  environment directly through their recipe-owned argv.
+- before spawning a native CLI, the launcher resolves a closed declarative adapter by
+  the exact recipe-owned `RC_NATIVE_RUNNER_REF`. M1 declares `runner-codex`
+  (`codex-responses-v1`, `codex-jsonl`) and `runner-pi` (`pi-models-v1`, `pi-jsonl`),
+  including the exact executable, supported model protocols, prompt delivery, private
+  configuration writer, and terminal trace events. Codex receives an exact
+  `model_providers.*` Responses configuration and Pi receives an exact `models.json`.
+  API-key fields name child environment variables; token bytes are never serialized
+  into either file. An unknown runnerRef, protocol, or executable fails with a typed
+  launcher error; there is no basename-selected or silent bare-exec fallback. The two
+  M1 declarations are retained for the already published images. A new immutable
+  runner image instead supplies the closed declaration at
+  `/opt/rc-runner/etc/rc-runner-adapter.json`; an `environment-only-v1` adapter may
+  use an image-owned wrapper for runner-specific setup. Adding such a runner therefore
+  does not add a KCS core protocol branch or launcher heuristic.
 
 Provider implementation and isolated canary evidence must satisfy these requirements
 before production activation.
@@ -150,7 +158,8 @@ digest mismatch, binding mismatch, partial document, unknown field, or symlink.
 frame is a four-byte unsigned big-endian payload length followed by at most `131072`
 bytes of RFC 8785 canonical UTF-8 JSON. Request frames are closed objects with
 `schemaVersion` (constant `1`), `command` (`credentialStatus`, `start`, `inspect`,
-`stop`, `finalize`, `createPty`, `writePty`, `readPty`, `resizePty`, or `closePty`),
+`stop`, `finalize`, `commitFinalize`, `createPty`, `writePty`, `readPty`, `resizePty`,
+or `closePty`),
 `requestRef`, `requestDigest`,
 `jobUid`, `podUid`, `generation`, and command-specific `payload`. ACK frames are
 closed objects with `schemaVersion=1`, the same binding and request fields plus `state` (`accepted`,
@@ -164,6 +173,15 @@ environment allowlist, and its ACK returns `ptyRef` (equal to the public
 `resizePty` carries `ptyRef`, rows, and columns; `closePty` carries `ptyRef` and a
 reason. All three use first-wins request identity; writes/resizes after close or TTL
 expiry fail with the existing typed terminal state error.
+
+PTY input writes are never performed while holding the launcher-wide state mutex.
+Each terminal has a single-writer gate and a two-second write deadline; deadline
+expiry closes that PTY and returns `pty_write_timeout`. Thus a stalled terminal
+consumer cannot block `inspect`, `stop`, `finalize`, or another terminal session.
+Exact input attempts/acceptance and observed output chunks are appended as ordered,
+binding-scoped base64 facts to
+`/run/rc-control/terminal-session.jsonl`; the file is platform-owned and is not a
+research-result authority.
 
 Launcher-to-control PTY output is a closed event frame with `schemaVersion=1`,
 `event=ptyOutput`, `ptyRef`, exact binding/generation, monotonic `startCursor` and
@@ -209,6 +227,17 @@ Native finalize requires a capture receipt and fence bound to the exact
 `complete`, `failed`, or `indeterminate`. Provider finalization reports the capture
 barrier; it does not infer the research result.
 
+Launcher finalization is a recoverable two-phase internal wire. `finalize` first
+atomically writes root-only `/run/rc-control/finalize-receipt.json`, containing the
+request ref/digest, capture receipt digest, binding, generation, stable receipt digest,
+and acceptance time, then ACKs with `launcherAlive=true`. Replaying the same identity
+returns that receipt; a different identity is rejected. The launcher does not exit.
+After KCS has durably retained the ACK, control sends `commitFinalize` with the receipt
+digest. The launcher persists `state=committed`, writes the ACK, and only then exits.
+Control may read the receipt after an interrupted ACK and reconcile rather than infer
+success from a missing socket. This internal command is not a public ResearchCosmos
+operation.
+
 Existing transfer paths and schemas are lane-additive: hosted bindings dispatch to
 the workspace sidecar, while native bindings dispatch to control. Control remains
 alive through the capture barrier. Transfer and capture work must never be sent to
@@ -226,7 +255,12 @@ The minimum evidence surface is:
   stop cause, and protocol terminal/error observation;
 - `runner_phase` runtime events with sequence and state digest;
 - bounded cursor logs for `runner` and `control` containers, subject to the existing
-  log redaction and size policy.
+  log redaction and size policy;
+- exact runner stdout/stderr append-only tees at
+  `/run/rc-control/runner-stdout.raw` and `/run/rc-control/runner-stderr.raw`, plus the
+  agent-authored stdout JSONL at `/workspace/worktree/.trajectory/session.jsonl`.
+  Each complete stdout line is also emitted to the runner container log as `RCJL|...`;
+  the selected adapter observes terminal JSONL facts but never changes agent behavior.
 
 ## 6. Remote evidence register
 

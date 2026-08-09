@@ -24,13 +24,18 @@ import (
 )
 
 const (
-	controlDir = "/run/rc-control"
-	socketPath = controlDir + "/launcher.sock"
-	statePath  = controlDir + "/runner-state.json"
-	tokenPath  = "/var/run/rc/model-gateway/token"
-	worktree   = "/workspace/worktree"
-	maxFrame   = 131072
-	maxPTYData = 65536
+	controlDir        = "/run/rc-control"
+	socketPath        = controlDir + "/launcher.sock"
+	statePath         = controlDir + "/runner-state.json"
+	receiptPath       = controlDir + "/finalize-receipt.json"
+	rawStdoutPath     = controlDir + "/runner-stdout.raw"
+	rawStderrPath     = controlDir + "/runner-stderr.raw"
+	terminalFactsPath = controlDir + "/terminal-session.jsonl"
+	tokenPath         = "/var/run/rc/model-gateway/token"
+	worktree          = "/workspace/worktree"
+	sessionPath       = worktree + "/.trajectory/session.jsonl"
+	maxFrame          = 131072
+	maxPTYData        = 65536
 )
 
 type processExit struct {
@@ -90,15 +95,30 @@ type retainedAcknowledgement struct {
 	ack    acknowledgement
 }
 
+type pendingAcknowledgement struct {
+	digest string
+	done   chan struct{}
+}
+
 type terminalSession struct {
+	ptyRef       string
+	jobUID       string
+	podUID       string
+	generation   int
 	cmd          *exec.Cmd
 	pty          *os.File
+	write        func([]byte) (int, error)
+	cancelWrite  func()
+	writeGate    chan struct{}
+	factPath     string
 	output       []byte
 	base         int
 	closed       bool
 	expiresAt    time.Time
 	pausedRunner bool
 	mu           sync.Mutex
+	factMu       sync.Mutex
+	factSequence int64
 }
 
 type launcher struct {
@@ -109,9 +129,13 @@ type launcher struct {
 	jobUID           string
 	podUID           string
 	stopCause        string
-	finalizing       bool
+	protocolTerminal protocolTerminal
+	finalizeReceipt  *durableFinalizeReceipt
+	finalizePath     string
+	writeTimeout     time.Duration
 	terminals        map[string]*terminalSession
 	acknowledgements map[string]retainedAcknowledgement
+	pending          map[string]pendingAcknowledgement
 }
 
 func main() {
@@ -128,6 +152,15 @@ func main() {
 	l := &launcher{
 		terminals:        map[string]*terminalSession{},
 		acknowledgements: map[string]retainedAcknowledgement{},
+		pending:          map[string]pendingAcknowledgement{},
+		finalizePath:     receiptPath,
+		writeTimeout:     2 * time.Second,
+	}
+	if receipt, err := loadFinalizeReceipt(receiptPath); err != nil {
+		fatal(err)
+	} else if receipt != nil {
+		l.finalizeReceipt = receipt
+		l.jobUID, l.podUID, l.generation = receipt.JobUID, receipt.PodUID, receipt.Generation
 	}
 	if err := removeSocket(); err != nil {
 		fatal(err)
@@ -173,11 +206,13 @@ func (l *launcher) serve(connection net.Conn) {
 	if err := writeFrame(connection, ack); err != nil {
 		return
 	}
+	if frame.Command == "commitFinalize" && ack.State == "completed" {
+		os.Exit(0)
+	}
 }
 
 func (l *launcher) handle(frame request) acknowledgement {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	ack := acknowledgement{
 		SchemaVersion: 1,
 		Command:       frame.Command,
@@ -193,11 +228,13 @@ func (l *launcher) handle(frame request) acknowledgement {
 	if err := validateRequest(frame); err != nil {
 		code := err.Error()
 		ack.ErrorCode = &code
+		l.mu.Unlock()
 		return ack
 	}
 	if l.jobUID != "" && (l.jobUID != frame.JobUID || l.podUID != frame.PodUID) {
 		code := "stale_binding"
 		ack.ErrorCode = &code
+		l.mu.Unlock()
 		return ack
 	}
 	if l.jobUID == "" {
@@ -219,15 +256,50 @@ func (l *launcher) handle(frame request) acknowledgement {
 			if retained.digest != frame.RequestDigest {
 				code := "identity_conflict"
 				ack.ErrorCode = &code
+				l.mu.Unlock()
 				return ack
 			}
 			replayed := retained.ack
 			replayed.Replayed = true
 			replayed.ObservedAt = now()
+			l.mu.Unlock()
 			return replayed
 		}
+		if l.pending == nil {
+			l.pending = map[string]pendingAcknowledgement{}
+		}
+		if pending, found := l.pending[key]; found {
+			if pending.digest != frame.RequestDigest {
+				code := "identity_conflict"
+				ack.ErrorCode = &code
+				l.mu.Unlock()
+				return ack
+			}
+			l.mu.Unlock()
+			<-pending.done
+			l.mu.Lock()
+			retained := l.acknowledgements[key]
+			replayed := retained.ack
+			replayed.Replayed = true
+			replayed.ObservedAt = now()
+			l.mu.Unlock()
+			return replayed
+		}
+		l.pending[key] = pendingAcknowledgement{digest: frame.RequestDigest, done: make(chan struct{})}
 	}
-	result, err := l.dispatch(frame)
+	var result map[string]any
+	var err error
+	if frame.Command == "writePty" {
+		var write terminalWrite
+		write, err = l.prepareTerminalWrite(frame)
+		l.mu.Unlock()
+		if err == nil {
+			result, err = l.performTerminalWrite(write)
+		}
+		l.mu.Lock()
+	} else {
+		result, err = l.dispatch(frame)
+	}
 	if err != nil {
 		code := err.Error()
 		ack.ErrorCode = &code
@@ -240,7 +312,11 @@ func (l *launcher) handle(frame request) acknowledgement {
 			digest: frame.RequestDigest,
 			ack:    ack,
 		}
+		pending := l.pending[key]
+		delete(l.pending, key)
+		close(pending.done)
 	}
+	l.mu.Unlock()
 	return ack
 }
 
@@ -266,25 +342,13 @@ func (l *launcher) dispatch(frame request) (map[string]any, error) {
 	case "stop":
 		return l.stop(frame)
 	case "finalize":
-		var payload struct {
-			CaptureReceiptDigest string `json:"captureReceiptDigest"`
-		}
-		if err := decodePayload(frame.Payload, &payload); err != nil || payload.CaptureReceiptDigest == "" {
-			return nil, errors.New("finalize_invalid")
-		}
-		if l.obs.State != "exited" && l.obs.State != "killed" {
-			return nil, errors.New("runner_not_terminal")
-		}
-		l.finalizing = true
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			os.Exit(0)
-		}()
-		return map[string]any{"finalized": true, "launcherAlive": true}, nil
+		return l.finalize(frame)
+	case "commitFinalize":
+		return l.commitFinalize(frame)
 	case "createPty":
 		return l.createTerminal(frame)
 	case "writePty":
-		return l.writeTerminal(frame)
+		return nil, errors.New("internal_dispatch_error")
 	case "readPty":
 		return l.readTerminal(frame)
 	case "resizePty":
@@ -310,6 +374,9 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 		}
 		return nil, errors.New("generation_conflict")
 	}
+	if l.finalizeReceipt != nil {
+		return nil, errors.New("finalize_pending")
+	}
 	if frame.Generation < 1 || payload.NativeLaunchDigest == "" || payload.Descriptor == nil {
 		return nil, errors.New("launch_invalid")
 	}
@@ -328,13 +395,21 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	if err := json.Unmarshal([]byte(os.Getenv("RC_NATIVE_RUNNER_ENTRYPOINT_JSON")), &argv); err != nil || len(argv) == 0 {
 		return nil, errors.New("entrypoint_invalid")
 	}
+	adapter, err := resolveRunnerAdapter(argv)
+	if err != nil {
+		return nil, err
+	}
 	prompt := "Begin the work now and continue autonomously until the task is complete or a concrete blocker is proven. Use your native shell and file tools; do not stop after describing what you intend to do. First read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ", then inspect the actual workspace, implement the work, run relevant verification, and leave all requested outputs in the workspace. Report observed results and blockers honestly."
-	argv = append(argv, prompt)
+	argv = adapter.withPrompt(argv, prompt)
+	recorder, err := newTrajectoryRecorder(rawStdoutPath, rawStderrPath, sessionPath, adapter)
+	if err != nil {
+		return nil, errors.New("trajectory_open_failed")
+	}
 	childArgv := append([]string{"__rc_unprivileged_child"}, argv...)
 	cmd := exec.Command("/proc/self/exe", childArgv...)
 	cmd.Dir = worktree
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = recorder.stdout
+	cmd.Stderr = recorder.stderr
 	cmd.Stdin = nil
 	cmd.Env = childEnvironment(string(token))
 	cmd.SysProcAttr = childProcessAttributes(10001, 10001)
@@ -343,6 +418,7 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	l.stopCause = ""
 	l.setObservation("starting", nil, processExit{Kind: "not_observed"}, "none", &started, nil)
 	if err := cmd.Start(); err != nil {
+		recorder.close()
 		finished := now()
 		code := 127
 		l.setObservation("exited", nil, processExit{Kind: "exited", ExitCode: &code}, "natural_exit", &started, &finished)
@@ -351,12 +427,13 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	l.cmd = cmd
 	pid := cmd.Process.Pid
 	l.setObservation("running", &pid, processExit{Kind: "not_observed"}, "none", &started, nil)
-	go l.wait(cmd, started)
+	go l.wait(cmd, started, recorder)
 	return l.snapshot(), nil
 }
 
-func (l *launcher) wait(cmd *exec.Cmd, started string) {
+func (l *launcher) wait(cmd *exec.Cmd, started string, recorder *trajectoryRecorder) {
 	err := cmd.Wait()
+	recorder.close()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.cmd != cmd {
@@ -391,6 +468,7 @@ func (l *launcher) wait(cmd *exec.Cmd, started string) {
 		state = "killed"
 		cause = l.stopCause
 	}
+	l.protocolTerminal = recorder.terminal()
 	l.setObservation(state, nil, exit, cause, &started, &finished)
 	l.cmd = nil
 }
@@ -449,13 +527,17 @@ func (l *launcher) stop(frame request) (map[string]any, error) {
 }
 
 func (l *launcher) snapshot() map[string]any {
-	return map[string]any{"runnerObservation": l.obs, "launcherAlive": true}
+	result := map[string]any{"runnerObservation": l.obs, "launcherAlive": true}
+	if l.finalizeReceipt != nil {
+		result["finalizeReceipt"] = l.finalizeReceipt.public()
+	}
+	return result
 }
 
 func (l *launcher) setObservation(state string, pid *int, exit processExit, cause string, started, finished *string) {
 	l.obs = observation{
 		State: state, Sequence: l.obs.Sequence + 1, ChildPID: pid, ProcessExit: exit,
-		StopCause: cause, ProtocolTerminal: protocolTerminal{}, ChildStartedAt: started,
+		StopCause: cause, ProtocolTerminal: l.protocolTerminal, ChildStartedAt: started,
 		ChildFinishedAt: finished, ObservedAt: now(),
 	}
 	document := l.stateDocument(false)
@@ -529,22 +611,36 @@ func (l *launcher) createTerminal(frame request) (map[string]any, error) {
 		return nil, errors.New("pty_failed")
 	}
 	session := &terminalSession{
+		ptyRef:       payload.PTYRef,
+		jobUID:       l.jobUID,
+		podUID:       l.podUID,
+		generation:   l.generation,
 		cmd:          cmd,
 		pty:          terminal,
+		write:        terminal.Write,
+		writeGate:    make(chan struct{}, 1),
+		factPath:     terminalFactsPath,
 		expiresAt:    time.Now().Add(time.Duration(payload.TTLSeconds) * time.Second),
 		pausedRunner: pausedRunner,
 	}
+	session.cancelWrite = func() { l.closeTerminalProcess(session) }
 	l.terminals[payload.PTYRef] = session
+	if err := session.appendFact("opened", nil); err != nil {
+		delete(l.terminals, payload.PTYRef)
+		l.closeTerminalProcess(session)
+		l.resumeRunnerAfterTerminal(session)
+		return nil, errors.New("pty_audit_failed")
+	}
 	go session.capture(terminal)
 	go func() {
 		_ = cmd.Wait()
-		l.finishTerminal(payload.PTYRef, session, false)
+		l.finishTerminal(payload.PTYRef, session, "process_exited")
 	}()
 	go func() {
 		timer := time.NewTimer(time.Until(session.expiresAt))
 		defer timer.Stop()
 		<-timer.C
-		l.finishTerminal(payload.PTYRef, session, true)
+		l.finishTerminal(payload.PTYRef, session, "expired")
 	}()
 	return map[string]any{
 		"ptyRef":       payload.PTYRef,
@@ -559,48 +655,21 @@ func (s *terminalSession) capture(reader io.Reader) {
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
+			chunk := append([]byte(nil), buffer[:n]...)
 			s.mu.Lock()
-			s.output = append(s.output, buffer[:n]...)
+			s.output = append(s.output, chunk...)
 			if len(s.output) > 1048576 {
 				drop := len(s.output) - 1048576
 				s.output = append([]byte(nil), s.output[drop:]...)
 				s.base += drop
 			}
 			s.mu.Unlock()
+			_ = s.appendFact("output", chunk)
 		}
 		if err != nil {
 			return
 		}
 	}
-}
-
-func (l *launcher) writeTerminal(frame request) (map[string]any, error) {
-	var payload struct {
-		PTYRef        string `json:"ptyRef"`
-		ContentBase64 string `json:"contentBase64"`
-	}
-	if err := decodePayload(frame.Payload, &payload); err != nil {
-		return nil, err
-	}
-	s := l.terminals[payload.PTYRef]
-	if s == nil {
-		return nil, errors.New("pty_not_found")
-	}
-	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if closed || time.Now().After(s.expiresAt) {
-		return nil, errors.New("pty_expired")
-	}
-	content, err := base64.StdEncoding.DecodeString(payload.ContentBase64)
-	if err != nil || len(content) > maxPTYData {
-		return nil, errors.New("pty_input_invalid")
-	}
-	_, err = s.pty.Write(content)
-	if err != nil {
-		return nil, errors.New("pty_closed")
-	}
-	return map[string]any{"written": len(content)}, nil
 }
 
 func (l *launcher) readTerminal(frame request) (map[string]any, error) {
@@ -680,26 +749,35 @@ func (l *launcher) closeTerminal(frame request) (map[string]any, error) {
 	if s == nil {
 		return nil, errors.New("pty_not_found")
 	}
+	_ = s.appendFact("close_requested", nil)
 	delete(l.terminals, payload.PTYRef)
 	l.closeTerminalProcess(s)
 	l.resumeRunnerAfterTerminal(s)
+	_ = s.appendFact("closed", nil)
 	return map[string]any{"closed": true}, nil
 }
 
-func (l *launcher) finishTerminal(ptyRef string, session *terminalSession, terminate bool) {
+func (l *launcher) finishTerminal(ptyRef string, session *terminalSession, reason string) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.terminals[ptyRef] != session {
+		l.mu.Unlock()
 		return
 	}
-	if terminate {
+	l.mu.Unlock()
+	_ = session.appendFact(reason, nil)
+	if reason != "process_exited" {
 		l.closeTerminalProcess(session)
 	} else {
 		session.mu.Lock()
 		session.closed = true
 		session.mu.Unlock()
 	}
-	l.resumeRunnerAfterTerminal(session)
+	l.mu.Lock()
+	if l.terminals[ptyRef] == session {
+		l.resumeRunnerAfterTerminal(session)
+	}
+	l.mu.Unlock()
+	_ = session.appendFact("closed", nil)
 }
 
 func (l *launcher) closeTerminalProcess(session *terminalSession) {
@@ -710,8 +788,10 @@ func (l *launcher) closeTerminalProcess(session *terminalSession) {
 	if alreadyClosed {
 		return
 	}
-	_ = session.pty.Close()
-	if session.cmd.Process != nil {
+	if session.pty != nil {
+		_ = session.pty.Close()
+	}
+	if session.cmd != nil && session.cmd.Process != nil {
 		_ = syscall.Kill(-session.cmd.Process.Pid, syscall.SIGTERM)
 	}
 }
@@ -821,7 +901,7 @@ func normalizeWorktreeModes() error {
 }
 
 func childEnvironment(token string) []string {
-	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "CODEX_HOME=/run/rc-user/home/.codex", "PI_CODING_AGENT_DIR=/run/rc-user/home/pi-agent", "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "CODEX_HOME=/run/rc-user/home/.codex", "PI_CODING_AGENT_DIR=/run/rc-user/home/pi-agent", "RC_NATIVE_RUNNER_REF=" + os.Getenv("RC_NATIVE_RUNNER_REF"), "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
 	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
 	if strings.HasPrefix(protocol, "anthropic-") {
 		values = append(values, "ANTHROPIC_API_KEY="+token)
@@ -829,86 +909,6 @@ func childEnvironment(token string) []string {
 		values = append(values, "OPENAI_API_KEY="+token)
 	}
 	return values
-}
-
-func prepareRunnerConfiguration(argv []string) error {
-	if len(argv) == 0 {
-		return errors.New("runner argv is empty")
-	}
-	route := os.Getenv("MODEL_ROUTE")
-	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
-	if route == "" || protocol == "" {
-		return errors.New("model route is incomplete")
-	}
-	switch filepath.Base(argv[0]) {
-	case "codex":
-		if protocol != "openai-responses" {
-			return errors.New("codex requires openai-responses")
-		}
-		directory := "/run/rc-user/home/.codex"
-		if err := os.MkdirAll(directory, 0700); err != nil {
-			return err
-		}
-		contents := strings.Join([]string{
-			"model = " + strconv.Quote(route),
-			"model_provider = \"researchcosmos\"",
-			"",
-			"[model_providers.researchcosmos]",
-			"name = \"ResearchCosmos Model Gateway\"",
-			"base_url = " + strconv.Quote(os.Getenv("OPENAI_BASE_URL")),
-			"env_key = \"OPENAI_API_KEY\"",
-			"wire_api = \"responses\"",
-			"",
-		}, "\n")
-		return writeRunnerConfig(filepath.Join(directory, "config.toml"), []byte(contents))
-	case "pi":
-		if protocol != "openai-completions" && protocol != "anthropic-messages" {
-			return errors.New("pi protocol is unsupported")
-		}
-		directory := "/run/rc-user/home/pi-agent"
-		if err := os.MkdirAll(directory, 0700); err != nil {
-			return err
-		}
-		baseURL := os.Getenv("OPENAI_BASE_URL")
-		keyName := "OPENAI_API_KEY"
-		if protocol == "anthropic-messages" {
-			baseURL = os.Getenv("ANTHROPIC_BASE_URL")
-			keyName = "ANTHROPIC_API_KEY"
-		}
-		payload := map[string]any{
-			"providers": map[string]any{
-				"researchcosmos": map[string]any{
-					"baseUrl": baseURL,
-					"api":     protocol,
-					"apiKey":  keyName,
-					"models": []map[string]any{{
-						"id":            route,
-						"name":          route,
-						"reasoning":     true,
-						"input":         []string{"text"},
-						"contextWindow": 200000,
-						"maxTokens":     8192,
-					}},
-				},
-			},
-		}
-		bytes, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		return writeRunnerConfig(filepath.Join(directory, "models.json"), bytes)
-	default:
-		// Other registered native CLIs may consume the frozen model environment
-		// directly. Their exact argv remains recipe-owned rather than launcher-owned.
-		return nil
-	}
-}
-
-func writeRunnerConfig(path string, contents []byte) error {
-	if err := os.WriteFile(path, contents, 0600); err != nil {
-		return err
-	}
-	return os.Chmod(path, 0600)
 }
 
 func readCredential() ([]byte, error) {
@@ -1051,14 +1051,17 @@ func writeAtomicJSON(path string, value any) error {
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	temp, err := os.CreateTemp(controlDir, ".runner-state-")
+	directoryPath := filepath.Dir(path)
+	temp, err := os.CreateTemp(directoryPath, ".rc-state-")
 	if err != nil {
 		return err
 	}
 	tempName := temp.Name()
 	defer os.Remove(tempName)
 	if err = temp.Chmod(0600); err == nil {
-		err = temp.Chown(0, 0)
+		if os.Geteuid() == 0 {
+			err = temp.Chown(0, 0)
+		}
 	}
 	if err == nil {
 		_, err = temp.Write(bytes)
@@ -1076,7 +1079,7 @@ func writeAtomicJSON(path string, value any) error {
 	if err = os.Rename(tempName, path); err != nil {
 		return err
 	}
-	directory, err := os.Open(controlDir)
+	directory, err := os.Open(directoryPath)
 	if err != nil {
 		return err
 	}
