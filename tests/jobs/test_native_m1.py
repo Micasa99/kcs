@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from kcs.jobs.canonical import canonical_digest
+from kcs.jobs.contracts import CreateJobRequest
 from kcs.jobs.errors import RuntimeRecipeForbiddenError
 from kcs.jobs.native_contracts import NativeCreateJobRequest, NativeRunnerGenerationSnapshot
 from kcs.jobs.provider import V2JobProvider, _native_post_ack_delivery_loss
@@ -230,3 +231,15 @@ def test_recipe_refusal_increments_only_the_aggregate_metric() -> None:
     assert "kcs_native_recipe_forbidden_total 1\n" in metrics
     assert "unknown-runner" not in metrics
     assert "unknown-environment" not in metrics
+
+
+def test_production_provider_refuses_new_hosted_jobs() -> None:
+    payload = json.loads(
+        (ROOT / "openapi/examples/fixtures/create-request.json").read_text()
+    )
+    request = CreateJobRequest.model_validate(payload)
+    provider = object.__new__(V2JobProvider)
+    provider._hosted_admission = False
+
+    with pytest.raises(RuntimeRecipeForbiddenError, match="hosted Job admission is retired"):
+        provider.create(request)

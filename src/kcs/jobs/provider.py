@@ -421,6 +421,7 @@ class V2JobProvider:
         transport: AgentRpcTransportProtocol | None = None,
         workspace_transport: WorkspaceRpcTransportProtocol | None = None,
         observability: V2ObservabilityProtocol | None = None,
+        hosted_admission: bool = True,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -441,6 +442,7 @@ class V2JobProvider:
         self._transport = transport
         self._workspace_transport = workspace_transport
         self._observability = observability
+        self._hosted_admission = hosted_admission
         self._cluster_feed = ClusterFeed(kube, clock=self._clock)
         self._lifecycle = LifecycleGate(store)
         self._startup_reconcile = False
@@ -1653,6 +1655,11 @@ class V2JobProvider:
 
     def create(self, request: CreateJobRequest | NativeCreateJobRequest) -> CreateResult:
         """Reserve before create and reconcile a response lost after API acceptance."""
+
+        if not isinstance(request, NativeCreateJobRequest) and not self._hosted_admission:
+            raise RuntimeRecipeForbiddenError(
+                "hosted Job admission is retired; submit an exact native runtime recipe"
+            )
 
         spec_payload = (
             request.spec

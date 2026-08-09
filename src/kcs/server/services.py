@@ -91,6 +91,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             transport=ExecRpcTransport(kube.exec_supervisor_rpc),
             workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
             observability=observability,
+            hosted_admission=False,
         )
     return _v2_provider
 
