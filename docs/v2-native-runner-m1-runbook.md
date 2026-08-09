@@ -8,9 +8,11 @@ Production deployment is a separate owner checkpoint.
 
 ## 1. Build and register immutable images
 
-Build the API from `Containerfile`, the control sidecar from
-`deploy/v2/conformance-workspace.Containerfile`, and the platform image volume from
-`native/launcher/Containerfile`. Push each image to the KCS-managed registry and
+Build the API from `Containerfile`, the production control sidecar from
+`deploy/v2/native-runtime-control.Containerfile`, and the platform image volume from
+`native/launcher/Containerfile`. The fixed probes in
+`kcs.conformance.workspace_sidecar` remain a test/hosted-conformance wrapper and are
+not the native control authority. Push each image to the KCS-managed registry and
 resolve the registry digest; tags are never accepted in a recipe. The runner image
 volume is a digest-pinned image containing the native CLI and its own runtime. The
 environment image is the experiment filesystem and must not contain platform
@@ -50,6 +52,13 @@ contract failure. Soft deadline starts only at the successful start ACK and stop
 the child, not launcher/control. Hard deadline, eviction, node loss, or ENOSPC may
 destroy the Pod and must set output-loss/indeterminate facts rather than simulate a
 runner result.
+
+The production control durably records the launcher's finalize acknowledgement
+before replying to the API. The private control action `inspectNativeFinalize`
+reconciles the exact
+jobUID/podUID/finalizeRef/generation and launcher request digest after an API ACK
+loss. The control process accepts shutdown only after such a receipt exists and the
+launcher socket has stopped accepting connections.
 
 Use `GET /api/v2/jobs/{jobRef}`, `GET /api/v2/events`, and bounded runner/control logs
 for diagnosis. The launcher state file and socket are private platform surfaces;
