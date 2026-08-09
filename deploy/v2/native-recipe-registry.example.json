@@ -6,7 +6,7 @@
         "runnerRef": "runner-codex",
         "environmentProfileRef": "env-default",
         "recipeRef": "recipe-codex-env-default-v1",
-        "recipeDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+        "recipeDigest": "34f8b68e735c1a4e746ca38c9ad1a0e3ade79d3b65a407343c444d7eb2f498ae",
         "delivery": {
           "mode": "assembled",
           "transport": "imageVolume",

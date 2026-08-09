@@ -11,7 +11,11 @@ from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.errors import RuntimeRecipeForbiddenError
 from kcs.jobs.native_contracts import NativeCreateJobRequest, NativeRunnerGenerationSnapshot
 from kcs.jobs.provider import V2JobProvider, _native_post_ack_delivery_loss
-from kcs.jobs.recipe_registry import NativeRecipeRegistry
+from kcs.jobs.recipe_registry import (
+    NativeRecipeRegistry,
+    runtime_recipe_digest,
+    runtime_recipe_snapshot_wire,
+)
 from kcs.jobs.renderer import V2JobRenderer, runner_credential_secret_name
 from kcs.jobs.settings import V2RuntimeSettings
 from kcs.server.app import create_app
@@ -23,6 +27,7 @@ def _registry(tmp_path: Path) -> NativeRecipeRegistry:
     recipe = json.loads(
         (ROOT / "openapi/native-fixtures/runtime-recipe-assembled.json").read_text()
     )
+    recipe["recipeDigest"] = runtime_recipe_digest(recipe)
     path = tmp_path / "recipes.json"
     path.write_text(
         json.dumps(
@@ -49,6 +54,53 @@ def test_native_recipe_is_exact_and_unknown_pairs_fail_closed(tmp_path: Path) ->
     assert registry.count == 1
     with pytest.raises(RuntimeRecipeForbiddenError):
         registry.resolve("runner-codex", "env-unknown")
+
+
+def test_native_recipe_digest_is_recomputed_and_snapshot_wire_is_stable(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    first = registry.resolve("runner-codex", "env-default")
+    second = registry.resolve("runner-codex", "env-default")
+
+    first_snapshot = runtime_recipe_snapshot_wire(first)
+    second_snapshot = runtime_recipe_snapshot_wire(second)
+    assert first_snapshot == second_snapshot
+    assert "observedAt" not in first_snapshot
+    assert first_snapshot["recipeDigest"] == runtime_recipe_digest(first_snapshot)
+
+
+def test_native_recipe_registry_rejects_digest_mismatch(tmp_path: Path) -> None:
+    recipe = json.loads(
+        (ROOT / "openapi/native-fixtures/runtime-recipe-assembled.json").read_text()
+    )
+    recipe["recipeDigest"] = runtime_recipe_digest(recipe)
+    recipe["recipeRef"] = f"{recipe['recipeRef']}-tampered"
+    path = tmp_path / "recipes.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "recipes": [
+                    {
+                        "recipe": recipe,
+                        "requires": ["linux-amd64", "workspace-rw"],
+                        "provides": [
+                            "linux-amd64",
+                            "workspace-rw",
+                            "nvidia-gpu",
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="native recipe digest does not match immutable content",
+    ):
+        NativeRecipeRegistry(path)
 
 
 def test_native_renderer_builds_only_runner_control_and_no_replacement(tmp_path: Path) -> None:

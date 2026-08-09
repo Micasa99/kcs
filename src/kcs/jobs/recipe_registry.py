@@ -2,13 +2,63 @@
 
 from __future__ import annotations
 
+import copy
+import hmac
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from .canonical import canonical_digest
 from .errors import InvalidRequestError, RuntimeRecipeForbiddenError
 from .native_contracts import ResolvedRuntimeRecipe
+
+
+def _recipe_wire(
+    recipe: ResolvedRuntimeRecipe | Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(recipe, ResolvedRuntimeRecipe):
+        return copy.deepcopy(recipe.wire())
+    return copy.deepcopy(dict(recipe))
+
+
+def runtime_recipe_digest_payload(
+    recipe: ResolvedRuntimeRecipe | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the immutable recipe content covered by ``recipeDigest``.
+
+    ``recipeDigest`` is self-referential and ``observedAt`` describes an API
+    observation rather than runtime assembly content.  Every other canonical
+    recipe field participates in the digest.
+    """
+
+    payload = _recipe_wire(recipe)
+    payload.pop("recipeDigest", None)
+    payload.pop("observedAt", None)
+    return payload
+
+
+def runtime_recipe_digest(
+    recipe: ResolvedRuntimeRecipe | Mapping[str, Any],
+) -> str:
+    """Return the RFC 8785 SHA-256 digest for immutable recipe content."""
+
+    return canonical_digest(runtime_recipe_digest_payload(recipe))
+
+
+def runtime_recipe_snapshot_wire(
+    recipe: ResolvedRuntimeRecipe | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return stable content suitable for a future create-time snapshot.
+
+    The result deliberately omits the dynamic ``observedAt`` response field and
+    carries a digest recomputed from the returned immutable content.
+    """
+
+    payload = runtime_recipe_digest_payload(recipe)
+    payload["recipeDigest"] = canonical_digest(payload)
+    return payload
 
 
 class NativeRecipeRegistry:
@@ -47,6 +97,10 @@ class NativeRecipeRegistry:
             ):
                 raise ValueError("native recipe requires must be a subset of provides")
             recipe = ResolvedRuntimeRecipe.model_validate(item["recipe"])
+            supplied_digest = str(recipe.root["recipeDigest"])
+            expected_digest = runtime_recipe_digest(recipe)
+            if not hmac.compare_digest(supplied_digest, expected_digest):
+                raise ValueError("native recipe digest does not match immutable content")
             key = (recipe.runner_ref, recipe.environment_profile_ref)
             if key in self._recipes:
                 raise ValueError("native recipe registry contains a duplicate pair")
@@ -67,4 +121,9 @@ class NativeRecipeRegistry:
         return len(self._recipes)
 
 
-__all__ = ["NativeRecipeRegistry"]
+__all__ = [
+    "NativeRecipeRegistry",
+    "runtime_recipe_digest",
+    "runtime_recipe_digest_payload",
+    "runtime_recipe_snapshot_wire",
+]
