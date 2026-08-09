@@ -49,7 +49,10 @@ func newTrajectoryRecorderWithOwnership(rawOutPath, rawErrPath, sessionFile stri
 		return nil, err
 	}
 	if setOwner {
-		if err := os.Chown(trajectoryDir, 10001, 10001); err != nil {
+		if err := os.Chown(trajectoryDir, 0, 10001); err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(trajectoryDir, 02770); err != nil {
 			return nil, err
 		}
 	}
@@ -69,7 +72,13 @@ func newTrajectoryRecorderWithOwnership(rawOutPath, rawErrPath, sessionFile stri
 		return nil, err
 	}
 	if setOwner {
-		if err := session.Chown(10001, 10001); err != nil {
+		if err := session.Chmod(0660); err != nil {
+			rawOut.Close()
+			rawErr.Close()
+			session.Close()
+			return nil, err
+		}
+		if err := session.Chown(0, 10001); err != nil {
 			rawOut.Close()
 			rawErr.Close()
 			session.Close()

@@ -33,7 +33,8 @@ const (
 	terminalFactsPath = controlDir + "/terminal-session.jsonl"
 	tokenPath         = "/var/run/rc/model-gateway/token"
 	worktree          = "/workspace/worktree"
-	sessionPath       = worktree + "/.trajectory/session.jsonl"
+	trajectoryDir     = worktree + "/.trajectory"
+	sessionPath       = trajectoryDir + "/session.jsonl"
 	maxFrame          = 131072
 	maxPTYData        = 65536
 )
@@ -843,6 +844,31 @@ func preparePaths() error {
 	// this deliberately capability-minimal launcher no longer has CAP_FOWNER.
 	if err := os.Chmod(worktree, 02775); err != nil {
 		return err
+	}
+	// Reserve the platform trace seam before handing the worktree root to the
+	// experiment identity. PID 1 intentionally has no DAC override afterwards.
+	if err := os.MkdirAll(trajectoryDir, 02770); err != nil {
+		return err
+	}
+	if err := os.Chmod(trajectoryDir, 02770); err != nil {
+		return err
+	}
+	if err := os.Chown(trajectoryDir, 0, 10001); err != nil {
+		return err
+	}
+	session, err := os.OpenFile(sessionPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
+	if err != nil {
+		return err
+	}
+	if err = session.Chmod(0660); err == nil {
+		err = session.Chown(0, 10001)
+	}
+	closeErr := session.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	return os.Chown(worktree, 10001, 10001)
 }

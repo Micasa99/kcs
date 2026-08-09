@@ -636,9 +636,7 @@ class NativeRuntimeController:
                         raise
                 else:
                     if reply.get("finalized") is not True:
-                        raise DependencyUnavailableError(
-                            "launcher did not acknowledge finalize"
-                        )
+                        raise DependencyUnavailableError("launcher did not acknowledge finalize")
             payload.update(state="launcher_acknowledged", observedAt=self._now().isoformat())
             record = self._store.update_runtime(
                 "native-finalize",
@@ -855,11 +853,19 @@ class NativeRuntimeController:
         except Exception as error:
             raise DependencyUnavailableError("native launcher RPC failed") from error
         if response.get("ok") is not True:
+            raw_message = response.get("message")
+            message = (
+                raw_message
+                if isinstance(raw_message, str)
+                and raw_message.startswith("native launcher rejected ")
+                and len(raw_message) <= 160
+                else "native launcher rejected the request"
+            )
             if response.get("code") == "PRECONDITION_FAILED":
-                raise PreconditionFailedError("native runtime capacity preflight failed")
+                raise PreconditionFailedError(message)
             if response.get("code") == "STATE_CONFLICT":
-                raise StateConflictError("native launcher retained a different identity")
-            raise DependencyUnavailableError("native launcher rejected the request")
+                raise StateConflictError(message)
+            raise DependencyUnavailableError(message)
         result = response.get("result")
         if not isinstance(result, Mapping):
             raise DependencyUnavailableError("native launcher returned an invalid result")

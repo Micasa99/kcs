@@ -52,6 +52,25 @@ _ENTRY_MODE_BITS = {
 _EXPERIMENT_UID = 10001
 _EXPERIMENT_GID = 10001
 _NATIVE_FINALIZE_RECEIPT_PATH = "/run/rc-control/finalize-receipt.json"
+_NATIVE_LAUNCHER_PRECONDITION_ERRORS = frozenset(
+    {
+        "entrypoint_invalid",
+        "launch_invalid",
+        "model_route_missing",
+        "runner_adapter_invalid",
+        "runner_adapter_unsupported",
+        "runner_entrypoint_mismatch",
+        "runner_protocol_unsupported",
+    }
+)
+_NATIVE_LAUNCHER_DEPENDENCY_ERRORS = frozenset(
+    {
+        "child_start_failed",
+        "credential_unavailable",
+        "finalize_pending",
+        "trajectory_open_failed",
+    }
+)
 
 
 class _RpcRejectedError(Exception):
@@ -426,11 +445,21 @@ class RuntimeControlSidecar:
                 public_code = "PRECONDITION_FAILED"
             elif code in {"identity_conflict", "stale_binding"}:
                 public_code = "STATE_CONFLICT"
+            elif code in _NATIVE_LAUNCHER_PRECONDITION_ERRORS:
+                public_code = "PRECONDITION_FAILED"
             else:
                 public_code = "DEPENDENCY_UNAVAILABLE"
+            known_errors = (
+                _NATIVE_LAUNCHER_PRECONDITION_ERRORS
+                | _NATIVE_LAUNCHER_DEPENDENCY_ERRORS
+                | {"capacity_insufficient", "identity_conflict", "stale_binding"}
+            )
+            public_error = (
+                code if isinstance(code, str) and code in known_errors else "launcher_failed"
+            )
             raise _RpcRejectedError(
                 public_code,
-                "native launcher rejected the request",
+                f"native launcher rejected {command}: {public_error}",
             )
         if command in {"start", "inspect", "stop"}:
             result["payload"]["runnerObservation"] = self._read_native_state(
