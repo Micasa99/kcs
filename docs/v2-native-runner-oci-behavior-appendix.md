@@ -317,7 +317,10 @@ job UID, Pod UID, generation, TTL, and connection limit. RC issues its own
 same-origin browser ticket and proxies HTTP/WebSocket traffic. Renew rotates the KCS
 credential; expiry and revoke are immediate and typed. Replacement Pod identity is
 stale, not transparently reattached. KCS strips credentials before proxying and does
-not pass them to OpenVSCode. Extensions are curated/cached through platform policy;
+not pass them to OpenVSCode. The outer relay is the only container mounting this
+root-owned `0400` Secret; it runs as UID/GID `0:0` with all capabilities dropped,
+read-only rootfs, no workspace mount and no service-account token. OpenVSCode remains
+the unprivileged `10002:10001` process and never mounts the credential. Extensions are curated/cached through platform policy;
 arbitrary Open VSX egress is disabled by default.
 
 ### 7.3 Exact Skill and Tool activation
