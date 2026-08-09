@@ -1047,9 +1047,9 @@ class RuntimeControlSidecar:
             dir_fd=parent_fd,
         )
         try:
+            os.fchmod(descriptor, 0o660)
             if os.geteuid() == 0:
                 os.fchown(descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
-            os.fchmod(descriptor, 0o660)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -1528,6 +1528,12 @@ class RuntimeControlSidecar:
                     if not create:
                         raise _RpcRejectedError("NOT_FOUND", "workspace parent does not exist")
                     os.mkdir(component, 0o2775, dir_fd=descriptor)
+                    os.chmod(
+                        component,
+                        0o2775,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
                     if os.geteuid() == 0:
                         os.chown(
                             component,
@@ -1536,12 +1542,6 @@ class RuntimeControlSidecar:
                             dir_fd=descriptor,
                             follow_symlinks=False,
                         )
-                    os.chmod(
-                        component,
-                        0o2775,
-                        dir_fd=descriptor,
-                        follow_symlinks=False,
-                    )
                 next_descriptor = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
