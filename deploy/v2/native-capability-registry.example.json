@@ -9,9 +9,9 @@
       "sourcePath": "/",
       "targetPath": "/opt/rc-skills/native-autonomous-research",
       "runnerDiscoveryPath": "/opt/rc-skills/native-autonomous-research",
-      "runnerRefs": ["native-lane/codex-runner@1"],
+      "runnerRefs": ["native-lane/codex-runner@1", "native-lane/pi-runner@1"],
       "environmentProfileRefs": ["research/python-analysis@1.13.0"],
-      "modelProtocols": ["openai-responses"]
+      "modelProtocols": ["openai-responses", "openai-completions", "anthropic-messages"]
     },
     {
       "kind": "tool",
@@ -21,9 +21,9 @@
       "sourcePath": "/",
       "targetPath": "/opt/rc-tools/evidence-manifest",
       "runnerDiscoveryPath": "/opt/rc-tools/evidence-manifest/rc-evidence-manifest",
-      "runnerRefs": ["native-lane/codex-runner@1"],
+      "runnerRefs": ["native-lane/codex-runner@1", "native-lane/pi-runner@1"],
       "environmentProfileRefs": ["research/python-analysis@1.13.0"],
-      "modelProtocols": ["openai-responses"]
+      "modelProtocols": ["openai-responses", "openai-completions", "anthropic-messages"]
     }
   ]
 }

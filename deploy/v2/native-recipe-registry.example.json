@@ -49,6 +49,55 @@
       },
       "requires": ["linux-amd64", "workspace-rw", "model-gateway"],
       "provides": ["linux-amd64", "workspace-rw", "model-gateway", "nvidia-gpu"]
+    },
+    {
+      "recipe": {
+        "runnerRef": "native-lane/pi-runner@1",
+        "environmentProfileRef": "research/python-analysis@1.13.0",
+        "recipeRef": "recipe-native-lane-pi-python-analysis-v1",
+        "recipeDigest": "02672ceb52d68abab3c17997920a36fb2ecac93539c315c66bba7bdfb3dcb2a4",
+        "delivery": {
+          "mode": "assembled",
+          "transport": "imageVolume",
+          "environmentImageDigest": "registry.example/environment@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "platformImageVolumeDigest": "registry.example/platform@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "runnerImageVolumeDigest": "registry.example/pi-runner@sha256:5555555555555555555555555555555555555555555555555555555555555555",
+          "controlImageDigest": "registry.example/control@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "imageFilesystem": {
+          "imageFsCompressedBytes": 700000000,
+          "imageFsUnpackedBytes": 1500000000
+        },
+        "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
+        "runnerEntrypoint": ["/opt/rc-runner/bin/pi", "--mode", "json", "-p", "--no-session"],
+        "controlCommand": ["/opt/kcs/workspace-sidecar", "serve"],
+        "launcherSocketPath": "/run/rc-control/launcher.sock",
+        "identity": {
+          "runtimeUid": 0,
+          "runtimeGid": 0,
+          "launcherUid": 0,
+          "launcherGid": 0,
+          "experimentUid": 10001,
+          "experimentGid": 10001,
+          "terminalUid": 10002,
+          "terminalGid": 10001
+        },
+        "mounts": [
+          {"role": "workspace", "mountPath": "/workspace", "readOnly": false},
+          {"role": "platform", "mountPath": "/opt/rc-platform", "readOnly": true},
+          {"role": "runner", "mountPath": "/opt/rc-runner", "readOnly": true},
+          {"role": "control", "mountPath": "/run/rc-control", "readOnly": false},
+          {"role": "credential", "mountPath": "/var/run/rc/model-gateway", "readOnly": true},
+          {"role": "userHome", "mountPath": "/run/rc-user/home", "readOnly": false},
+          {"role": "userTmp", "mountPath": "/run/rc-user/tmp", "readOnly": false},
+          {"role": "terminalHome", "mountPath": "/run/rc-terminal/home", "readOnly": false},
+          {"role": "terminalTmp", "mountPath": "/run/rc-terminal/tmp", "readOnly": false}
+        ],
+        "supportedModelProtocols": ["openai-completions", "anthropic-messages"],
+        "observedAt": "2026-08-08T08:59:00Z"
+      },
+      "requires": ["linux-amd64", "workspace-rw", "model-gateway"],
+      "provides": ["linux-amd64", "workspace-rw", "model-gateway", "nvidia-gpu"]
     }
   ]
 }

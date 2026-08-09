@@ -97,6 +97,29 @@ func TestRunnerSpecificEnvironmentIsOwnedByAdapter(t *testing.T) {
 	}
 }
 
+func TestPiAdapterSelectsTheResolvedGatewayModel(t *testing.T) {
+	t.Setenv("MODEL_ROUTE", "work-interactive")
+	pi := runnerAdapters["native-lane/pi-runner@1"].withPrompt(
+		[]string{"/opt/rc-runner/bin/pi", "--mode", "json", "-p", "--no-session"},
+		"read TASK.md",
+	)
+	want := []string{
+		"/opt/rc-runner/bin/pi", "--mode", "json", "-p", "--no-session",
+		"--provider", "researchcosmos", "--model", "work-interactive", "read TASK.md",
+	}
+	if strings.Join(pi, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("Pi did not select the resolved Model Gateway route: got=%v want=%v", pi, want)
+	}
+
+	codex := runnerAdapters["native-lane/codex-runner@1"].withPrompt(
+		[]string{"/opt/rc-runner/bin/codex", "exec"},
+		"read TASK.md",
+	)
+	if strings.Contains(strings.Join(codex, "\x00"), "--provider") {
+		t.Fatalf("Codex inherited Pi CLI selection arguments: %v", codex)
+	}
+}
+
 func TestExactToolDiscoveryPathsExtendChildPATH(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "metrics", "bin")

@@ -135,6 +135,12 @@ func declaredRunnerAdapter(path string) (runnerAdapter, error) {
 
 func (adapter runnerAdapter) withPrompt(argv []string, prompt string) []string {
 	result := append([]string(nil), argv...)
+	// Pi does not select a custom provider merely because models.json contains
+	// one. Keep that runner-specific launch detail inside the adapter so every
+	// task uses the exact Model Gateway route resolved by the platform.
+	if adapter.Configuration == "pi-models-v1" {
+		result = append(result, "--provider", "researchcosmos", "--model", os.Getenv("MODEL_ROUTE"))
+	}
 	if adapter.PromptDelivery == "last-argument" {
 		return append(result, prompt)
 	}
