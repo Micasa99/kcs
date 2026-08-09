@@ -8,6 +8,7 @@ extensions and are deliberately not part of this module.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -37,6 +38,17 @@ from kcs.jobs.transport import (
 _COPY_CHUNK = 1024 * 1024
 _MAX_RPC_HEADER = 4 * 1024 * 1024
 _MAX_NATIVE_FRAME = 131072
+_MAX_INLINE_OPERATION_RESULT = 64 * 1024
+_MAX_OPERATION_RESULT = 256 * 1024 * 1024
+_MAX_STAGE_TREE_ENTRIES = 4096
+_MAX_CAPTURE_TREE_FILES = 4096
+_MAX_CAPTURE_TREE_BYTES = 128 * 1024 * 1024
+_WORKSPACE_TREE_SCHEMA = "cosmos.workspace-tree/1"
+_ENTRY_MODE_BITS = {
+    "read_only": 0o444,
+    "read_write": 0o644,
+    "executable": 0o755,
+}
 _EXPERIMENT_UID = 10001
 _EXPERIMENT_GID = 10001
 _NATIVE_FINALIZE_RECEIPT_PATH = "/run/rc-control/finalize-receipt.json"
@@ -47,6 +59,85 @@ class _RpcRejectedError(Exception):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+def _workspace_relative_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace path is absent")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise _RpcRejectedError("UNSAFE_PATH", "workspace path is unsafe")
+    if path.parts[0] in {".git", ".cosmos"}:
+        raise _RpcRejectedError("UNSAFE_PATH", "workspace entry claims a private prefix")
+    return str(path)
+
+
+def _workspace_action_payload(frame: Mapping[str, Any]) -> dict[str, Any]:
+    if set(frame) != {
+        "protocol",
+        "action",
+        "operation_id",
+        "request_digest",
+        "frame_digest",
+        "payload",
+    }:
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace tree frame is not closed")
+    payload = frame.get("payload")
+    if not isinstance(payload, dict):
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace tree payload is absent")
+    frame_digest = frame.get("frame_digest")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if frame_digest != hashlib.sha256(encoded.encode()).hexdigest():
+        raise _RpcRejectedError("DIGEST_MISMATCH", "workspace tree frame digest differs")
+    request_digest = frame.get("request_digest")
+    if not isinstance(request_digest, str) or len(request_digest) != 64:
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace request digest is invalid")
+    return payload
+
+
+def _workspace_tree_entries(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list) or len(value) > _MAX_STAGE_TREE_ENTRIES:
+        raise _RpcRejectedError("INVALID_REQUEST", "workspace tree entries are invalid")
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict) or set(raw) != {"path", "size", "sha256", "mode"}:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace tree entry is invalid")
+        relative = _workspace_relative_path(raw.get("path"))
+        size = raw.get("size")
+        digest = raw.get("sha256")
+        mode = raw.get("mode")
+        if (
+            relative in seen
+            or type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or mode not in _ENTRY_MODE_BITS
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace tree entry descriptor is invalid")
+        seen.add(relative)
+        entries.append({"path": relative, "size": size, "sha256": digest, "mode": mode})
+    return entries
+
+
+def _workspace_tree_digest(entries: list[dict[str, object]]) -> str:
+    canonical = [
+        {
+            "path": entry["path"],
+            "blobDigest": entry["sha256"],
+            "size": entry["size"],
+            "mode": entry["mode"],
+        }
+        for entry in sorted(entries, key=lambda entry: str(entry["path"]))
+    ]
+    encoded = json.dumps(
+        {"schema": _WORKSPACE_TREE_SCHEMA, "entries": canonical},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 class RuntimeControlSidecar:
@@ -1423,14 +1514,43 @@ class RuntimeControlSidecar:
                     "dispatchToken": dispatch_token,
                 }
             action_result = self._execute_workspace_action(frame)
+            encoded_result = json.dumps(
+                action_result,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            self._operation_side_effects += 1
+            exit_code = 0 if action_result.get("ok") is True else 1
+            inline_result: dict[str, object] | None
+            result_transfer_ref: str | None
+            if len(encoded_result) <= _MAX_INLINE_OPERATION_RESULT:
+                inline_result = action_result
+                result_transfer_ref = None
+                output = encoded_result.decode() + "\n"
+            else:
+                if len(encoded_result) > _MAX_OPERATION_RESULT:
+                    raise _RpcRejectedError(
+                        "PAYLOAD_TOO_LARGE",
+                        "workspace operation result exceeds the capture bound",
+                    )
+                result_transfer_ref = self._publish_operation_result(operation_ref, encoded_result)
+                inline_result = None
+                output = ""
             print(
-                json.dumps(action_result, sort_keys=True, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "ok": action_result.get("ok") is True,
+                        "operationRef": operation_ref,
+                        "action": frame.get("action"),
+                        "resultBytes": len(encoded_result),
+                        "resultTransferRef": result_transfer_ref,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 file=sys.stderr,
                 flush=True,
             )
-            self._operation_side_effects += 1
-            exit_code = 0 if action_result.get("ok") is True else 1
-            output = json.dumps(action_result, sort_keys=True, separators=(",", ":")) + "\n"
             result = {
                 "ok": True,
                 "operationRef": operation_ref,
@@ -1439,16 +1559,255 @@ class RuntimeControlSidecar:
                 "exitCode": exit_code,
                 "stdout": output,
                 "stderr": "",
-                "inlineResult": action_result,
-                "resultTransferRef": None,
+                "inlineResult": inline_result,
+                "resultTransferRef": result_transfer_ref,
             }
             self._operations[operation_ref] = result
             return dict(result)
 
     def _execute_workspace_action(self, frame: Mapping[str, Any]) -> dict[str, object]:
-        """Application actions must be provided by an explicit test/hosted extension."""
-        del frame
+        """Execute task-agnostic workspace tree staging and capture."""
+        action = frame.get("action")
+        if action == "stage_tree":
+            return self._stage_workspace_tree(frame)
+        if action == "capture_tree":
+            return self._capture_workspace_tree(frame)
         raise _RpcRejectedError("INVALID_REQUEST", "workspace action is not registered")
+
+    def _stage_workspace_tree(self, frame: Mapping[str, Any]) -> dict[str, object]:
+        payload = _workspace_action_payload(frame)
+        base = payload.get("base_manifest")
+        if not isinstance(base, dict) or set(base) != {
+            "manifest_ref",
+            "tree_digest",
+            "entries",
+        }:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace base manifest is invalid")
+        entries = _workspace_tree_entries(base.get("entries"))
+        declared_tree_digest = base.get("tree_digest")
+        if declared_tree_digest != _workspace_tree_digest(entries):
+            raise _RpcRejectedError(
+                "DIGEST_MISMATCH", "workspace base tree digest does not match its entries"
+            )
+        bulk_transfer = payload.get("bulk_transfer")
+        if not isinstance(bulk_transfer, bool):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace bulk-transfer marker is invalid")
+        inline_items = payload.get("inline_contents") or []
+        if not isinstance(inline_items, list) or (bulk_transfer and inline_items):
+            raise _RpcRejectedError(
+                "INVALID_REQUEST", "workspace inline staging declaration is invalid"
+            )
+        inline: dict[str, bytes] = {}
+        if not bulk_transfer:
+            for item in inline_items:
+                if not isinstance(item, dict) or set(item) != {"path", "content_b64"}:
+                    raise _RpcRejectedError("INVALID_REQUEST", "workspace inline entry is invalid")
+                relative = _workspace_relative_path(item.get("path"))
+                encoded_content = item.get("content_b64")
+                if not isinstance(encoded_content, str):
+                    raise _RpcRejectedError(
+                        "INVALID_REQUEST", "workspace inline entry is not base64"
+                    )
+                try:
+                    inline[relative] = base64.b64decode(encoded_content, validate=True)
+                except (TypeError, ValueError) as error:
+                    raise _RpcRejectedError(
+                        "INVALID_REQUEST", "workspace inline entry is not base64"
+                    ) from error
+            if set(inline) != {str(item["path"]) for item in entries}:
+                raise _RpcRejectedError(
+                    "INVALID_REQUEST", "workspace inline entries do not close over the manifest"
+                )
+
+        operation_id = frame.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace operation id is absent")
+        bulk_stem = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+        observed: list[dict[str, object]] = []
+        for item in entries:
+            relative = str(item["path"])
+            content = (
+                self._read_workspace_file(f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{relative}")
+                if bulk_transfer
+                else inline[relative]
+            )
+            if (
+                len(content) != item["size"]
+                or hashlib.sha256(content).hexdigest() != item["sha256"]
+            ):
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH",
+                    f"workspace base entry {relative!r} failed integrity",
+                )
+            self._write_workspace_file(
+                f"worktree/{relative}", content, _ENTRY_MODE_BITS[str(item["mode"])]
+            )
+            actual = self._read_workspace_file(f"worktree/{relative}")
+            mode = self._workspace_file_mode(f"worktree/{relative}")
+            observed.append(
+                {
+                    "path": relative,
+                    "size": len(actual),
+                    "sha256": hashlib.sha256(actual).hexdigest(),
+                    "mode": mode,
+                }
+            )
+        staged_tree_digest = _workspace_tree_digest(observed)
+        identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+        return {
+            "ok": True,
+            "resume_handle": f"workspace-stage://stage_{identity}",
+            "staged_tree_digest": staged_tree_digest,
+            "manifest_tree_digest": declared_tree_digest,
+            "entry_count": len(entries),
+            "git_enabled": False,
+            "git_error": None,
+            "restaged": False,
+            "observations": [],
+        }
+
+    def _capture_workspace_tree(self, frame: Mapping[str, Any]) -> dict[str, object]:
+        payload = _workspace_action_payload(frame)
+        max_files = payload.get("max_files", _MAX_CAPTURE_TREE_FILES)
+        max_total_bytes = payload.get("max_total_bytes", _MAX_CAPTURE_TREE_BYTES)
+        if (
+            type(max_files) is not int
+            or not 1 <= max_files <= _MAX_CAPTURE_TREE_FILES
+            or type(max_total_bytes) is not int
+            or not 1 <= max_total_bytes <= _MAX_CAPTURE_TREE_BYTES
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace capture bounds are invalid")
+        worktree = self.workspace / "worktree"
+        entries: list[dict[str, object]] = []
+        total = 0
+        if worktree.is_dir():
+            for root, directories, files in os.walk(worktree, followlinks=False):
+                root_path = Path(root)
+                relative_root = root_path.relative_to(worktree)
+                if relative_root == Path("."):
+                    directories[:] = [
+                        name for name in directories if name not in {".git", ".cosmos"}
+                    ]
+                for name in sorted(files):
+                    path = root_path / name
+                    relative = path.relative_to(worktree).as_posix()
+                    if path.is_symlink():
+                        raise _RpcRejectedError(
+                            "UNSAFE_PATH",
+                            f"workspace capture found an unsupported symlink at {relative!r}",
+                        )
+                    if len(entries) >= max_files:
+                        raise _RpcRejectedError(
+                            "PAYLOAD_TOO_LARGE", "workspace capture exceeds its file bound"
+                        )
+                    content = self._read_workspace_file(f"worktree/{relative}")
+                    total += len(content)
+                    if total > max_total_bytes:
+                        raise _RpcRejectedError(
+                            "PAYLOAD_TOO_LARGE", "workspace capture exceeds its byte bound"
+                        )
+                    entries.append(
+                        {
+                            "path": relative,
+                            "size": len(content),
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "mode": self._workspace_file_mode(f"worktree/{relative}"),
+                            "content_b64": base64.b64encode(content).decode(),
+                        }
+                    )
+        entries.sort(key=lambda item: str(item["path"]))
+        captured_tree_digest = _workspace_tree_digest(
+            [{key: item[key] for key in ("path", "size", "sha256", "mode")} for item in entries]
+        )
+        operation_id = frame.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace operation id is absent")
+        identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+        return {
+            "ok": True,
+            "resume_handle": f"workspace-capture://capture_{identity}",
+            "entries": entries,
+            "entry_count": len(entries),
+            "total_bytes": total,
+            "captured_tree_digest": captured_tree_digest,
+            "git": {
+                "enabled": False,
+                "status_b64": None,
+                "status_truncated": False,
+            },
+            "observations": [],
+        }
+
+    def _read_workspace_file(self, raw_path: str) -> bytes:
+        parent_fd, target_name = self._open_parent(raw_path, create=False)
+        try:
+            descriptor = os.open(
+                target_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise _RpcRejectedError("UNSAFE_PATH", "workspace entry is not a regular file")
+            chunks = bytearray()
+            while chunk := os.read(descriptor, _COPY_CHUNK):
+                chunks.extend(chunk)
+            return bytes(chunks)
+        finally:
+            os.close(descriptor)
+
+    def _write_workspace_file(self, raw_path: str, content: bytes, mode: int) -> None:
+        parent_fd, target_name = self._open_parent(raw_path, create=True)
+        temporary_name = f".{target_name}.{os.getpid()}.{time.time_ns()}.partial"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+                dir_fd=parent_fd,
+            )
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fchmod(descriptor, mode)
+            if os.geteuid() == 0:
+                os.fchown(descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+
+    def _workspace_file_mode(self, raw_path: str) -> str:
+        parent_fd, target_name = self._open_parent(raw_path, create=False)
+        try:
+            mode = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+        finally:
+            os.close(parent_fd)
+        if mode & 0o111:
+            return "executable"
+        if mode & 0o200:
+            return "read_write"
+        return "read_only"
+
+    def _publish_operation_result(self, operation_ref: str, content: bytes) -> str:
+        operation_digest = hashlib.sha256(operation_ref.encode()).hexdigest()
+        path = f".cosmos/kcs-operation-results/{operation_digest}.json"
+        self._write_workspace_file(path, content, 0o660)
+        content_digest = hashlib.sha256(content).hexdigest()
+        return f"rc-result-v1-{operation_digest[:24]}-{len(content)}-{content_digest}"
 
     def _fence_operation(self, request: Mapping[str, Any]) -> dict[str, object]:
         operation_ref, digest = _identity(request, "operationRef", "requestDigest")

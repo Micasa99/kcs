@@ -474,3 +474,127 @@ def test_production_control_owns_transfer_and_pty_transport(tmp_path: Path, monk
     launcher.join(timeout=2)
     assert not launcher.is_alive()
     launcher_socket.unlink(missing_ok=True)
+
+
+def test_production_control_stages_exact_workspace_tree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
+    transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
+    operation_id = "workspace-stage-tree:envelope-1"
+    content = b"print('native')\n"
+    relative = "src/main.py"
+    bulk_stem = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+    bulk_path = f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{relative}"
+    body = tmp_path / "stage-body"
+    body.write_bytes(content)
+    stage = {
+        "action": "stage",
+        "transferRef": "bulk-1",
+        "requestDigest": "a" * 64,
+        "direction": "stage_input",
+        "path": bulk_path,
+        "declaredSizeBytes": len(content),
+        "authorizedMaxSizeBytes": len(content),
+        "contentSha256": hashlib.sha256(content).hexdigest(),
+        "overwritePolicy": "forbid",
+    }
+    assert transport.rpc({}, stage, body).header["state"] == "completed"
+    entries = [
+        {
+            "path": relative,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mode": "executable",
+        }
+    ]
+    tree_digest = canonical_digest(
+        {
+            "schema": "cosmos.workspace-tree/1",
+            "entries": [
+                {
+                    "path": relative,
+                    "blobDigest": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                    "mode": "executable",
+                }
+            ],
+        }
+    )
+    payload = {
+        "base_manifest": {
+            "manifest_ref": {"kind": "workspace_base_manifest", "id": "base-1"},
+            "tree_digest": tree_digest,
+            "entries": entries,
+        },
+        "compute_lease_ref": {"kind": "compute_lease", "id": "lease-1"},
+        "bulk_transfer": True,
+    }
+    frame = {
+        "protocol": "cosmos.workspace/1",
+        "action": "stage_tree",
+        "operation_id": operation_id,
+        "request_digest": "b" * 64,
+        "frame_digest": canonical_digest(payload),
+        "payload": payload,
+    }
+    request = {
+        "action": "invoke",
+        "operationRef": "operation-stage-1",
+        "requestDigest": "c" * 64,
+        "dispatchToken": "d" * 32,
+        "frame": frame,
+    }
+    reply = transport.rpc({}, request).header
+    assert reply["state"] == "succeeded"
+    assert reply["inlineResult"]["staged_tree_digest"] == tree_digest
+    assert reply["inlineResult"]["entry_count"] == 1
+    target = workspace / "worktree/src/main.py"
+    assert target.read_bytes() == content
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+def test_production_control_spools_large_tree_capture(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktree"
+    worktree.mkdir(parents=True)
+    content = b"x" * (70 * 1024)
+    (worktree / "large.bin").write_bytes(content)
+    control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
+    transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
+    payload = {
+        "compute_lease_ref": {"kind": "compute_lease", "id": "lease-1"},
+        "max_files": 4096,
+        "max_total_bytes": 128 * 1024 * 1024,
+    }
+    frame = {
+        "protocol": "cosmos.workspace/1",
+        "action": "capture_tree",
+        "operation_id": "workspace-capture-tree:envelope-1",
+        "request_digest": "e" * 64,
+        "frame_digest": canonical_digest(payload),
+        "payload": payload,
+    }
+    operation_ref = "operation-capture-1"
+    reply = transport.rpc(
+        {},
+        {
+            "action": "invoke",
+            "operationRef": operation_ref,
+            "requestDigest": "f" * 64,
+            "dispatchToken": "0" * 32,
+            "frame": frame,
+        },
+    ).header
+    assert reply["state"] == "succeeded"
+    assert reply["inlineResult"] is None
+    transfer_ref = reply["resultTransferRef"]
+    assert transfer_ref.startswith("rc-result-v1-")
+    result_path = (
+        workspace
+        / ".cosmos/kcs-operation-results"
+        / f"{hashlib.sha256(operation_ref.encode()).hexdigest()}.json"
+    )
+    captured = json.loads(result_path.read_bytes())
+    assert captured["entry_count"] == 1
+    assert captured["captured_tree_digest"]
+    assert captured["entries"][0]["content_b64"]
