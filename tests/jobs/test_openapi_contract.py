@@ -29,6 +29,7 @@ EXPECTED_PATHS = {
     "/api/v2/jobs/{jobRef}/runner/start",
     "/api/v2/jobs/{jobRef}/runner/stop",
     "/api/v2/runtime-recipes/resolve",
+    "/api/v2/runtime-assemblies/resolve",
     "/api/v2/jobs/{jobRef}/transfers",
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}",
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content",
@@ -39,6 +40,14 @@ EXPECTED_PATHS = {
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input",
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output",
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize",
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots",
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}",
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/content",
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/diff",
+    "/api/v2/jobs/{jobRef}/dev-sessions",
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}",
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/renew",
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay",
     "/api/v2/jobs/{jobRef}/operations/{operationRef}",
     "/api/v2/jobs/{jobRef}/finalize",
     "/api/v2/jobs/{jobRef}/cancel",
@@ -62,6 +71,7 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs/{jobRef}/runner/start": {"post"},
     "/api/v2/jobs/{jobRef}/runner/stop": {"post"},
     "/api/v2/runtime-recipes/resolve": {"get"},
+    "/api/v2/runtime-assemblies/resolve": {"post"},
     "/api/v2/jobs/{jobRef}/transfers": {"post"},
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}": {"get", "delete"},
     "/api/v2/jobs/{jobRef}/transfers/{transferRef}/content": {"get", "put"},
@@ -72,6 +82,14 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/input": {"post"},
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/output": {"get"},
     "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}/resize": {"post"},
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots": {"post"},
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}": {"get", "delete"},
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/content": {"get"},
+    "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/diff": {"get"},
+    "/api/v2/jobs/{jobRef}/dev-sessions": {"post"},
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}": {"get", "delete"},
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/renew": {"post"},
+    "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay": {"get"},
     "/api/v2/jobs/{jobRef}/operations/{operationRef}": {"get"},
     "/api/v2/jobs/{jobRef}/finalize": {"post"},
     "/api/v2/jobs/{jobRef}/cancel": {"post"},
@@ -111,7 +129,8 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.4.0"
+    assert openapi["info"]["version"] == "2.5.0"
+    assert openapi["x-kcs-contract-status"] == "dormant"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {
         path: {method for method in item if method in {"get", "post", "put", "delete"}}

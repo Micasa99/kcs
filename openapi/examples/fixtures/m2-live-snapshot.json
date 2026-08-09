@@ -1,0 +1,22 @@
+{
+  "snapshotRef": "snapshot-m2-001",
+  "requestDigest": "59f81955b859209b6518ab8e60809ca30584f00630f40a36c48662861c94d17e",
+  "jobRef": "job-synthetic-001",
+  "jobUid": "11111111-1111-4111-8111-111111111111",
+  "podUid": "22222222-2222-4222-8222-222222222222",
+  "generation": 1,
+  "baseManifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sequence": 7,
+  "snapshotDigest": "134993ae58126de0bcb8775872ff1671c507687bf5dc47b8170bb434960ccc9c",
+  "state": "ready",
+  "entries": [
+    {"path": "TASK.md", "kind": "file", "mode": 420, "sizeBytes": 128, "contentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "symlinkTarget": null},
+    {"path": "results", "kind": "directory", "mode": 509, "sizeBytes": 0, "contentSha256": null, "symlinkTarget": null},
+    {"path": "results/metrics.jsonl", "kind": "file", "mode": 436, "sizeBytes": 72, "contentSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "symlinkTarget": null}
+  ],
+  "truncated": false,
+  "omissions": [],
+  "createdAt": "2026-08-09T12:00:00Z",
+  "expiresAt": "2026-08-09T12:01:00Z",
+  "observedAt": "2026-08-09T12:00:01Z"
+}

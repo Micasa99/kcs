@@ -70,6 +70,17 @@ NO_STORE_OPERATION_IDS = {
     "readTerminalOutput",
     "resizeTerminalSession",
     "closeTerminalSession",
+    "resolveRuntimeAssembly",
+    "createLiveWorkspaceSnapshot",
+    "inspectLiveWorkspaceSnapshot",
+    "releaseLiveWorkspaceSnapshot",
+    "readLiveWorkspaceContent",
+    "getLiveWorkspaceDiff",
+    "createDevSession",
+    "inspectDevSession",
+    "renewDevSession",
+    "revokeDevSession",
+    "relayDevSession",
 }
 MUTATION_OPERATION_IDS = {
     "createJob",
@@ -87,6 +98,9 @@ MUTATION_OPERATION_IDS = {
     "cancelJob",
     "deleteJob",
     "createTerminalSession",
+    "createLiveWorkspaceSnapshot",
+    "createDevSession",
+    "renewDevSession",
 }
 OPERATION_AUTHORIZATION = {
     "getCapacity": "v2-reader",
@@ -125,6 +139,17 @@ OPERATION_AUTHORIZATION = {
     "readTerminalOutput": "v2-reader",
     "resizeTerminalSession": "v2-mutator",
     "closeTerminalSession": "v2-mutator",
+    "resolveRuntimeAssembly": "v2-reader",
+    "createLiveWorkspaceSnapshot": "v2-mutator",
+    "inspectLiveWorkspaceSnapshot": "v2-reader",
+    "releaseLiveWorkspaceSnapshot": "v2-mutator",
+    "readLiveWorkspaceContent": "v2-reader",
+    "getLiveWorkspaceDiff": "v2-reader",
+    "createDevSession": "v2-mutator",
+    "inspectDevSession": "v2-reader",
+    "renewDevSession": "v2-mutator",
+    "revokeDevSession": "v2-mutator",
+    "relayDevSession": "v2-reader",
 }
 EXPECTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
@@ -202,12 +227,53 @@ EXPECTED_OPERATION_LOCATIONS = {
         "delete",
         "/api/v2/jobs/{jobRef}/workspace/terminal-sessions/{terminalRef}",
     ),
+    "resolveRuntimeAssembly": ("post", "/api/v2/runtime-assemblies/resolve"),
+    "createLiveWorkspaceSnapshot": (
+        "post",
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots",
+    ),
+    "inspectLiveWorkspaceSnapshot": (
+        "get",
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}",
+    ),
+    "releaseLiveWorkspaceSnapshot": (
+        "delete",
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}",
+    ),
+    "readLiveWorkspaceContent": (
+        "get",
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/content",
+    ),
+    "getLiveWorkspaceDiff": (
+        "get",
+        "/api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/diff",
+    ),
+    "createDevSession": ("post", "/api/v2/jobs/{jobRef}/dev-sessions"),
+    "inspectDevSession": (
+        "get",
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}",
+    ),
+    "renewDevSession": (
+        "post",
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/renew",
+    ),
+    "revokeDevSession": (
+        "delete",
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}",
+    ),
+    "relayDevSession": (
+        "get",
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay",
+    ),
 }
 EXPECTED_ROOT_FEATURES = {
     "transferModes": ["direct"],
     "rangeRequests": False,
     "signedTransfers": False,
     "nativeRunner": True,
+    "liveWorkspaceSnapshots": True,
+    "devSessionRelay": "openvscode",
+    "exactCapabilityActivation": True,
     "runtimeRecipeDeliveryModes": ["assembled", "prebuilt"],
     "runtimeRecipeDeliveryDefault": "assembled.imageVolume",
 }
@@ -228,9 +294,15 @@ EXPECTED_ROOT_LIMITS = {
     "tombstoneRetentionSeconds": 604800,
     "credentialTtlDefaultSeconds": 300,
     "credentialTtlMaximumSeconds": 900,
+    "liveSnapshotMaximumEntries": 2000,
+    "liveSnapshotMaximumBytes": 16777216,
+    "liveContentRangeMaximumBytes": 1048576,
+    "liveSnapshotTtlMaximumSeconds": 300,
+    "devSessionTtlMaximumSeconds": 900,
+    "devSessionMaximumConnections": 4,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "34aab1f7958f0866ead568c8a36a510b62c0021cbdf3d69ef35fa5080c239e2d"
-CANONICAL_OPENAPI_SHA256 = "3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f"
+CANONICAL_X_KCS_POLICY_SHA256 = "57f103f71fa3ca7fdf6f38f231900b1ab7d2689d42695d635c60ca2187cfb2bb"
+CANONICAL_OPENAPI_SHA256 = "a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -266,6 +338,11 @@ REQUIRED_SCENARIOS = {
     "delete-tombstone",
     "terminal-create",
     "typed-error",
+    "m2-live-snapshot",
+    "m2-live-snapshot-stale",
+    "m2-log-cursor-gap",
+    "m2-dev-session-revoked",
+    "m2-capability-incompatible",
 }
 SECRET_VALUE = re.compile(
     r"(?ix)("
@@ -819,7 +896,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.4.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.5.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -1095,6 +1172,65 @@ def _validate_limit_carriers(document: Mapping[str, Any]) -> None:
             ),
             limits["directTransferBytes"],
         ),
+        (
+            (
+                "components",
+                "schemas",
+                "LiveWorkspaceSnapshotSpec",
+                "properties",
+                "maximumEntries",
+                "maximum",
+            ),
+            limits["liveSnapshotMaximumEntries"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "LiveWorkspaceSnapshotSpec",
+                "properties",
+                "maximumBytes",
+                "maximum",
+            ),
+            limits["liveSnapshotMaximumBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "LiveWorkspaceSnapshotSpec",
+                "properties",
+                "ttlSeconds",
+                "maximum",
+            ),
+            limits["liveSnapshotTtlMaximumSeconds"],
+        ),
+        (
+            ("components", "parameters", "LiveContentLimit", "schema", "maximum"),
+            limits["liveContentRangeMaximumBytes"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "DevSessionCreateSpec",
+                "properties",
+                "ttlSeconds",
+                "maximum",
+            ),
+            limits["devSessionTtlMaximumSeconds"],
+        ),
+        (
+            (
+                "components",
+                "schemas",
+                "DevSessionSnapshot",
+                "properties",
+                "maximumConnections",
+                "const",
+            ),
+            limits["devSessionMaximumConnections"],
+        ),
     )
     for path, expected in carriers:
         if _contract_value(document, path) != expected:
@@ -1199,7 +1335,7 @@ def _validate_contract_extensions(document: dict[str, Any]) -> None:
     if (
         info.get("x-kcs-features") != EXPECTED_ROOT_FEATURES
         or info.get("x-kcs-limits") != EXPECTED_ROOT_LIMITS
-        or document.get("x-kcs-contract-status") != "active"
+        or document.get("x-kcs-contract-status") != "dormant"
         or document.get("x-kcs-legacy-authorization") != expected_legacy_authorization
         or document.get("x-kcs-network-boundary") != expected_network_boundary
     ):
@@ -2079,7 +2215,11 @@ def _validate_digest_semantics(
             raise ValueError(f"{label}: response Content-Length does not match body bytes")
     elif operation_id == "listJobs" and isinstance(response_body, dict):
         _validate_list_response(document, operation, request, response_body, label)
-    elif operation_id == "getRoleLogs" and isinstance(response_body, dict):
+    elif (
+        operation_id == "getRoleLogs"
+        and isinstance(response_body, dict)
+        and _error_code(response_body) is None
+    ):
         _validate_logs_response(document, operation, request, response_body, label)
     elif (
         operation_id == "invokeWorkspace"
@@ -2138,7 +2278,14 @@ def _validate_error_semantics(
     context = error.get("context", {})
     if not isinstance(context, Mapping):
         return
-    for field in ("jobRef", "credentialGrantRef", "transferRef", "operationRef"):
+    for field in (
+        "jobRef",
+        "credentialGrantRef",
+        "transferRef",
+        "operationRef",
+        "snapshotRef",
+        "devSessionRef",
+    ):
         expected = request.get("path", {}).get(field)
         if expected is not None and context.get(field) is not None and context[field] != expected:
             raise ValueError(f"{label}: error context does not match request path {field}")
@@ -2193,6 +2340,11 @@ def _validate_scenario_semantics(
         "delete-tombstone": "200",
         "terminal-create": "201",
         "typed-error": "404",
+        "m2-live-snapshot": "201",
+        "m2-live-snapshot-stale": "410",
+        "m2-log-cursor-gap": "410",
+        "m2-dev-session-revoked": "410",
+        "m2-capability-incompatible": "422",
     }
     if set(expected_status) != REQUIRED_SCENARIOS:
         raise ValueError("generator scenario status table does not cover required scenarios")
@@ -2217,6 +2369,14 @@ def _validate_scenario_semantics(
             raise ValueError(f"{label}: tombstone does not match create identity or digest")
     if scenario == "typed-error" and _error_code(response_body) != "NOT_FOUND":
         raise ValueError(f"{label}: typed 404 example must use NOT_FOUND")
+    expected_m2_error = {
+        "m2-live-snapshot-stale": "STALE_BINDING",
+        "m2-log-cursor-gap": "CURSOR_GAP",
+        "m2-dev-session-revoked": "DEV_SESSION_REVOKED",
+        "m2-capability-incompatible": "CAPABILITY_ACTIVATION_INCOMPATIBLE",
+    }.get(scenario)
+    if expected_m2_error is not None and _error_code(response_body) != expected_m2_error:
+        raise ValueError(f"{label}: M2 scenario must use {expected_m2_error}")
     if scenario == "grant-acknowledged" and response_body.get("state") != "acknowledged":
         raise ValueError(f"{label}: grant must be acknowledged")
     if scenario == "grant-destroyed":
@@ -2900,8 +3060,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.4.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.4.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.5.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.5.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")
