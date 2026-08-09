@@ -37,6 +37,8 @@ from kcs.jobs.transport import (
 _COPY_CHUNK = 1024 * 1024
 _MAX_RPC_HEADER = 4 * 1024 * 1024
 _MAX_NATIVE_FRAME = 131072
+_EXPERIMENT_UID = 10001
+_EXPERIMENT_GID = 10001
 
 
 class _RpcRejectedError(Exception):
@@ -815,6 +817,7 @@ class RuntimeControlSidecar:
                             "UNSAFE_PATH", "workspace target is not a regular file"
                         )
                 os.replace(partial, target_name, dst_dir_fd=parent_fd)
+            self._hand_off_staged_file(parent_fd, target_name)
             os.fsync(parent_fd)
             self._stage_installs += 1
             result = {**intent, "ok": True, "state": "completed"}
@@ -824,6 +827,21 @@ class RuntimeControlSidecar:
         finally:
             partial.unlink(missing_ok=True)
             os.close(parent_fd)
+
+    @staticmethod
+    def _hand_off_staged_file(parent_fd: int, target_name: str) -> None:
+        descriptor = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            if os.geteuid() == 0:
+                os.fchown(descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
+            os.fchmod(descriptor, 0o660)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _reconcile_installing(
         self,
@@ -1298,7 +1316,21 @@ class RuntimeControlSidecar:
                 if not collisions:
                     if not create:
                         raise _RpcRejectedError("NOT_FOUND", "workspace parent does not exist")
-                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    os.mkdir(component, 0o2775, dir_fd=descriptor)
+                    if os.geteuid() == 0:
+                        os.chown(
+                            component,
+                            _EXPERIMENT_UID,
+                            _EXPERIMENT_GID,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                    os.chmod(
+                        component,
+                        0o2775,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
                 next_descriptor = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),

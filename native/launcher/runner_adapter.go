@@ -141,6 +141,19 @@ func (adapter runnerAdapter) withPrompt(argv []string, prompt string) []string {
 	return result
 }
 
+func (adapter runnerAdapter) environment() []string {
+	switch adapter.Configuration {
+	case "codex-responses-v1":
+		return []string{"CODEX_HOME=/run/rc-user/home/.codex"}
+	case "pi-models-v1":
+		return []string{"PI_CODING_AGENT_DIR=/run/rc-user/home/pi-agent"}
+	case "environment-only-v1":
+		return nil
+	default:
+		return nil
+	}
+}
+
 func prepareRunnerConfiguration(argv []string) error {
 	adapter, err := resolveRunnerAdapter(argv)
 	if err != nil {

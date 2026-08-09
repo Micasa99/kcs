@@ -384,9 +384,6 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	if err != nil || requiredMiB < 512 || storagePreflight(requiredMiB) != nil {
 		return nil, errors.New("capacity_insufficient")
 	}
-	if err := normalizeWorktree(); err != nil {
-		return nil, errors.New("worktree_prepare_failed")
-	}
 	token, err := readCredential()
 	if err != nil || len(token) == 0 {
 		return nil, errors.New("credential_unavailable")
@@ -411,7 +408,7 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	cmd.Stdout = recorder.stdout
 	cmd.Stderr = recorder.stderr
 	cmd.Stdin = nil
-	cmd.Env = childEnvironment(string(token))
+	cmd.Env = childEnvironment(adapter, string(token))
 	cmd.SysProcAttr = childProcessAttributes(10001, 10001)
 	started := now()
 	l.generation = frame.Generation
@@ -835,73 +832,21 @@ func preparePaths() error {
 			return err
 		}
 	}
-	return os.MkdirAll(worktree, 02775)
-}
-
-func normalizeWorktree() error {
-	paths := make([]string, 0, 32)
-	err := filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		paths = append(paths, path)
-		if info.Mode()&os.ModeSymlink != 0 {
-			target, resolveErr := filepath.EvalSymlinks(path)
-			if resolveErr != nil {
-				return resolveErr
-			}
-			relative, relErr := filepath.Rel(worktree, target)
-			if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
-				return errors.New("worktree_symlink_escape")
-			}
-		}
-		return nil
-	})
-	if err != nil {
+	if err := os.MkdirAll(worktree, 02775); err != nil {
 		return err
 	}
-	// Change ownership leaf-first.  The launcher deliberately has no
-	// DAC_OVERRIDE capability; handing a 0700 parent to the experiment UID
-	// before its children would lock the launcher out mid-walk.
-	for index := len(paths) - 1; index >= 0; index-- {
-		path := paths[index]
-		info, statErr := os.Lstat(path)
-		if statErr != nil {
-			return statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			if err := os.Lchown(path, 10001, 10001); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := os.Chown(path, 10001, 10001); err != nil {
-			return err
-		}
+	// Only the platform-owned root is normalized here.  Files installed by
+	// staging are handed to the experiment identity at the staging boundary;
+	// arbitrary project files and symlinks are never recursively rewritten.
+	if err := os.Chown(worktree, 10001, 10001); err != nil {
+		return err
 	}
-	return nil
+	return os.Chmod(worktree, 02775)
 }
 
-func normalizeWorktreeModes() error {
-	return filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		mode := info.Mode().Perm()
-		if info.IsDir() {
-			mode = 02775
-		} else {
-			mode = (mode & 0111) | 0660
-		}
-		return os.Chmod(path, mode)
-	})
-}
-
-func childEnvironment(token string) []string {
-	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "CODEX_HOME=/run/rc-user/home/.codex", "PI_CODING_AGENT_DIR=/run/rc-user/home/pi-agent", "RC_NATIVE_RUNNER_REF=" + os.Getenv("RC_NATIVE_RUNNER_REF"), "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+func childEnvironment(adapter runnerAdapter, token string) []string {
+	values := []string{"PATH=/opt/rc-runner/usr/local/bin:/opt/rc-runner/usr/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/run/rc-user/home", "TMPDIR=/run/rc-user/tmp", "LANG=C.UTF-8", "MODEL_ROUTE=" + os.Getenv("MODEL_ROUTE"), "OPENAI_BASE_URL=" + os.Getenv("OPENAI_BASE_URL"), "ANTHROPIC_BASE_URL=" + os.Getenv("ANTHROPIC_BASE_URL"), "RC_NATIVE_RUNNER_REF=" + os.Getenv("RC_NATIVE_RUNNER_REF"), "RC_NATIVE_SELECTED_MODEL_PROTOCOL=" + os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL"), "RC_NATIVE_CHILD_ROLE=agent"}
+	values = append(values, adapter.environment()...)
 	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
 	if strings.HasPrefix(protocol, "anthropic-") {
 		values = append(values, "ANTHROPIC_API_KEY="+token)
@@ -955,9 +900,6 @@ func runUnprivilegedChild(argv []string) error {
 	}
 	syscall.Umask(0002)
 	if os.Getenv("RC_NATIVE_CHILD_ROLE") == "agent" {
-		if err := normalizeWorktreeModes(); err != nil {
-			return err
-		}
 		if err := prepareRunnerConfiguration(argv); err != nil {
 			return err
 		}

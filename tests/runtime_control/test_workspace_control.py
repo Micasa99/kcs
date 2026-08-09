@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import struct
 import threading
@@ -180,6 +181,14 @@ def test_production_control_owns_transfer_and_pty_transport(tmp_path: Path, monk
     }
     assert transport.rpc({}, stage, staged_body).header["state"] == "completed"
     assert (workspace / "worktree/input.txt").read_bytes() == staged_bytes
+    staged_stat = (workspace / "worktree/input.txt").stat()
+    if os.geteuid() == 0:
+        assert (staged_stat.st_uid, staged_stat.st_gid) == (10001, 10001)
+    assert staged_stat.st_mode & 0o777 == 0o660
+    parent_stat = (workspace / "worktree").stat()
+    if os.geteuid() == 0:
+        assert (parent_stat.st_uid, parent_stat.st_gid) == (10001, 10001)
+    assert parent_stat.st_mode & 0o2777 == 0o2775
 
     captured_bytes = b"captured output\n"
     output = workspace / "worktree/output.txt"

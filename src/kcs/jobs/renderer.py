@@ -506,7 +506,7 @@ class V2JobRenderer:
             privileged=False,
             allow_privilege_escalation=False,
             read_only_root_filesystem=True,
-            capabilities=client.V1Capabilities(drop=["ALL"], add=["DAC_OVERRIDE"]),
+            capabilities=client.V1Capabilities(drop=["ALL"], add=["CHOWN", "DAC_OVERRIDE"]),
             seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
 

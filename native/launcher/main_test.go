@@ -55,6 +55,22 @@ func TestRunnerImageCanDeclareAnEnvironmentOnlyAdapter(t *testing.T) {
 	}
 }
 
+func TestRunnerSpecificEnvironmentIsOwnedByAdapter(t *testing.T) {
+	codex := strings.Join(childEnvironment(runnerAdapters["runner-codex"], "token"), "\n")
+	if !strings.Contains(codex, "CODEX_HOME=") || strings.Contains(codex, "PI_CODING_AGENT_DIR=") {
+		t.Fatalf("codex environment leaked another runner's configuration: %s", codex)
+	}
+	pi := strings.Join(childEnvironment(runnerAdapters["runner-pi"], "token"), "\n")
+	if !strings.Contains(pi, "PI_CODING_AGENT_DIR=") || strings.Contains(pi, "CODEX_HOME=") {
+		t.Fatalf("pi environment leaked another runner's configuration: %s", pi)
+	}
+	custom := runnerAdapter{Configuration: "environment-only-v1"}
+	generic := strings.Join(childEnvironment(custom, "token"), "\n")
+	if strings.Contains(generic, "CODEX_HOME=") || strings.Contains(generic, "PI_CODING_AGENT_DIR=") {
+		t.Fatalf("generic adapter inherited a built-in runner's configuration: %s", generic)
+	}
+}
+
 func TestTrajectoryRecorderPreservesRawStreamsAndSessionLines(t *testing.T) {
 	directory := t.TempDir()
 	adapter := runnerAdapters["runner-codex"]
