@@ -188,7 +188,7 @@ def test_active_generated_and_served_contracts_are_byte_identical() -> None:
     generated = ROOT / "openapi/generated/kcs-v2-jobs.openapi.json"
     assert generated.read_bytes() == SERVED_PACKAGE.read_bytes()
     assert hashlib.sha256(SERVED_PACKAGE.read_bytes()).hexdigest() == (
-        "61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc"
+        "3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f"
     )
 
 
@@ -252,7 +252,7 @@ def test_recipe_fixtures_freeze_launcher_and_exact_mount_roles() -> None:
     ):
         recipe = json.loads((NATIVE_FIXTURES / filename).read_text())
         assert recipe["launcherCommand"] == ["/opt/rc-platform/bin/rc-native-launcher"]
-        assert recipe["controlCommand"] == ["/opt/kcs/workspace-sidecar", "rpc"]
+        assert recipe["controlCommand"] == ["/opt/kcs/workspace-sidecar", "serve"]
         assert recipe["launcherSocketPath"] == "/run/rc-control/launcher.sock"
         mounts = {item["role"]: (item["mountPath"], item["readOnly"]) for item in recipe["mounts"]}
         expected = dict(expected_common)

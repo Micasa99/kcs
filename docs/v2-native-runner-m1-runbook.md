@@ -3,7 +3,7 @@
 This runbook operates the M1 native lane without changing the hosted lane. The
 canonical contract is `openapi/kcs-v2-jobs.openapi.yaml`; generated and packaged
 bytes must all have SHA-256
-`61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc`.
+`3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f`.
 Production deployment is a separate owner checkpoint.
 
 ## 1. Build and register immutable images

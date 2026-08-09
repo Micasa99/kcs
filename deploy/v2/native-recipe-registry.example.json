@@ -6,7 +6,7 @@
         "runnerRef": "runner-codex",
         "environmentProfileRef": "env-default",
         "recipeRef": "recipe-codex-env-default-v1",
-        "recipeDigest": "34f8b68e735c1a4e746ca38c9ad1a0e3ade79d3b65a407343c444d7eb2f498ae",
+        "recipeDigest": "c216d9e07861b7f16b2277317983be1615b4ee120abb0ea18eb046619bac509a",
         "delivery": {
           "mode": "assembled",
           "transport": "imageVolume",
@@ -21,7 +21,7 @@
         },
         "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
         "runnerEntrypoint": ["/opt/rc-runner/usr/local/bin/codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],
-        "controlCommand": ["/opt/kcs/workspace-sidecar", "rpc"],
+        "controlCommand": ["/opt/kcs/workspace-sidecar", "serve"],
         "launcherSocketPath": "/run/rc-control/launcher.sock",
         "identity": {
           "runtimeUid": 0,

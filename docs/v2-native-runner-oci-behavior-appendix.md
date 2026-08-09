@@ -2,7 +2,7 @@
 
 Status: **M1 implementation contract**. The implementation branch serves OpenAPI
 2.4.0 at SHA-256
-`61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc` and implements
+`3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f` and implements
 the native provider/renderer/launcher path. It has not been deployed to the formal
 `researchcosmos-v2` namespace; production activation still requires owner approval.
 
@@ -91,7 +91,8 @@ Frozen implementation requirement:
 - the runtime container's only PID 1 command is
   `/opt/rc-platform/bin/rc-native-launcher`; a recipe's `runnerEntrypoint` is child
   argv and is never installed directly as PID 1;
-- control serves workspace RPC as its container PID 1; the recipe-pinned
+- control serves workspace RPC as its recipe-pinned container PID 1 command,
+  `/opt/kcs/workspace-sidecar serve`; the separately fixed
   `/opt/kcs/workspace-sidecar rpc` command is the API-side exec client and talks
   to the launcher only through `/run/rc-control/launcher.sock`; it does not exec the
   root runtime container; its private temporary directory is the same bounded

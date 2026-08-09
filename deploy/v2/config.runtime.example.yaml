@@ -5,7 +5,7 @@ api:
   caFile: /path/to/untracked/kcs-v2-ca.pem
   image: registry.example.invalid/researchcosmos/kcs-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
   expectedVersion: "2.4.0"
-  expectedOpenapiSha256: 61ded062aac97258947a7b18f1a31fa4a139eea756d4b7bb49d996cbd20011bc
+  expectedOpenapiSha256: 3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f
 
 workloads:
   agentImage: registry.example.invalid/researchcosmos/kcs-conformance-agent@sha256:2222222222222222222222222222222222222222222222222222222222222222

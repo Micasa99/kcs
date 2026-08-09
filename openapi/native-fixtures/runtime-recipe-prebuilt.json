@@ -15,7 +15,7 @@
   },
   "launcherCommand": ["/opt/rc-platform/bin/rc-native-launcher"],
   "runnerEntrypoint": ["/opt/rc/bin/codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],
-  "controlCommand": ["/opt/kcs/workspace-sidecar", "rpc"],
+  "controlCommand": ["/opt/kcs/workspace-sidecar", "serve"],
   "launcherSocketPath": "/run/rc-control/launcher.sock",
   "identity": {
     "runtimeUid": 0,

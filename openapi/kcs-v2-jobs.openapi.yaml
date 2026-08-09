@@ -2585,7 +2585,8 @@ components:
           description: Child argv executed only by rc-native-launcher after the identity transition.
         controlCommand:
           type: array
-          const: [/opt/kcs/workspace-sidecar, rpc]
+          const: [/opt/kcs/workspace-sidecar, serve]
+          description: The control container's long-lived PID 1 command; API-side exec uses the fixed rpc subcommand.
         launcherSocketPath: {type: string, const: /run/rc-control/launcher.sock}
         identity: {$ref: '#/components/schemas/RuntimeIdentity'}
         mounts:
