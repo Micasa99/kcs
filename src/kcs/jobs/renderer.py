@@ -408,8 +408,6 @@ class V2JobRenderer:
             enable_service_links=False,
             security_context=client.V1PodSecurityContext(
                 seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
-                fs_group=10001,
-                fs_group_change_policy="OnRootMismatch",
             ),
         )
         return client.V1Job(

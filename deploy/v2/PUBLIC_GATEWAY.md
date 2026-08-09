@@ -50,3 +50,28 @@ the KCS control host and terminate TLS with Nginx (or an equivalent reverse
 proxy), forwarding only `/api/v2/*` to the private KCS API with backend CA
 verification enabled. The current hosted deployment uses port 8888 for this
 reason. Do not bind the private API itself to the public interface.
+
+The edge must preserve the frozen direct-transfer limit. Nginx defaults to a
+1 MiB request body, which rejects ordinary datasets before they reach KCS and
+turns an otherwise replayable transfer into an undeclared edge response. The
+KCS location therefore needs both the contract limit and streaming request
+bodies:
+
+```nginx
+location /api/v2/ {
+    client_max_body_size 100g;
+    client_body_timeout 3600s;
+    proxy_request_buffering off;
+
+    proxy_pass https://<private-kcs-api>;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+```
+
+`100g` matches the API's 100 GiB declared transfer ceiling; each transfer is
+still constrained by its smaller `authorizedMaxSizeBytes` and SHA-256 at KCS.
+Do not replace this with a smaller undocumented proxy limit or enable request
+buffering onto the control node's system disk.

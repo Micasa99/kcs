@@ -127,6 +127,12 @@ def test_native_renderer_builds_only_runner_control_and_no_replacement(tmp_path:
     assert pod.share_process_namespace is False
     assert pod.automount_service_account_token is False
     assert pod.init_containers is None
+    # A Pod-level fsGroup rewrites Secret projection ownership and violates
+    # the frozen root:root/0400 model-gateway credential boundary. The root
+    # launcher and control staging code explicitly prepare the writable
+    # experiment directories instead.
+    assert pod.security_context.fs_group is None
+    assert pod.security_context.fs_group_change_policy is None
     assert runner.command == ["/opt/rc-platform/bin/rc-native-launcher"]
     assert runner.security_context.run_as_user == 0
     assert set(runner.security_context.capabilities.add) == {
