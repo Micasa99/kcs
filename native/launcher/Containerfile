@@ -7,7 +7,7 @@ ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY native/launcher/go.mod native/launcher/go.sum ./
 RUN go mod download
-COPY native/launcher/main.go native/launcher/security_linux.go native/launcher/security_other.go ./
+COPY native/launcher/*.go ./
 RUN test -n "$SOURCE_REVISION" \
     && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/rc-native-launcher .
 
