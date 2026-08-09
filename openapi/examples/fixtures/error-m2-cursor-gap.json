@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": "CURSOR_GAP",
+    "message": "The requested log cursor is older than retained output.",
+    "retryable": false,
+    "recoveryAction": "reattach",
+    "requestId": "request-m2-cursor-gap-001",
+    "context": {
+      "jobRef": "job-synthetic-001",
+      "cursorGap": {"requestedCursor": "Y3Vyc29yLW9sZA", "earliestRetainedCursor": "Y3Vyc29yLWVhcmxpZXN0"}
+    }
+  }
+}

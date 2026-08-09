@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "CAPABILITY_ACTIVATION_INCOMPATIBLE",
+    "message": "The exact Tool bundle does not provide a binary compatible with this runtime recipe.",
+    "retryable": false,
+    "recoveryAction": "none",
+    "requestId": "request-m2-capability-incompatible-001",
+    "details": [{"field": "toolPins[0]", "reason": "linux/amd64 runtime requirement is not provided"}]
+  }
+}

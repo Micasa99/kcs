@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "STALE_BINDING",
+    "message": "The snapshot belongs to a previous Pod incarnation.",
+    "retryable": false,
+    "recoveryAction": "inspect_job",
+    "requestId": "request-m2-stale-001",
+    "context": {"jobRef": "job-synthetic-001", "snapshotRef": "snapshot-m2-stale-001"}
+  }
+}

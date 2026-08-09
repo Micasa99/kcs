@@ -1,0 +1,13 @@
+{
+  "runnerRef": "runner.codex@0.146.0",
+  "environmentProfileRef": "environment.cuda-12.8@1.0.0",
+  "recipeDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "capabilityLockDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "selectedModelProtocol": "openai-responses",
+  "skillPins": [
+    {"capabilityRef": "skill.reproducible-probe@1.0.0", "materialDigest": "449e8e4ff4e46e4ee243771dcf62ecf0f33edc67722a13c7b0c808eced4a37b4"}
+  ],
+  "toolPins": [
+    {"capabilityRef": "tool.probe@1.0.0", "materialDigest": "ef751deee661e26cf3e0945f8ee4c9baae475e2c15e01f45655028521308267b"}
+  ]
+}

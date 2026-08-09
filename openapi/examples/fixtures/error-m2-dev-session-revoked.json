@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "DEV_SESSION_REVOKED",
+    "message": "The dev session was revoked.",
+    "retryable": false,
+    "recoveryAction": "none",
+    "requestId": "request-m2-dev-revoked-001",
+    "context": {"jobRef": "job-synthetic-001", "devSessionRef": "dev-session-m2-revoked-001"}
+  }
+}

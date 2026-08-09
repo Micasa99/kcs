@@ -1,8 +1,8 @@
 openapi: 3.1.0
-x-kcs-contract-status: active
+x-kcs-contract-status: dormant
 info:
   title: KCS V2 Attempt API
-  version: 2.4.0
+  version: 2.5.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -11,6 +11,9 @@ info:
     rangeRequests: false
     signedTransfers: false
     nativeRunner: true
+    liveWorkspaceSnapshots: true
+    devSessionRelay: openvscode
+    exactCapabilityActivation: true
     runtimeRecipeDeliveryModes: [assembled, prebuilt]
     runtimeRecipeDeliveryDefault: assembled.imageVolume
   x-kcs-limits:
@@ -30,6 +33,12 @@ info:
     tombstoneRetentionSeconds: 604800
     credentialTtlDefaultSeconds: 300
     credentialTtlMaximumSeconds: 900
+    liveSnapshotMaximumEntries: 2000
+    liveSnapshotMaximumBytes: 16777216
+    liveContentRangeMaximumBytes: 1048576
+    liveSnapshotTtlMaximumSeconds: 300
+    devSessionTtlMaximumSeconds: 900
+    devSessionMaximumConnections: 4
 x-kcs-legacy-authorization:
   v2NamespaceAccess: denied
   podsExec: denied
@@ -47,9 +56,12 @@ tags:
   - {name: Credentials}
   - {name: Native runner}
   - {name: Runtime recipes}
+  - {name: Runtime assemblies}
   - {name: Transfers}
   - {name: Workspace}
   - {name: Workspace terminal}
+  - {name: Live workspace}
+  - {name: Dev sessions}
   - {name: Cluster observations}
   - {name: Contract}
 paths:
@@ -67,6 +79,8 @@ paths:
         PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
         UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
         DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        CAPABILITY_ACTIVATION_INCOMPATIBLE: {status: 422, recoveryAction: resolve_runtime_assembly}
+        CAPABILITY_BUNDLE_MISMATCH: {status: 422, recoveryAction: resolve_runtime_assembly}
         CAPACITY_LIMIT: {status: 429, recoveryAction: retry_same}
         RATE_LIMIT: {status: 429, recoveryAction: retry_same}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
@@ -268,6 +282,7 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         NOT_FOUND: {status: 404, recoveryAction: none}
         STALE_CURSOR: {status: 409, recoveryAction: inspect_job}
+        CURSOR_GAP: {status: 410, recoveryAction: reattach}
         TOMBSTONED: {status: 410, recoveryAction: inspect_job}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
@@ -286,7 +301,7 @@ paths:
         '404': *Error404
         '409': *Error409
         '410':
-          description: Requested log identity is gone.
+          description: Requested log identity is gone or its retained byte window has a typed cursor gap.
           content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}
         '500': *Error500
         '503': *Error503
@@ -806,6 +821,37 @@ paths:
         '422': *Error422
         '500': *Error500
         '503': *Error503
+  /api/v2/runtime-assemblies/resolve:
+    post:
+      tags: [Runtime assemblies]
+      operationId: resolveRuntimeAssembly
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        CAPABILITY_ACTIVATION_INCOMPATIBLE: {status: 422, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RuntimeAssemblyResolutionRequest'}
+      responses:
+        '200':
+          description: Exact deployable recipe plus immutable Skill and Tool activation plan.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ResolvedRuntimeAssembly'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/transfers:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -1174,6 +1220,191 @@ paths:
         '500': *Error500
         '503': *Error503
         '504': *Error504
+  /api/v2/jobs/{jobRef}/workspace/live-snapshots:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Live workspace]
+      operationId: createLiveWorkspaceSnapshot
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: [{in: body, name: snapshotRef}]
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_live_snapshot
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_live_snapshot}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_job}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LiveWorkspaceSnapshotRequest'}
+      responses:
+        '201': &LiveSnapshotSuccess
+          description: A new immutable, bounded view of one live worktree incarnation.
+          x-kcs-required-headers: [Cache-Control, ETag]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            ETag: {$ref: '#/components/headers/SnapshotEtag'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/LiveWorkspaceSnapshot'}}}
+        '200': *LiveSnapshotSuccess
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
+  /api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/SnapshotRef'}
+    get:
+      tags: [Live workspace]
+      operationId: inspectLiveWorkspaceSnapshot
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: &LiveSnapshotReadErrors
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_live_snapshot}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        LIVE_SNAPSHOT_EXPIRED: {status: 410, recoveryAction: reattach}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses: &LiveSnapshotResponses
+        '200': *LiveSnapshotSuccess
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+    delete:
+      tags: [Live workspace]
+      operationId: releaseLiveWorkspaceSnapshot
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: *LiveSnapshotReadErrors
+      responses: *LiveSnapshotResponses
+  /api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/content:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/SnapshotRef'}
+    get:
+      tags: [Live workspace]
+      operationId: readLiveWorkspaceContent
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-snapshot-bytes: immutable-no-follow
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_live_snapshot}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        LIVE_SNAPSHOT_EXPIRED: {status: 410, recoveryAction: reattach}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSAFE_PATH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      parameters:
+        - {$ref: '#/components/parameters/LiveWorkspacePath'}
+        - {$ref: '#/components/parameters/LiveContentOffset'}
+        - {$ref: '#/components/parameters/LiveContentLimit'}
+      responses:
+        '200':
+          description: One bounded byte range from the immutable snapshot; symlinks are never followed.
+          x-kcs-required-headers: [Cache-Control, ETag, Content-Range, KCS-Content-SHA256, KCS-Snapshot-Sequence]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            ETag: {$ref: '#/components/headers/SnapshotEtag'}
+            Content-Range: {$ref: '#/components/headers/ContentRange'}
+            KCS-Content-SHA256: {$ref: '#/components/headers/ContentSha256'}
+            KCS-Snapshot-Sequence: {$ref: '#/components/headers/SnapshotSequence'}
+          content:
+            application/octet-stream:
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 1048576}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '413': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/workspace/live-snapshots/{snapshotRef}/diff:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/SnapshotRef'}
+    get:
+      tags: [Live workspace]
+      operationId: getLiveWorkspaceDiff
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes:
+        INVALID_PAGE_TOKEN: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_live_snapshot}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        LIVE_SNAPSHOT_EXPIRED: {status: 410, recoveryAction: reattach}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      parameters:
+        - {$ref: '#/components/parameters/PageToken'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200':
+          description: Bounded diff from the exact base manifest to this immutable snapshot.
+          x-kcs-required-headers: [Cache-Control, ETag]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            ETag: {$ref: '#/components/headers/SnapshotEtag'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/LiveWorkspaceDiffPage'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/workspace/terminal-sessions:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -1341,7 +1572,18 @@ paths:
       x-kcs-service-authorization: v2-reader
       x-kcs-cache-control: no-store
       x-kcs-redact-headers: [Authorization, KCS-Terminal-Credential]
-      x-kcs-error-codes: *TerminalErrors
+      x-kcs-error-codes:
+        INVALID_CURSOR: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        TERMINAL_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_terminal}
+        STALE_BINDING: {status: 409, recoveryAction: inspect_job}
+        CURSOR_GAP: {status: 410, recoveryAction: reattach}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       parameters:
         - {name: cursor, in: query, required: false, schema: {type: integer, minimum: 0, default: 0}}
         - {name: limitBytes, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 65536, default: 65536}}
@@ -1354,6 +1596,7 @@ paths:
             KCS-Terminal-Next-Cursor: {schema: {type: integer, minimum: 0}}
             KCS-Terminal-Open: {schema: {type: boolean}}
           content: {application/octet-stream: {schema: {type: string, contentMediaType: application/octet-stream, maxLength: 65536}}}
+        '400': *NoStoreError
         '401': *NoStoreError
         '403': *NoStoreError
         '404': *NoStoreError
@@ -1401,6 +1644,205 @@ paths:
         '409': *NoStoreError
         '410': *NoStoreError
         '415': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/dev-sessions:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+    post:
+      tags: [Dev sessions]
+      operationId: createDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: [{in: body, name: devSessionRef}]
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_dev_session
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_dev_session}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_dev_session}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_TIMEOUT: {status: 504, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/DevSessionCreateRequest'}}}
+      responses:
+        '201': &DevSessionCreated
+          description: New binding-scoped OpenVSCode relay; the KCS credential is returned only to the RC backend in a header.
+          x-kcs-required-headers: [Cache-Control, KCS-Dev-Session-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Dev-Session-Credential: {$ref: '#/components/headers/DevSessionCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/DevSessionSnapshot'}}}
+        '200': *DevSessionCreated
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+        '504': *NoStoreError
+  /api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+    get:
+      tags: [Dev sessions]
+      operationId: inspectDevSession
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: &DevSessionErrors
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        DEV_SESSION_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_dev_session}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        DEV_SESSION_EXPIRED: {status: 410, recoveryAction: reattach}
+        DEV_SESSION_REVOKED: {status: 410, recoveryAction: none}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEV_SESSION_RELAY_DOWN: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      responses: &DevSessionSnapshotResponses
+        '200':
+          description: Non-secret dev-session state bound to one exact Pod incarnation.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/DevSessionSnapshot'}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+    delete:
+      tags: [Dev sessions]
+      operationId: revokeDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: *DevSessionErrors
+      responses: *DevSessionSnapshotResponses
+  /api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/renew:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+    post:
+      tags: [Dev sessions]
+      operationId: renewDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: devSessionRef}
+          - {in: body, name: renewRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 200
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: inspect_dev_session
+      x-kcs-error-codes:
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        DEV_SESSION_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: inspect_dev_session}
+        STATE_CONFLICT: {status: 409, recoveryAction: inspect_dev_session}
+        STALE_BINDING: {status: 410, recoveryAction: inspect_job}
+        DEV_SESSION_EXPIRED: {status: 410, recoveryAction: reattach}
+        DEV_SESSION_REVOKED: {status: 410, recoveryAction: none}
+        TOMBSTONED: {status: 410, recoveryAction: inspect_job}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEV_SESSION_RELAY_DOWN: {status: 503, recoveryAction: retry_same}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/DevSessionRenewRequest'}}}
+      responses:
+        '200':
+          description: Session lease renewed and KCS credential rotated.
+          x-kcs-required-headers: [Cache-Control, KCS-Dev-Session-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Dev-Session-Credential: {$ref: '#/components/headers/DevSessionCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/DevSessionSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay:
+    parameters:
+      - {$ref: '#/components/parameters/JobRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+      - {$ref: '#/components/parameters/DevSessionRelayPath'}
+    get:
+      tags: [Dev sessions]
+      operationId: relayDevSession
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-websocket-relay:
+        upstream: http://127.0.0.1:3000
+        binding: [namespace, jobRef, jobUid, podUid, generation, devSessionRef]
+        credentialForwarding: forbidden
+      x-kcs-error-codes: *DevSessionErrors
+      responses:
+        '101':
+          description: Authenticated WebSocket upgrade to the loopback OpenVSCode process.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+        '200':
+          description: Authenticated bounded HTTP response from the loopback OpenVSCode process.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/octet-stream: {schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}}}
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
         '500': *NoStoreError
         '503': *NoStoreError
   /api/v2/jobs/{jobRef}/operations/{operationRef}:
@@ -1670,7 +2112,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.4.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.5.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -1692,6 +2134,8 @@ components:
     CredentialGrantRef: {name: credentialGrantRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     TransferRef: {name: transferRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     OperationRef: {name: operationRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    SnapshotRef: {name: snapshotRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    DevSessionRef: {name: devSessionRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     Container: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace]}}
     AnyContainer: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace, runner, control]}}
     Cursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
@@ -1739,9 +2183,23 @@ components:
     TerminalRef: {name: terminalRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     TerminalSubject: {name: KCS-Subject-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     TerminalCredential: {name: KCS-Terminal-Credential, in: header, required: true, schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
+    LiveWorkspacePath: {name: path, in: query, required: true, schema: {$ref: '#/components/schemas/SafeRelativePath'}}
+    LiveContentOffset: {name: offset, in: query, required: false, schema: {type: integer, minimum: 0, default: 0}}
+    LiveContentLimit: {name: limitBytes, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1048576, default: 1048576}}
+    DevSessionCredential: {name: KCS-Dev-Session-Credential, in: header, required: true, schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
+    DevSessionRelayPath:
+      name: path
+      in: query
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 4096, pattern: '^/[A-Za-z0-9._~!$&''()*+,;=:@%/?-]*$'}
   headers:
     NoStore: {schema: {type: string, const: no-store}}
     TerminalCredential: {schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
+    SnapshotEtag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
+    ContentRange: {schema: {type: string, pattern: '^bytes ([0-9]+-[0-9]+/[0-9]+|\\*/0)$'}}
+    ContentSha256: {schema: {$ref: '#/components/schemas/Sha256'}}
+    SnapshotSequence: {schema: {type: integer, minimum: 1}}
+    DevSessionCredential: {schema: {type: string, minLength: 32, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$'}}
   responses:
     BadRequest: *Error400
     Unauthorized: *Error401
@@ -1781,6 +2239,10 @@ components:
       format: kcs-base64url
       x-kcs-maxUtf8Bytes: 4096
       description: Opaque base64url token bound to namespace and the complete filter set.
+    CursorPosition:
+      oneOf:
+        - {$ref: '#/components/schemas/OpaqueCursor'}
+        - {type: integer, minimum: 0}
     Sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     KubernetesUid: {type: string, format: uuid}
     Timestamp: {type: string, format: date-time}
@@ -2142,6 +2604,7 @@ components:
         modelEnv: {$ref: '#/components/schemas/NativeModelEnv'}
         resources: {$ref: '#/components/schemas/NativeRuntimeResources'}
         assemblyDigest: {$ref: '#/components/schemas/Sha256'}
+        capabilityActivation: {$ref: '#/components/schemas/CapabilityActivationSelection'}
     NativeJobSpec:
       type: object
       additionalProperties: false
@@ -2396,6 +2859,8 @@ components:
           items: {$ref: '#/components/schemas/OpaqueRef'}
         selectedModelProtocol: {$ref: '#/components/schemas/SelectedModelProtocol'}
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        capabilityActivationPlanRef: {$ref: '#/components/schemas/OpaqueRef'}
+        capabilityActivationPlanDigest: {$ref: '#/components/schemas/Sha256'}
     RunnerStartRequest:
       type: object
       additionalProperties: false
@@ -2611,6 +3076,105 @@ components:
           uniqueItems: true
           items: {$ref: '#/components/schemas/SelectedModelProtocol'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+    CapabilityPin:
+      type: object
+      additionalProperties: false
+      required: [capabilityRef, materialDigest]
+      properties:
+        capabilityRef: {$ref: '#/components/schemas/OpaqueRef'}
+        materialDigest: {$ref: '#/components/schemas/Sha256'}
+    RuntimeAssemblyResolutionRequest:
+      type: object
+      additionalProperties: false
+      required: [runnerRef, environmentProfileRef, recipeDigest, capabilityLockDigest, selectedModelProtocol, skillPins, toolPins]
+      properties:
+        runnerRef: {$ref: '#/components/schemas/OpaqueRef'}
+        environmentProfileRef: {$ref: '#/components/schemas/OpaqueRef'}
+        recipeDigest: {$ref: '#/components/schemas/Sha256'}
+        capabilityLockDigest: {$ref: '#/components/schemas/Sha256'}
+        selectedModelProtocol: {$ref: '#/components/schemas/SelectedModelProtocol'}
+        skillPins: {type: array, maxItems: 64, uniqueItems: true, items: {$ref: '#/components/schemas/CapabilityPin'}}
+        toolPins: {type: array, maxItems: 64, uniqueItems: true, items: {$ref: '#/components/schemas/CapabilityPin'}}
+    CapabilityBundleMount:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if: {required: [kind], properties: {kind: {const: skill}}}
+          then:
+            properties:
+              targetPath: {type: string, pattern: '^/opt/rc-skills/[A-Za-z0-9._-]+$'}
+              runnerDiscoveryPath: {type: string, pattern: '^/opt/rc-skills/[A-Za-z0-9._-]+$'}
+        - if: {required: [kind], properties: {kind: {const: tool}}}
+          then:
+            properties:
+              targetPath: {type: string, pattern: '^/opt/rc-tools/[A-Za-z0-9._-]+$'}
+              runnerDiscoveryPath: {type: string, pattern: '^/opt/rc-tools/[A-Za-z0-9._/-]+$'}
+      required: [kind, capabilityRef, materialDigest, imageVolumeDigest, sourcePath, targetPath, runnerDiscoveryPath, readOnly]
+      properties:
+        kind: {type: string, enum: [skill, tool]}
+        capabilityRef: {$ref: '#/components/schemas/OpaqueRef'}
+        materialDigest: {$ref: '#/components/schemas/Sha256'}
+        imageVolumeDigest: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        sourcePath: {type: string, minLength: 1, maxLength: 4096, pattern: '^/'}
+        targetPath: {type: string, minLength: 1, maxLength: 4096, pattern: '^/opt/rc-(skills|tools)/'}
+        runnerDiscoveryPath: {type: string, minLength: 1, maxLength: 4096, pattern: '^/opt/rc-(skills|tools)/'}
+        readOnly: {type: boolean, const: true}
+    CapabilityActivationPlan:
+      type: object
+      additionalProperties: false
+      required: [planRef, planDigest, capabilityLockDigest, skillPins, toolPins, mounts]
+      properties:
+        planRef: {$ref: '#/components/schemas/OpaqueRef'}
+        planDigest: {$ref: '#/components/schemas/Sha256'}
+        capabilityLockDigest: {$ref: '#/components/schemas/Sha256'}
+        skillPins: {type: array, maxItems: 64, uniqueItems: true, items: {$ref: '#/components/schemas/CapabilityPin'}}
+        toolPins: {type: array, maxItems: 64, uniqueItems: true, items: {$ref: '#/components/schemas/CapabilityPin'}}
+        mounts: {type: array, maxItems: 128, uniqueItems: true, x-kcs-uniqueBy: targetPath, items: {$ref: '#/components/schemas/CapabilityBundleMount'}}
+    CapabilityActivationSelection:
+      type: object
+      additionalProperties: false
+      required: [planRef, planDigest]
+      properties:
+        planRef: {$ref: '#/components/schemas/OpaqueRef'}
+        planDigest: {$ref: '#/components/schemas/Sha256'}
+    ResolvedRuntimeAssembly:
+      type: object
+      additionalProperties: false
+      required: [assemblyRef, assemblyDigest, recipe, selectedModelProtocol, capabilityActivation, observedAt]
+      properties:
+        assemblyRef: {$ref: '#/components/schemas/OpaqueRef'}
+        assemblyDigest: {$ref: '#/components/schemas/Sha256'}
+        recipe: {$ref: '#/components/schemas/ResolvedRuntimeRecipe'}
+        selectedModelProtocol: {$ref: '#/components/schemas/SelectedModelProtocol'}
+        capabilityActivation: {$ref: '#/components/schemas/CapabilityActivationPlan'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    CapabilityMountReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, capabilityRef, materialDigest, imageVolumeRef, imageVolumeId, targetPath, readOnly, verified]
+      properties:
+        kind: {type: string, enum: [skill, tool]}
+        capabilityRef: {$ref: '#/components/schemas/OpaqueRef'}
+        materialDigest: {$ref: '#/components/schemas/Sha256'}
+        imageVolumeRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        imageVolumeId: {$ref: '#/components/schemas/NullableString'}
+        targetPath: {type: string, pattern: '^/opt/rc-(skills|tools)/'}
+        readOnly: {type: boolean, const: true}
+        verified: {type: boolean}
+    CapabilityActivationReceipt:
+      type: object
+      additionalProperties: false
+      required: [planRef, planDigest, jobUid, podUid, generation, state, mounts, failureReason, observedAt]
+      properties:
+        planRef: {$ref: '#/components/schemas/OpaqueRef'}
+        planDigest: {$ref: '#/components/schemas/Sha256'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        state: {type: string, enum: [ready, failed, indeterminate]}
+        mounts: {type: array, maxItems: 128, uniqueItems: true, x-kcs-uniqueBy: targetPath, items: {$ref: '#/components/schemas/CapabilityMountReceipt'}}
+        failureReason: {$ref: '#/components/schemas/NullableString'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     ActionSnapshot:
       type: object
       additionalProperties: false
@@ -2737,6 +3301,174 @@ components:
       oneOf:
         - {$ref: '#/components/schemas/TerminalSessionSnapshot'}
         - {$ref: '#/components/schemas/NativeTerminalSessionSnapshot'}
+    LiveWorkspaceSnapshotState: {type: string, enum: [ready, released, expired, lost]}
+    LiveWorkspaceSnapshotSpec:
+      type: object
+      additionalProperties: false
+      required: [jobUid, podUid, generation, baseManifestDigest, ttlSeconds, maximumEntries, maximumBytes]
+      properties:
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        baseManifestDigest: {$ref: '#/components/schemas/Sha256'}
+        ttlSeconds: {type: integer, minimum: 1, maximum: 300, default: 60}
+        maximumEntries: {type: integer, minimum: 1, maximum: 2000, default: 2000}
+        maximumBytes: {type: integer, minimum: 1, maximum: 16777216, default: 16777216}
+    LiveWorkspaceSnapshotRequest:
+      type: object
+      additionalProperties: false
+      required: [snapshotRef, requestDigest, spec]
+      properties:
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/LiveWorkspaceSnapshotSpec'}
+    LiveWorkspaceEntry:
+      type: object
+      additionalProperties: false
+      allOf:
+        - if: {required: [kind], properties: {kind: {const: file}}}
+          then:
+            properties:
+              contentSha256: {$ref: '#/components/schemas/Sha256'}
+              symlinkTarget: {type: 'null'}
+        - if: {required: [kind], properties: {kind: {const: directory}}}
+          then:
+            properties:
+              contentSha256: {type: 'null'}
+              symlinkTarget: {type: 'null'}
+        - if: {required: [kind], properties: {kind: {const: symlink}}}
+          then:
+            properties:
+              contentSha256: {type: 'null'}
+              symlinkTarget: {type: string, minLength: 1, maxLength: 4096, x-kcs-maxUtf8Bytes: 4096}
+      required: [path, kind, mode, sizeBytes, contentSha256, symlinkTarget]
+      properties:
+        path: {$ref: '#/components/schemas/SafeRelativePath'}
+        kind: {type: string, enum: [file, directory, symlink]}
+        mode: {type: integer, minimum: 0, maximum: 4095}
+        sizeBytes: {type: integer, minimum: 0}
+        contentSha256: {$ref: '#/components/schemas/NullableSha256'}
+        symlinkTarget:
+          oneOf: [{type: string, maxLength: 4096, x-kcs-maxUtf8Bytes: 4096}, {type: 'null'}]
+    LiveWorkspaceOmission:
+      type: object
+      additionalProperties: false
+      required: [path, reason]
+      properties:
+        path: {$ref: '#/components/schemas/SafeRelativePath'}
+        reason: {type: string, enum: [entry_limit, byte_limit, unsafe_path, unreadable, changed_during_snapshot]}
+    LiveWorkspaceSnapshot:
+      type: object
+      additionalProperties: false
+      required: [snapshotRef, requestDigest, jobRef, jobUid, podUid, generation, baseManifestDigest, sequence, snapshotDigest, state, entries, truncated, omissions, createdAt, expiresAt, observedAt]
+      properties:
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        baseManifestDigest: {$ref: '#/components/schemas/Sha256'}
+        sequence: {type: integer, minimum: 1}
+        snapshotDigest: {$ref: '#/components/schemas/Sha256'}
+        state: {$ref: '#/components/schemas/LiveWorkspaceSnapshotState'}
+        entries: {type: array, maxItems: 2000, items: {$ref: '#/components/schemas/LiveWorkspaceEntry'}}
+        truncated: {type: boolean}
+        omissions: {type: array, maxItems: 2000, items: {$ref: '#/components/schemas/LiveWorkspaceOmission'}}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    LiveWorkspaceDiffItem:
+      type: object
+      additionalProperties: false
+      required: [path, change, baseSha256, snapshotSha256, sizeBytes]
+      properties:
+        path: {$ref: '#/components/schemas/SafeRelativePath'}
+        change: {type: string, enum: [added, modified, deleted, type_changed]}
+        baseSha256: {$ref: '#/components/schemas/NullableSha256'}
+        snapshotSha256: {$ref: '#/components/schemas/NullableSha256'}
+        sizeBytes: {type: integer, minimum: 0}
+    LiveWorkspaceDiffPage:
+      type: object
+      additionalProperties: false
+      required: [snapshotRef, snapshotDigest, sequence, items, nextPageToken, observedAt]
+      properties:
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        snapshotDigest: {$ref: '#/components/schemas/Sha256'}
+        sequence: {type: integer, minimum: 1}
+        items: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/LiveWorkspaceDiffItem'}}
+        nextPageToken:
+          oneOf: [{$ref: '#/components/schemas/OpaquePageToken'}, {type: 'null'}]
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    DevSessionState: {type: string, enum: [opening, ready, expired, revoked, lost]}
+    DevSessionCreateSpec:
+      type: object
+      additionalProperties: false
+      required: [tenantRef, principalRef, conversationRef, attemptRef, subjectRef, jobUid, podUid, generation, scope, ttlSeconds]
+      properties:
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        attemptRef: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        scope: {type: string, const: workspace-ide}
+        ttlSeconds: {type: integer, minimum: 1, maximum: 900, default: 300}
+    DevSessionCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [devSessionRef, requestDigest, spec]
+      properties:
+        devSessionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/DevSessionCreateSpec'}
+    DevSessionRenewSpec:
+      type: object
+      additionalProperties: false
+      required: [ttlSeconds]
+      properties:
+        ttlSeconds: {type: integer, minimum: 1, maximum: 900}
+    DevSessionRenewRequest:
+      type: object
+      additionalProperties: false
+      required: [renewRef, requestDigest, spec]
+      properties:
+        renewRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/DevSessionRenewSpec'}
+    DevSessionSnapshot:
+      type: object
+      additionalProperties: false
+      required: [devSessionRef, requestDigest, tenantRef, principalRef, conversationRef, attemptRef, subjectRef, jobRef, jobUid, podUid, generation, scope, state, relayKind, relayPath, writable, effectiveUid, effectiveGid, openVscodeImageRef, openVscodeImageId, activeConnections, maximumConnections, createdAt, expiresAt, revokedAt, observedAt]
+      properties:
+        devSessionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        attemptRef: {$ref: '#/components/schemas/OpaqueRef'}
+        subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobRef: {$ref: '#/components/schemas/OpaqueRef'}
+        jobUid: {$ref: '#/components/schemas/KubernetesUid'}
+        podUid: {$ref: '#/components/schemas/KubernetesUid'}
+        generation: {type: integer, minimum: 1}
+        scope: {type: string, const: workspace-ide}
+        state: {$ref: '#/components/schemas/DevSessionState'}
+        relayKind: {type: string, const: openvscode}
+        relayPath: {type: string, pattern: '^/api/v2/jobs/'}
+        writable: {type: boolean, const: true}
+        effectiveUid: {type: integer, const: 10002}
+        effectiveGid: {type: integer, const: 10001}
+        openVscodeImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        openVscodeImageId: {$ref: '#/components/schemas/NullableString'}
+        activeConnections: {type: integer, minimum: 0, maximum: 4}
+        maximumConnections: {type: integer, const: 4}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        revokedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     JobBindingSnapshot:
       type: object
       additionalProperties: false
@@ -2974,6 +3706,8 @@ components:
           oneOf: [{$ref: '#/components/schemas/NativeRunnerGenerationSnapshot'}, {type: 'null'}]
         recipeActivation:
           oneOf: [{$ref: '#/components/schemas/RuntimeRecipeActivationReceipt'}, {type: 'null'}]
+        capabilityActivation:
+          oneOf: [{$ref: '#/components/schemas/CapabilityActivationReceipt'}, {type: 'null'}]
         deadline: {$ref: '#/components/schemas/NativeDeadlineSnapshot'}
         activeOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
         terminalOperationRefs: {type: array, uniqueItems: true, items: {$ref: '#/components/schemas/OpaqueRef'}}
@@ -3447,12 +4181,19 @@ components:
         transferObservations: {type: array, items: {$ref: '#/components/schemas/TransferObservation'}}
         deletedAt: {$ref: '#/components/schemas/Timestamp'}
         expiresAt: {$ref: '#/components/schemas/Timestamp'}
+    CursorGapContext:
+      type: object
+      additionalProperties: false
+      required: [requestedCursor, earliestRetainedCursor]
+      properties:
+        requestedCursor: {$ref: '#/components/schemas/CursorPosition'}
+        earliestRetainedCursor: {$ref: '#/components/schemas/CursorPosition'}
     ErrorCode:
       type: string
-      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
+      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, CURSOR_GAP, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, DEV_SESSION_CREDENTIAL_INVALID, DEV_SESSION_EXPIRED, DEV_SESSION_REVOKED, DEV_SESSION_RELAY_DOWN, LIVE_SNAPSHOT_EXPIRED, CAPABILITY_ACTIVATION_INCOMPATIBLE, CAPABILITY_BUNDLE_MISMATCH, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
     RecoveryAction:
       type: string
-      enum: [retry_same, inspect_job, inspect_grant, inspect_runner_credential_grant, inspect_transfer, inspect_operation, inspect_terminal, reattach, reconcile, new_attempt, none]
+      enum: [retry_same, inspect_job, inspect_grant, inspect_runner_credential_grant, inspect_transfer, inspect_operation, inspect_terminal, inspect_live_snapshot, inspect_dev_session, resolve_runtime_assembly, reattach, reconcile, new_attempt, none]
     ErrorDetail:
       type: object
       additionalProperties: false
@@ -3468,6 +4209,9 @@ components:
         credentialGrantRef: {$ref: '#/components/schemas/OpaqueRef'}
         transferRef: {$ref: '#/components/schemas/OpaqueRef'}
         operationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        devSessionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        cursorGap: {$ref: '#/components/schemas/CursorGapContext'}
         tombstone: {$ref: '#/components/schemas/JobTombstone'}
     ErrorEnvelope:
       type: object
@@ -3490,6 +4234,17 @@ components:
                   recoveryAction: {const: inspect_job}
                   context:
                     required: [tombstone]
+            - if:
+                required: [code]
+                properties:
+                  code: {const: CURSOR_GAP}
+              then:
+                required: [context]
+                properties:
+                  retryable: {const: false}
+                  recoveryAction: {const: reattach}
+                  context:
+                    required: [cursorGap]
           properties:
             code: {$ref: '#/components/schemas/ErrorCode'}
             message: {type: string, minLength: 1}

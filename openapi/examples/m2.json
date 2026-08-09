@@ -1,0 +1,76 @@
+{
+  "exchanges": [
+    {
+      "scenario": "m2-live-snapshot",
+      "operationId": "createLiveWorkspaceSnapshot",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001"},
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/m2-live-snapshot-request.json"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Cache-Control": "no-store",
+          "ETag": "134993ae58126de0bcb8775872ff1671c507687bf5dc47b8170bb434960ccc9c"
+        },
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/m2-live-snapshot.json"
+      }
+    },
+    {
+      "scenario": "m2-live-snapshot-stale",
+      "operationId": "inspectLiveWorkspaceSnapshot",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001", "snapshotRef": "snapshot-m2-stale-001"}
+      },
+      "response": {
+        "status": 410,
+        "headers": {"Cache-Control": "no-store"},
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/error-m2-stale-binding.json"
+      }
+    },
+    {
+      "scenario": "m2-log-cursor-gap",
+      "operationId": "getRoleLogs",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001"},
+        "query": {"container": "runner", "cursor": "Y3Vyc29yLW9sZA", "limitBytes": 65536}
+      },
+      "response": {
+        "status": 410,
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/error-m2-cursor-gap.json"
+      }
+    },
+    {
+      "scenario": "m2-dev-session-revoked",
+      "operationId": "inspectDevSession",
+      "request": {
+        "path": {"jobRef": "job-synthetic-001", "devSessionRef": "dev-session-m2-revoked-001"},
+        "headers": {"KCS-Dev-Session-Credential": "synthetic-dev-session-credential-000001"}
+      },
+      "response": {
+        "status": 410,
+        "headers": {"Cache-Control": "no-store"},
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/error-m2-dev-session-revoked.json"
+      }
+    },
+    {
+      "scenario": "m2-capability-incompatible",
+      "operationId": "resolveRuntimeAssembly",
+      "request": {
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/m2-runtime-assembly-request.json"
+      },
+      "response": {
+        "status": 422,
+        "headers": {"Cache-Control": "no-store"},
+        "contentType": "application/json",
+        "bodyFixture": "fixtures/error-m2-capability-incompatible.json"
+      }
+    }
+  ]
+}

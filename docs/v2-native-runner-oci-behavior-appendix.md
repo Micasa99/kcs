@@ -1,10 +1,12 @@
-# KCS OpenAPI 2.4 native-runner OCI behavior appendix
+# KCS OpenAPI 2.5 native-runner OCI behavior appendix
 
-Status: **M1 implementation contract**. The implementation branch serves OpenAPI
-2.4.0 at SHA-256
+Status: **M1 implemented; M2 dormant freeze**. The implementation branch serves
+OpenAPI 2.4.0 at SHA-256
 `3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f` and implements
-the native provider/renderer/launcher path. It has not been deployed to the formal
-`researchcosmos-v2` namespace; production activation still requires owner approval.
+the native provider/renderer/launcher path. OpenAPI 2.5.0 at SHA-256
+`a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408` freezes M2 as
+`dormant`; it is generated for review but is not packaged, served, or deployed.
+Production `researchcosmos-v2` is unchanged.
 
 ## 1. Delivery selection and immutable image roles
 
@@ -129,7 +131,8 @@ launcher applies the terminal identity transition and starts it as UID/GID
 `/workspace/worktree`. The native response records
 `container=runner`, `launcherMediated=true`, effective identity, and cwd. KCS must
 not implement this as direct Kubernetes exec into the root launcher. No separate
-native terminal path or developer-session surface is added.
+native terminal path is added. OpenAPI 2.5 adds a distinct, scoped developer-session
+relay for IDE traffic; it does not replace or fork the PTY wire.
 The terminal shell receives a fresh bounded shell environment and does not inherit
 the agent child's model-gateway token path or token-bearing process environment.
 Native terminal creation first pauses the runner and the snapshot therefore fixes
@@ -271,9 +274,65 @@ The minimum evidence surface is:
 | K3s 1.36 ImageVolume canary | digest-pinned agent image mounted read-only; environment image present; Node/Pi/Codex launched; worktree write succeeded; runner mount write was denied; ephemeral request `64 MiB`/limit `256 MiB`; completion about `3.30s`; image events reported both images already present; no approximately `687 MiB` copy | `assembled.imageVolume` is the default; activation must record admitted request/limit |
 | optional Secret projection canaries | projection became visible after about `47s` and `55s`; a `60s` projection lease was exhausted before start | minimum projection lease `120s`; fixture/recommendation `180s` |
 | M1 registry pull canary | the exact platform ImageVolume digest was absent on the target node, authenticated pull succeeded in `301ms` (reported image size `1,364,805` bytes), and subsequent mounts used the cached digest; the exact runner and environment digests were already cached | registry authentication and an exact platform-image cold pull are proven; a full uncached assembly SLO remains `not_reported` |
+| M2 live-worktree Journey | a real Codex child ran for `20.66s`; 24 operator samples observed monotonic runner sequence plus changing worktree and metrics bytes; capture/finalize ended `succeeded` | live reads must be immutable, binding-scoped snapshots; ad-hoc mixed-moment reads are forbidden |
+| M2 PTY/stop Journey | existing six PTY operations accepted input/resize/read/replay/close, replayed identical output, captured the terminal edit, then stop/capture/finalize ended `succeeded` | reuse the 2.4 PTY; add only explicit `CURSOR_GAP` retention semantics |
+| M2 OpenVSCode relay | OpenVSCode `1.109.5` ran loopback as `10002:10001`; outer relay returned `401` for bad credential, `410` after expiry/revoke, and `101` for WebSocket; exact image cold pull was `3.355s` | browser reaches KCS only through RC same-origin ticketing and binding-scoped relay; no direct credential or public Pod endpoint |
+| M2 capability activation | exact Skill and Tool image volumes pulled in `236ms`/`259ms`, were read-only, and a real Codex run read the Skill, invoked the Tool, and produced captured results | resolve immutable capability pins to an exact activation plan and record actual mounted image IDs/digests |
 
 Private raw probe artifacts remain outside the repository. Before production
 activation, the evidence owner attaches sanitized command output and timestamps to
 the release review. The M1 canary proves registry authentication and one exact
 platform-image cold pull, but does not present cached runner/environment timings as
 a full cold-assembly SLO.
+
+## 7. M2 additive behavior
+
+### 7.1 Live workspace
+
+KCS creates a bounded immutable snapshot from one exact
+`jobUid`/`podUid`/generation. Control walks `/workspace/worktree` using directory
+file descriptors, never follows symlinks, and freezes entry metadata and content
+bytes before returning a sequence and digest. Tree, diff, and ranged-content reads
+refer only to that snapshot. A Pod-incarnation mismatch is `STALE_BINDING`; expiry
+is `LIVE_SNAPSHOT_EXPIRED`. Limits and omissions are explicit, and captured output
+remains the only sealed result authority.
+
+Container logs and PTY output keep their 2.4 cursor wires. If requested bytes have
+fallen out of the retention window, KCS returns `CURSOR_GAP` with the requested and
+earliest retained opaque cursors. It never silently jumps forward.
+
+### 7.2 Developer session
+
+The registered OpenVSCode release is `1.109.5`; the upstream release tar SHA-256 is
+`b433bf4f0227321a7014d8460d10a8f958adc0f45aa79bd889e84e65e8f88363`. The probe
+image is digest-pinned as
+`10.255.250.1:5000/researchcosmos/rc-openvscode-server@sha256:f81187d7c9480c74cddbc3eec3955c239d492b4fbc1cb023b14c154f8b2d4e40`.
+It is mounted read-only outside the environment image and runs as terminal identity
+`10002:10001`, with its own HOME/TMP, against the group-writable worktree. It binds
+only `127.0.0.1:3000`. `--without-connection-token` is permitted only behind the
+KCS outer relay; no Pod port is public.
+
+The KCS dev-session credential is returned only to the RC backend, is never exposed
+to browser JavaScript, and is bound to tenant, principal, conversation, Attempt,
+job UID, Pod UID, generation, TTL, and connection limit. RC issues its own
+same-origin browser ticket and proxies HTTP/WebSocket traffic. Renew rotates the KCS
+credential; expiry and revoke are immediate and typed. Replacement Pod identity is
+stale, not transparently reattached. KCS strips credentials before proxying and does
+not pass them to OpenVSCode. Extensions are curated/cached through platform policy;
+arbitrary Open VSX egress is disabled by default.
+
+### 7.3 Exact Skill and Tool activation
+
+RC sends exact capability refs and material digests; it never sends arbitrary image
+or command fields in `CreateJob`. KCS resolves the approved runner/environment recipe
+plus pins to one immutable `CapabilityActivationPlan`. Each bundle is a digest-pinned
+image volume mounted read-only under `/opt/rc-skills/<id>` or
+`/opt/rc-tools/<id>`. Launcher maps only the plan-declared discovery paths into the
+selected runner. The activation receipt records requested refs/material digests,
+resolved image refs, actual image IDs, target paths, binding/generation, and state.
+
+Missing registration, protocol/platform incompatibility, material mismatch, or
+unavailable bundle fails loudly before runner start. There is no runtime download,
+mutable plugin install, host-path fallback, or silent omission. Agent-native shell
+and file operations remain sandbox capabilities; only externally governed Tools are
+activated through this catalog path.

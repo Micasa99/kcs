@@ -19,6 +19,19 @@ NATIVE_OPERATIONS = {
     "stopRunner",
     "resolveRuntimeRecipe",
 }
+M2_OPERATIONS = {
+    "resolveRuntimeAssembly",
+    "createLiveWorkspaceSnapshot",
+    "inspectLiveWorkspaceSnapshot",
+    "releaseLiveWorkspaceSnapshot",
+    "readLiveWorkspaceContent",
+    "getLiveWorkspaceDiff",
+    "createDevSession",
+    "inspectDevSession",
+    "renewDevSession",
+    "revokeDevSession",
+    "relayDevSession",
+}
 HOSTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
     "getRuntimeEvents": ("get", "/api/v2/events"),
@@ -161,16 +174,18 @@ def _operations(document: dict) -> dict[str, tuple[str, str, dict]]:
     }
 
 
-def test_v24_is_additive_over_the_frozen_served_v23_hosted_contract() -> None:
+def test_v25_dormant_contract_preserves_the_served_v24_hosted_arm() -> None:
     current = yaml.safe_load(SOURCE.read_text())
     served = json.loads(SERVED_PACKAGE.read_text())
     current_operations = _operations(current)
-    assert served == current
     assert served["info"]["version"] == "2.4.0"
-    assert current["info"]["version"] == "2.4.0"
-    assert current["x-kcs-contract-status"] == "active"
-    assert len(current_operations) == 36
-    assert set(current_operations) - set(HOSTED_OPERATION_LOCATIONS) == NATIVE_OPERATIONS
+    assert current["info"]["version"] == "2.5.0"
+    assert current["x-kcs-contract-status"] == "dormant"
+    assert len(_operations(served)) == 36
+    assert len(current_operations) == 47
+    assert set(current_operations) - set(HOSTED_OPERATION_LOCATIONS) == (
+        NATIVE_OPERATIONS | M2_OPERATIONS
+    )
 
     for operation_id, expected_location in HOSTED_OPERATION_LOCATIONS.items():
         method, path, _operation = current_operations[operation_id]
@@ -184,15 +199,18 @@ def test_v24_is_additive_over_the_frozen_served_v23_hosted_contract() -> None:
     )
 
 
-def test_active_generated_and_served_contracts_are_byte_identical() -> None:
+def test_dormant_generated_contract_does_not_replace_the_served_package() -> None:
     generated = ROOT / "openapi/generated/kcs-v2-jobs.openapi.json"
-    assert generated.read_bytes() == SERVED_PACKAGE.read_bytes()
+    assert generated.read_bytes() != SERVED_PACKAGE.read_bytes()
     assert hashlib.sha256(SERVED_PACKAGE.read_bytes()).hexdigest() == (
         "3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f"
     )
+    assert hashlib.sha256(generated.read_bytes()).hexdigest() == (
+        "a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408"
+    )
 
 
-def test_v24_native_arm_is_owned_by_kcs_and_has_no_m2_callable_surface() -> None:
+def test_v25_adds_only_the_frozen_m2_surface_to_the_kcs_owned_native_arm() -> None:
     document = yaml.safe_load(SOURCE.read_text())
     schemas = document["components"]["schemas"]
     paths = document["paths"]
@@ -205,7 +223,9 @@ def test_v24_native_arm_is_owned_by_kcs_and_has_no_m2_callable_surface() -> None
         "openai-completions",
         "anthropic-messages",
     ]
-    assert all("dev-session" not in path for path in paths)
+    assert "/api/v2/runtime-assemblies/resolve" in paths
+    assert "/api/v2/jobs/{jobRef}/workspace/live-snapshots" in paths
+    assert "/api/v2/jobs/{jobRef}/dev-sessions" in paths
     assert all(not ("/runner/" in path and "terminal" in path) for path in paths)
 
 
