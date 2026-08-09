@@ -134,3 +134,43 @@ The production `researchcosmos-v2` namespace was not patched, restarted, or roll
 out and remains on v2.3. This canary closes the natural success path only. Gateway
 429, report-missing, cancel/revoke, hard-deadline/indeterminate, ENOSPC/eviction, and
 hosted/native parallel Journeys remain production gates.
+
+## 8. 2026-08-09 runtime closeout canary
+
+The production-runtime closeout used KCS source commit `75d176c` and the same
+contract SHA recorded at the top of this runbook. The isolated canary resolved these
+exact images:
+
+- API: `sha256:c0e9a2bb4c499d0a06ed54a9ea3a3ad96993780f0cc598d329d57d8951c3c402`
+- platform launcher: `sha256:e20cc626b9f81eb4e76e7ce0e85740a5e358cb9bdcb6d5986c7b6f39e38bf212`
+- production control: `sha256:aba95ef4c22ae9bdde57d85ed4a7215670070457c69d07d6fdfc81dc0d6ce62c`
+- Codex runner: `sha256:096612527c31300383ff4dd1c0227642cad03bf2212e0a8ace64952af230f110`
+
+The registered Codex/environment exact pair resolved to recipe digest
+`0a5b9f071738d98a279bde4c6e6f12d17c1844160aa1b81f256cd1ccdd511abd`.
+There was no approximate version selection or assembled-to-prebuilt fallback.
+
+One native Codex Job received a six-file MLE workspace and completed autonomously as
+UID 10001. It executed the supplied baseline, adapted to the actually installed
+stdlib-only environment, improved validation log-loss from `1.5283` to `0.3860`, and
+produced a structurally verified 1,958-row submission plus research record,
+explanation, validation evidence, metrics, trace, and `RESULT.md`. KCS observed a
+natural exit code 0 and the raw `turn.completed` protocol terminal. ResearchCosmos
+sealed a complete 21-item NativeAttemptCapture with no omissions, truncations, or
+possible output loss, read both runner and control raw logs, finalized and deleted
+the Job, completed cleanup, and sealed a succeeded ResearchOutcome and
+ResearchClosure. The canary API remained Ready with zero restarts.
+
+The final ResearchRun-rooted pack then rejected one ResearchCosmos ownership
+invariant: the six ResearchRun input refs were compared to seven physical
+`input_material` rows because the Attempt-derived `TASK.md` was committed through
+that same owner table. This is a consumer-side lineage-membership defect, not a KCS
+runtime failure; the raw terminal/capture/cleanup facts remain preserved. KCS does
+not add a compatibility path for it. The ResearchCosmos fix must distinguish
+ResearchRun-declared inputs from reachable Attempt-derived staged materials while
+continuing to verify both exact refs and bytes.
+
+The closeout used only the isolated `rc-native-closeout-2a400da` namespace. No
+production namespace was changed. The transient Job and workload PVC were removed
+after capture; the namespace-local canary API remains available for the consumer
+lineage fix and a detached pack rerun.
