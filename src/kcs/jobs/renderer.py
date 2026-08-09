@@ -27,6 +27,8 @@ USER_HOME_VOLUME = "rc-user-home"
 USER_TMP_VOLUME = "rc-user-tmp"
 TERMINAL_HOME_VOLUME = "rc-terminal-home"
 TERMINAL_TMP_VOLUME = "rc-terminal-tmp"
+OPENVSCODE_VOLUME = "rc-openvscode"
+DEV_SESSION_CREDENTIAL_VOLUME = "rc-dev-session-credential"
 WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
 
 
@@ -47,6 +49,11 @@ def credential_secret_name(job_ref: str) -> str:
 def runner_credential_secret_name(job_ref: str) -> str:
     """Return the independent native model-gateway Secret slot."""
     return f"kcs-v2-runner-credential-{_short_hash(job_ref, 24)}"
+
+
+def dev_session_secret_name(job_ref: str) -> str:
+    """Return the fixed optional Secret slot watched by the M2 relay sidecars."""
+    return f"kcs-v2-dev-session-{_short_hash(job_ref, 24)}"
 
 
 class V2JobRenderer:
@@ -325,8 +332,14 @@ class V2JobRenderer:
                 ],
             ),
         ]
+        dev_sidecars = (
+            self._native_dev_session_sidecars(recipe, runtime_image, job_ref)
+            if self._settings.native_openvscode_image_volume is not None
+            else []
+        )
         pod_spec = client.V1PodSpec(
             containers=containers,
+            init_containers=dev_sidecars or None,
             volumes=volumes,
             restart_policy="Never",
             automount_service_account_token=False,
@@ -338,7 +351,9 @@ class V2JobRenderer:
             share_process_namespace=False,
             enable_service_links=False,
             security_context=client.V1PodSecurityContext(
-                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")
+                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                fs_group=10001,
+                fs_group_change_policy="OnRootMismatch",
             ),
         )
         return client.V1Job(
@@ -443,7 +458,131 @@ class V2JobRenderer:
                     ),
                 )
             )
+        if self._settings.native_openvscode_image_volume is not None:
+            volumes.extend(
+                [
+                    client.V1Volume(
+                        name=OPENVSCODE_VOLUME,
+                        image=client.V1ImageVolumeSource(
+                            reference=self._settings.native_openvscode_image_volume,
+                            pull_policy="IfNotPresent",
+                        ),
+                    ),
+                    client.V1Volume(
+                        name=DEV_SESSION_CREDENTIAL_VOLUME,
+                        secret=client.V1SecretVolumeSource(
+                            secret_name=dev_session_secret_name(job_ref),
+                            optional=True,
+                            default_mode=0o440,
+                        ),
+                    ),
+                ]
+            )
         return volumes
+
+    def _native_dev_session_sidecars(
+        self, recipe: ResolvedRuntimeRecipe, runtime_image: str, job_ref: str
+    ) -> list[client.V1Container]:
+        """Add the remotely proven OpenVSCode and credential-gating native sidecars.
+
+        Kubernetes 1.36 terminates ``restartPolicy: Always`` init sidecars after
+        runner/control finish, so they cannot keep the Job alive.  Only relay sees
+        the dev credential; OpenVSCode owns no platform secret and stays loopback.
+        """
+
+        del recipe
+        relay_image = self._settings.native_dev_session_relay_image
+        if relay_image is None:
+            raise PolicyViolationError("native dev-session relay image is not configured")
+        identity = client.V1SecurityContext(
+            run_as_user=10002,
+            run_as_group=10001,
+            privileged=False,
+            allow_privilege_escalation=False,
+            read_only_root_filesystem=True,
+            capabilities=client.V1Capabilities(drop=["ALL"]),
+            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+        )
+        return [
+            client.V1Container(
+                name="openvscode",
+                image=runtime_image,
+                image_pull_policy="IfNotPresent",
+                command=[
+                    "/opt/rc-dev/openvscode/bin/openvscode-server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "3000",
+                    "--without-connection-token",
+                    "--accept-server-license-terms",
+                    "--telemetry-level",
+                    "off",
+                    "--server-data-dir",
+                    "/run/rc-terminal/home/.openvscode-server",
+                    "--user-data-dir",
+                    "/run/rc-terminal/home/.openvscode-user",
+                    "--extensions-dir",
+                    "/run/rc-terminal/home/.openvscode-extensions",
+                    "/workspace/worktree",
+                ],
+                env=self._environment(
+                    {
+                        "HOME": "/run/rc-terminal/home",
+                        "TMPDIR": "/run/rc-terminal/tmp",
+                        "RC_OPENVSCODE_BINARY": (
+                            "/opt/rc-dev/openvscode/bin/openvscode-server"
+                        ),
+                    }
+                ),
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "250m", "memory": "512Mi", "ephemeral-storage": "512Mi"},
+                    limits={"cpu": "2", "memory": "2Gi", "ephemeral-storage": "2Gi"},
+                ),
+                security_context=identity,
+                restart_policy="Always",
+                volume_mounts=[
+                    client.V1VolumeMount(name=WORKSPACE_VOLUME, mount_path="/workspace"),
+                    client.V1VolumeMount(
+                        name=TERMINAL_HOME_VOLUME, mount_path="/run/rc-terminal/home"
+                    ),
+                    client.V1VolumeMount(
+                        name=TERMINAL_TMP_VOLUME, mount_path="/run/rc-terminal/tmp"
+                    ),
+                    client.V1VolumeMount(
+                        name=OPENVSCODE_VOLUME, mount_path="/opt/rc-dev", read_only=True
+                    ),
+                ],
+            ),
+            client.V1Container(
+                name="relay",
+                image=relay_image,
+                image_pull_policy="IfNotPresent",
+                env=self._environment(
+                    {
+                        "LISTEN_ADDR": ":8080",
+                        "UPSTREAM_URL": "http://127.0.0.1:3000",
+                        "DEV_SESSION_CREDENTIAL_FILE": "/run/dev-session/credential",
+                        "DEV_SESSION_EXPIRES_AT_FILE": "/run/dev-session/expires-at",
+                        "DEV_SESSION_REVOKED_FILE": "/run/dev-session/revoked",
+                    }
+                ),
+                ports=[client.V1ContainerPort(name="dev-relay", container_port=8080)],
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "50m", "memory": "32Mi", "ephemeral-storage": "32Mi"},
+                    limits={"cpu": "250m", "memory": "128Mi", "ephemeral-storage": "128Mi"},
+                ),
+                security_context=identity,
+                restart_policy="Always",
+                volume_mounts=[
+                    client.V1VolumeMount(
+                        name=DEV_SESSION_CREDENTIAL_VOLUME,
+                        mount_path="/run/dev-session",
+                        read_only=True,
+                    )
+                ],
+            ),
+        ]
 
     def _validate_gateway(self, model_env: dict[str, str]) -> None:
         if (

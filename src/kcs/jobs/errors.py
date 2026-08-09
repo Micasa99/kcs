@@ -245,6 +245,54 @@ class TerminalCredentialError(KcsV2Error):
     default_message = "The Workspace terminal credential is missing, invalid, or expired"
 
 
+class DevSessionCredentialError(KcsV2Error):
+    code = "DEV_SESSION_CREDENTIAL_INVALID"
+    status_code = 401
+    default_message = "The dev-session credential is missing or invalid"
+
+
+class DevSessionExpiredError(KcsV2Error):
+    code = "DEV_SESSION_EXPIRED"
+    status_code = 410
+    recovery_action = "reattach"
+    default_message = "The dev session has expired"
+
+
+class DevSessionRevokedError(KcsV2Error):
+    code = "DEV_SESSION_REVOKED"
+    status_code = 410
+    default_message = "The dev session has been revoked"
+
+
+class DevSessionRelayDownError(KcsV2Error):
+    code = "DEV_SESSION_RELAY_DOWN"
+    status_code = 503
+    retryable = True
+    recovery_action = "retry_same"
+    default_message = "The bound dev-session relay is unavailable"
+
+
+class DevSessionIdentityConflictError(IdentityDigestConflictError):
+    recovery_action = "inspect_dev_session"
+
+
+class CursorGapError(KcsV2Error):
+    code = "CURSOR_GAP"
+    status_code = 410
+    recovery_action = "reattach"
+    default_message = "The requested cursor precedes the retained output window"
+
+    def __init__(self, requested_cursor: int, earliest_retained_cursor: int) -> None:
+        super().__init__(
+            context={
+                "cursorGap": {
+                    "requestedCursor": requested_cursor,
+                    "earliestRetainedCursor": earliest_retained_cursor,
+                }
+            }
+        )
+
+
 class TombstonedError(KcsV2Error):
     code = "TOMBSTONED"
     status_code = 410

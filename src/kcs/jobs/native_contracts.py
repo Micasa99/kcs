@@ -1,4 +1,4 @@
-"""Canonical 2.4 native-runner wire models.
+"""Canonical 2.5 native-runner and M2 wire models.
 
 The native arm is intentionally validated from the packaged canonical OpenAPI
 document.  This keeps the implementation and the frozen contract on one source
@@ -32,8 +32,8 @@ def _canonical_document() -> dict[str, Any]:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError("KCS_V2_OPENAPI_PATH is not a valid contract") from error
-        if value.get("info", {}).get("version") != "2.4.0":
-            raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.4 contract")
+        if value.get("info", {}).get("version") != "2.5.0":
+            raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.5 contract")
         return value
     candidates = [
         Path(__file__).resolve().parents[3] / "openapi/generated/kcs-v2-jobs.openapi.json"
@@ -41,7 +41,7 @@ def _canonical_document() -> dict[str, Any]:
     for candidate in candidates:
         if candidate.is_file():
             value = json.loads(candidate.read_text(encoding="utf-8"))
-            if value.get("info", {}).get("version") == "2.4.0":
+            if value.get("info", {}).get("version") == "2.5.0":
                 return value
     payload = (
         importlib.resources.files("kcs.openapi")
@@ -49,8 +49,8 @@ def _canonical_document() -> dict[str, Any]:
         .read_text(encoding="utf-8")
     )
     value = json.loads(payload)
-    if value.get("info", {}).get("version") != "2.4.0":
-        raise RuntimeError("the served KCS package does not contain the active 2.4 contract")
+    if value.get("info", {}).get("version") != "2.5.0":
+        raise RuntimeError("the served KCS package does not contain the active 2.5 contract")
     return value
 
 
@@ -218,6 +218,56 @@ class NativeTerminalSessionSnapshot(CanonicalNativeModel):
     component = "NativeTerminalSessionSnapshot"
 
 
+class RuntimeAssemblyResolutionRequest(CanonicalNativeModel):
+    component = "RuntimeAssemblyResolutionRequest"
+
+
+class ResolvedRuntimeAssembly(CanonicalNativeModel):
+    component = "ResolvedRuntimeAssembly"
+
+
+class LiveWorkspaceSnapshotRequest(CanonicalNativeModel):
+    component = "LiveWorkspaceSnapshotRequest"
+
+    @model_validator(mode="after")
+    def validate_request_digest(self) -> LiveWorkspaceSnapshotRequest:
+        if canonical_digest(self.root["spec"]) != self.root["requestDigest"]:
+            raise ValueError("requestDigest does not match live snapshot spec")
+        return self
+
+
+class LiveWorkspaceSnapshot(CanonicalNativeModel):
+    component = "LiveWorkspaceSnapshot"
+
+
+class LiveWorkspaceDiffPage(CanonicalNativeModel):
+    component = "LiveWorkspaceDiffPage"
+
+
+class DevSessionCreateRequest(CanonicalNativeModel):
+    component = "DevSessionCreateRequest"
+
+    @model_validator(mode="after")
+    def validate_request_digest(self) -> DevSessionCreateRequest:
+        if canonical_digest(self.root["spec"]) != self.root["requestDigest"]:
+            raise ValueError("requestDigest does not match dev session spec")
+        return self
+
+
+class DevSessionRenewRequest(CanonicalNativeModel):
+    component = "DevSessionRenewRequest"
+
+    @model_validator(mode="after")
+    def validate_request_digest(self) -> DevSessionRenewRequest:
+        if canonical_digest(self.root["spec"]) != self.root["requestDigest"]:
+            raise ValueError("requestDigest does not match dev session renew spec")
+        return self
+
+
+class DevSessionSnapshot(CanonicalNativeModel):
+    component = "DevSessionSnapshot"
+
+
 __all__ = [
     "AnyJobBindingSnapshotList",
     "NativeCreateJobRequest",
@@ -226,6 +276,14 @@ __all__ = [
     "NativeRoleLogs",
     "NativeRunnerGenerationSnapshot",
     "NativeTerminalSessionSnapshot",
+    "RuntimeAssemblyResolutionRequest",
+    "ResolvedRuntimeAssembly",
+    "LiveWorkspaceSnapshotRequest",
+    "LiveWorkspaceSnapshot",
+    "LiveWorkspaceDiffPage",
+    "DevSessionCreateRequest",
+    "DevSessionRenewRequest",
+    "DevSessionSnapshot",
     "ResolvedRuntimeRecipe",
     "RunnerCredentialGrantSnapshot",
     "RunnerStartRequest",

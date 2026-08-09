@@ -174,14 +174,14 @@ def _operations(document: dict) -> dict[str, tuple[str, str, dict]]:
     }
 
 
-def test_v25_dormant_contract_preserves_the_served_v24_hosted_arm() -> None:
+def test_v25_active_contract_preserves_the_v24_hosted_decode_arm() -> None:
     current = yaml.safe_load(SOURCE.read_text())
     served = json.loads(SERVED_PACKAGE.read_text())
     current_operations = _operations(current)
-    assert served["info"]["version"] == "2.4.0"
+    assert served["info"]["version"] == "2.5.0"
     assert current["info"]["version"] == "2.5.0"
-    assert current["x-kcs-contract-status"] == "dormant"
-    assert len(_operations(served)) == 36
+    assert current["x-kcs-contract-status"] == "active"
+    assert len(_operations(served)) == 47
     assert len(current_operations) == 47
     assert set(current_operations) - set(HOSTED_OPERATION_LOCATIONS) == (
         NATIVE_OPERATIONS | M2_OPERATIONS
@@ -199,15 +199,9 @@ def test_v25_dormant_contract_preserves_the_served_v24_hosted_arm() -> None:
     )
 
 
-def test_dormant_generated_contract_does_not_replace_the_served_package() -> None:
+def test_active_generated_contract_is_the_only_served_package() -> None:
     generated = ROOT / "openapi/generated/kcs-v2-jobs.openapi.json"
-    assert generated.read_bytes() != SERVED_PACKAGE.read_bytes()
-    assert hashlib.sha256(SERVED_PACKAGE.read_bytes()).hexdigest() == (
-        "3a09c318f85faa20ae8273c372e2bed186dbab60d122667f031989a9b75db84f"
-    )
-    assert hashlib.sha256(generated.read_bytes()).hexdigest() == (
-        "a4aab79cbc56060928b1f04a1e36b49fa17e77c6eed44e1ef60aba03c4b20408"
-    )
+    assert generated.read_bytes() == SERVED_PACKAGE.read_bytes()
 
 
 def test_v25_adds_only_the_frozen_m2_surface_to_the_kcs_owned_native_arm() -> None:

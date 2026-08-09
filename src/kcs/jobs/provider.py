@@ -79,6 +79,7 @@ from .contracts import (
     WorkspaceRequestedResources,
     WorkspaceRoleSnapshot,
 )
+from .dev_session import DevSessionMutation, DevSessionRelayTarget, DevSessionService
 from .errors import (
     CredentialActiveError,
     CredentialDestroyFailedError,
@@ -119,6 +120,9 @@ from .lifecycle import (
 )
 from .native_contracts import (
     AnyJobBindingSnapshotList,
+    DevSessionCreateRequest,
+    DevSessionRenewRequest,
+    DevSessionSnapshot,
     NativeCreateJobRequest,
     NativeFinalizeJobRequest,
     NativeJobBindingSnapshot,
@@ -240,6 +244,14 @@ class V2KubeAdapterProtocol(Protocol):
     def read_secret(self, name: str) -> object | None: ...
 
     def delete_secret(self, name: str, secret_uid: str) -> bool: ...
+
+    def upsert_secret(self, name: str, body: object) -> object: ...
+
+    def pod_relay_endpoint(self, job_ref: str, pod_uid: str) -> tuple[str, int]: ...
+
+    def pod_container_image_id(
+        self, job_ref: str, pod_uid: str, container: str
+    ) -> tuple[str | None, bool]: ...
 
     def open_workspace_terminal(
         self,
@@ -422,6 +434,7 @@ class V2JobProvider:
         workspace_transport: WorkspaceRpcTransportProtocol | None = None,
         observability: V2ObservabilityProtocol | None = None,
         hosted_admission: bool = True,
+        openvscode_image_ref: str | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -459,11 +472,53 @@ class V2JobProvider:
             workspace_transport,
             clock=self._clock,
         )
+        self._dev_sessions = DevSessionService(
+            store,
+            kube,
+            openvscode_image_ref=openvscode_image_ref,
+            binding_resolver=self._native_live_binding,
+            clock=self._clock,
+        )
         self._native_metrics_lock = threading.Lock()
         self._native_recipe_forbidden_total = 0
         self._terminal_lifecycle_lock = threading.RLock()
         self.reconcile_credentials()
         self.reconcile_terminals()
+        self._dev_sessions.reconcile()
+
+    def create_dev_session(
+        self, job_ref: str, request: DevSessionCreateRequest
+    ) -> DevSessionMutation:
+        binding = self._native_live_binding(job_ref)
+        self._assert_accepting_workspace_work(job_ref)
+        return self._dev_sessions.create(job_ref, request, binding)
+
+    def inspect_dev_session(
+        self, job_ref: str, dev_session_ref: str, credential: str
+    ) -> DevSessionSnapshot:
+        return self._dev_sessions.inspect(job_ref, dev_session_ref, credential)
+
+    def renew_dev_session(
+        self,
+        job_ref: str,
+        dev_session_ref: str,
+        credential: str,
+        request: DevSessionRenewRequest,
+    ) -> DevSessionMutation:
+        self._assert_accepting_workspace_work(job_ref)
+        return self._dev_sessions.renew(job_ref, dev_session_ref, credential, request)
+
+    def revoke_dev_session(
+        self, job_ref: str, dev_session_ref: str, credential: str
+    ) -> DevSessionSnapshot:
+        return self._dev_sessions.revoke(job_ref, dev_session_ref, credential)
+
+    def dev_session_relay_target(
+        self, job_ref: str, dev_session_ref: str, credential: str, path: str
+    ) -> DevSessionRelayTarget:
+        return self._dev_sessions.relay_target(
+            job_ref, dev_session_ref, credential, path
+        )
 
     def capacity(self) -> CapacitySnapshot:
         """Return a fresh, read-only projection of Kubernetes Node capacity."""
@@ -1437,6 +1492,7 @@ class V2JobProvider:
         try:
             report.indeterminate += self.reconcile_credentials()
             report.indeterminate += self.reconcile_terminals()
+            report.indeterminate += self._dev_sessions.reconcile()
             for record in self._store.list_create():
                 report.scanned += 1
                 job_ref = str(_field(record, "job_ref"))
@@ -2575,6 +2631,7 @@ class V2JobProvider:
                 return True
 
             try:
+                self._dev_sessions.revoke_for_job(job_ref, "native_finalize")
                 result = self._native.finalize(job_ref, binding, request, transfers_terminal)
                 close.phase("succeeded", closed=True)
             except KcsV2Error:
@@ -2839,6 +2896,7 @@ class V2JobProvider:
         }
         try:
             if phase == "accepted":
+                self._dev_sessions.revoke_for_job(job_ref, "native_cancel")
                 self._native.revoke_all(job_ref)
                 record = self._set_cancel_phase(
                     record, "credentials_revoked", output_loss_possible=True
@@ -2998,6 +3056,7 @@ class V2JobProvider:
             close.phase("delete_intent_persisted")
 
         if _is_native_record(record):
+            self._dev_sessions.revoke_for_job(job_ref, "job_delete")
             self._native.revoke_all(job_ref)
             self._prove_native_secret_absent(job_ref, str(_field(record, "job_uid")))
         else:
@@ -3174,6 +3233,12 @@ class V2JobProvider:
             raise StateConflictError("The Job has a retained deletion intent")
         if binding.pod_uid is None or binding.binding_state is JobBindingState.INDETERMINATE:
             raise ReplacementPodError()
+        return binding
+
+    def _native_live_binding(self, job_ref: str) -> NativeJobBindingSnapshot:
+        binding = self._live_binding(job_ref)
+        if not isinstance(binding, NativeJobBindingSnapshot):
+            raise StateConflictError("The operation requires a Native Job")
         return binding
 
     def _binding_for_close(

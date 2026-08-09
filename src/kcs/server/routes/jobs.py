@@ -16,16 +16,20 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
+import requests
 import yaml  # type: ignore[import-untyped]
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response, WebSocket
 from fastapi import Path as ApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.exceptions import ConnectionClosed
 
 from kcs.jobs.canonical import DigestMismatchError as CanonicalDigestMismatchError
 from kcs.jobs.contracts import (
@@ -58,6 +62,7 @@ from kcs.jobs.contracts import (
     WorkspaceOperationSnapshot,
 )
 from kcs.jobs.errors import (
+    DevSessionRelayDownError,
     DigestMismatchError,
     InvalidRequestError,
     KcsV2Error,
@@ -66,6 +71,9 @@ from kcs.jobs.errors import (
 )
 from kcs.jobs.native_contracts import (
     AnyJobBindingSnapshotList,
+    DevSessionCreateRequest,
+    DevSessionRenewRequest,
+    DevSessionSnapshot,
     NativeCreateJobRequest,
     NativeFinalizeJobRequest,
     NativeJobBindingSnapshot,
@@ -89,11 +97,22 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.4.0"
+API_VERSION = "2.5.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_DEV_RELAY_RESPONSE_HEADERS = frozenset(
+    {
+        "content-type",
+        "content-encoding",
+        "etag",
+        "last-modified",
+        "cache-control",
+        "vary",
+        "accept-ranges",
+    }
+)
 log = logging.getLogger("kcs")
 
 
@@ -439,6 +458,181 @@ def create_jobs_router(
         ],
     ) -> Response:
         return _json_model(provider.resolve_runtime_recipe(runner_ref, environment_profile_ref))
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/dev-sessions",
+        operation_id="createDevSession",
+        tags=["Dev sessions"],
+        status_code=201,
+        response_model=DevSessionSnapshot,
+        responses=_error_responses(200, 400, 401, 403, 404, 409, 410, 415, 422, 500, 503),
+    )
+    def create_dev_session(
+        job_ref: Annotated[
+            str, ApiPath(alias="jobRef", min_length=1, max_length=256, pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: DevSessionCreateRequest,
+    ) -> Response:
+        result = provider.create_dev_session(job_ref, payload)
+        headers = {"KCS-Dev-Session-Credential": result.credential or ""}
+        response = _json_model(result.snapshot, status_code=201 if result.created else 200)
+        response.headers.update(headers)
+        return response
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}",
+        operation_id="inspectDevSession",
+        tags=["Dev sessions"],
+        response_model=DevSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_dev_session(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(
+            provider.inspect_dev_session(job_ref, dev_session_ref, credential)
+        )
+
+    @router.post(
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/renew",
+        operation_id="renewDevSession",
+        tags=["Dev sessions"],
+        response_model=DevSessionSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503),
+    )
+    def renew_dev_session(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: DevSessionRenewRequest,
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        result = provider.renew_dev_session(
+            job_ref, dev_session_ref, credential, payload
+        )
+        response = _json_model(result.snapshot)
+        response.headers["KCS-Dev-Session-Credential"] = result.credential or ""
+        return response
+
+    @router.delete(
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}",
+        operation_id="revokeDevSession",
+        tags=["Dev sessions"],
+        response_model=DevSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def revoke_dev_session(
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(provider.revoke_dev_session(job_ref, dev_session_ref, credential))
+
+    @router.get(
+        "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay",
+        operation_id="relayDevSession",
+        tags=["Dev sessions"],
+        response_class=Response,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def relay_dev_session(
+        request: Request,
+        job_ref: Annotated[str, ApiPath(alias="jobRef", pattern=_OPAQUE_REF_PATTERN)],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        path: Annotated[str, Query(min_length=1, max_length=4096, pattern=r"^/")],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        target = provider.dev_session_relay_target(
+            job_ref, dev_session_ref, credential, path
+        )
+        forward_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.casefold()
+            in {"accept", "accept-encoding", "accept-language", "range", "if-none-match", "if-modified-since", "user-agent"}
+        }
+        forward_headers["X-RC-Dev-Session-Credential"] = credential
+        try:
+            upstream = requests.get(
+                f"http://{target.host}:{target.port}{target.path}",
+                headers=forward_headers,
+                allow_redirects=False,
+                stream=True,
+                timeout=(3, 30),
+            )
+            upstream.raw.decode_content = False
+            body = upstream.raw.read(8 * 1024 * 1024 + 1)
+        except requests.RequestException as error:
+            raise DevSessionRelayDownError() from error
+        finally:
+            if "upstream" in locals():
+                upstream.close()
+        if len(body) > 8 * 1024 * 1024 or upstream.status_code in {401, 410, 429, 503}:
+            raise DevSessionRelayDownError()
+        headers = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.casefold() in _DEV_RELAY_RESPONSE_HEADERS
+        }
+        location = upstream.headers.get("Location")
+        if location:
+            parsed = urlsplit(location)
+            relocated = parsed.path or "/"
+            if parsed.query:
+                relocated += f"?{parsed.query}"
+            headers["Location"] = (
+                f"/api/v2/jobs/{quote(job_ref, safe='')}/dev-sessions/"
+                f"{quote(dev_session_ref, safe='')}/relay?path={quote(relocated, safe='')}"
+            )
+        headers["Cache-Control"] = "no-store"
+        media_type = headers.pop("Content-Type", headers.pop("content-type", None))
+        return Response(
+            content=body,
+            status_code=upstream.status_code,
+            media_type=media_type,
+            headers=headers,
+        )
 
     @router.post(
         "/api/v2/jobs",
@@ -1278,4 +1472,113 @@ def create_jobs_router(
     return router
 
 
-__all__ = ["V2Caller", "create_jobs_router"]
+def install_dev_session_websocket(
+    app: FastAPI,
+    provider: V2JobProvider,
+    service_token: str,
+) -> None:
+    """Install the WebSocket half of the frozen HTTP/upgrade relay route.
+
+    FastAPI's HTTP dependency stack doesn't run for WebSocket upgrades, so this
+    adapter repeats the same service-token check before resolving the exact Pod
+    binding.  The browser credential reaches only the private relay sidecar;
+    OpenVSCode itself still owns no KCS or ResearchCosmos credential.
+    """
+
+    expected_token = hashlib.sha256(service_token.encode("utf-8")).digest()
+
+    @app.websocket(
+        "/api/v2/jobs/{job_ref}/dev-sessions/{dev_session_ref}/relay",
+        name="relayDevSessionWebSocket",
+    )
+    async def relay_dev_session_websocket(
+        websocket: WebSocket,
+        job_ref: str,
+        dev_session_ref: str,
+    ) -> None:
+        authorization = websocket.headers.get("authorization", "")
+        scheme, separator, supplied_token = authorization.partition(" ")
+        authenticated = (
+            separator == " "
+            and scheme.casefold() == "bearer"
+            and hmac.compare_digest(
+                hashlib.sha256(supplied_token.encode("utf-8")).digest(),
+                expected_token,
+            )
+        )
+        credential = websocket.headers.get("kcs-dev-session-credential", "")
+        relay_path = websocket.query_params.get("path", "")
+        if not authenticated or not credential:
+            await websocket.close(code=4401, reason="unauthenticated")
+            return
+        if not relay_path.startswith("/") or len(relay_path) > 4096:
+            await websocket.close(code=4400, reason="invalid relay path")
+            return
+        try:
+            target = await asyncio.to_thread(
+                provider.dev_session_relay_target,
+                job_ref,
+                dev_session_ref,
+                credential,
+                relay_path,
+            )
+        except KcsV2Error as error:
+            await websocket.close(
+                code=4410 if error.status_code == 410 else 4403,
+                reason=error.code,
+            )
+            return
+
+        offered = websocket.headers.get("sec-websocket-protocol", "")
+        subprotocols = [item.strip() for item in offered.split(",") if item.strip()]
+        try:
+            async with websocket_connect(
+                f"ws://{target.host}:{target.port}{target.path}",
+                additional_headers={"X-RC-Dev-Session-Credential": credential},
+                subprotocols=subprotocols or None,
+                open_timeout=3,
+                close_timeout=3,
+                max_size=8 * 1024 * 1024,
+            ) as upstream:
+                await websocket.accept(subprotocol=upstream.subprotocol)
+
+                async def browser_to_relay() -> None:
+                    while True:
+                        message = await websocket.receive()
+                        kind = message.get("type")
+                        if kind == "websocket.disconnect":
+                            return
+                        if message.get("bytes") is not None:
+                            await upstream.send(message["bytes"])
+                        elif message.get("text") is not None:
+                            await upstream.send(message["text"])
+
+                async def relay_to_browser() -> None:
+                    async for message in upstream:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+
+                tasks = {
+                    asyncio.create_task(browser_to_relay()),
+                    asyncio.create_task(relay_to_browser()),
+                }
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
+        except (ConnectionClosed, DevSessionRelayDownError):
+            if websocket.client_state.name != "DISCONNECTED":
+                await websocket.close(code=1011, reason="relay disconnected")
+        except Exception:
+            log.exception("dev-session WebSocket relay failed jobRef=%s", job_ref)
+            if websocket.client_state.name != "DISCONNECTED":
+                await websocket.close(code=1013, reason="relay unavailable")
+
+
+__all__ = ["V2Caller", "create_jobs_router", "install_dev_session_websocket"]

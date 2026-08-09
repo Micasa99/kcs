@@ -193,7 +193,7 @@ def _create_v2_app(
 ) -> FastAPI:
     """Create only the private health and authenticated V2 Job surfaces."""
     from kcs.jobs.settings import V2RuntimeSettings
-    from kcs.server.routes import create_jobs_router
+    from kcs.server.routes import create_jobs_router, install_dev_session_websocket
 
     if settings is None:
         settings_environ = dict(os.environ)
@@ -215,7 +215,7 @@ def _create_v2_app(
     app = FastAPI(
         title="kcs V2 Attempt Runtime API",
         description="Isolated physical attempt runtime for ResearchCosmos.",
-        version="2.4.0",
+        version="2.5.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -303,6 +303,7 @@ def _create_v2_app(
         return response
 
     app.include_router(create_jobs_router(provider, resolved_token))
+    install_dev_session_websocket(app, provider, resolved_token)
     return app
 
 

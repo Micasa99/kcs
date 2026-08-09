@@ -70,6 +70,8 @@ class CoreV1Api(Protocol):
 
     def patch_namespaced_pod(self, *, name: str, namespace: str, body: Any) -> Any: ...
 
+    def patch_namespaced_secret(self, *, name: str, namespace: str, body: Any) -> Any: ...
+
     def create_namespaced_config_map(self, *, namespace: str, body: Any) -> Any: ...
 
     def read_namespaced_config_map(self, *, name: str, namespace: str) -> Any: ...
@@ -419,6 +421,19 @@ class V2KubeAdapter:
     def create_secret(self, body: Any) -> Any:
         return self._core.create_namespaced_secret(namespace=self.namespace, body=body)
 
+    def upsert_secret(self, name: str, body: Any) -> Any:
+        """Create or patch one fixed namespace-bound Secret slot."""
+        try:
+            return self._core.create_namespaced_secret(namespace=self.namespace, body=body)
+        except Exception as exc:
+            if _status(exc) != 409:
+                raise
+        return self._core.patch_namespaced_secret(
+            name=name,
+            namespace=self.namespace,
+            body=body,
+        )
+
     def read_secret(self, name: str) -> Any | None:
         """Observe one namespace-bound Secret, returning ``None`` only for a proven 404."""
         try:
@@ -449,6 +464,30 @@ class V2KubeAdapter:
             if attempt < 19:
                 time.sleep(0.05)
         return False
+
+    def pod_relay_endpoint(self, job_ref: str, pod_uid: str) -> tuple[str, int]:
+        """Return the exact bound Pod IP for the private M2 relay."""
+        pod = self._pod_with_uid(job_ref, pod_uid)
+        pod_ip = _value(_value(pod, "status"), "pod_ip") or _value(
+            _value(pod, "status"), "podIP"
+        )
+        if not isinstance(pod_ip, str) or not pod_ip:
+            raise DependencyUnavailableError("the bound Pod has no routable relay address")
+        return pod_ip, 8080
+
+    def pod_container_image_id(
+        self, job_ref: str, pod_uid: str, container: str
+    ) -> tuple[str | None, bool]:
+        pod = self._pod_with_uid(job_ref, pod_uid)
+        status = _value(pod, "status")
+        statuses = list(_value(status, "container_statuses") or ()) + list(
+            _value(status, "init_container_statuses") or ()
+        )
+        for item in statuses:
+            if _value(item, "name") == container:
+                image_id = _value(item, "image_id") or _value(item, "imageID")
+                return (str(image_id) if image_id else None, bool(_value(item, "ready")))
+        return None, False
 
     def exec_supervisor_rpc(
         self, binding: Mapping[str, str], container: str, command: list[str], frame: bytes

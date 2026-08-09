@@ -130,7 +130,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
 
     assert openapi["openapi"] == "3.1.0"
     assert openapi["info"]["version"] == "2.5.0"
-    assert openapi["x-kcs-contract-status"] == "dormant"
+    assert openapi["x-kcs-contract-status"] == "active"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {
         path: {method for method in item if method in {"get", "post", "put", "delete"}}

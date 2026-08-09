@@ -36,7 +36,7 @@ rules:
     verbs: ["create", "get", "list", "update", "delete"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "patch", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch"]

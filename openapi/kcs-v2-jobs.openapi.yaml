@@ -1,5 +1,5 @@
 openapi: 3.1.0
-x-kcs-contract-status: dormant
+x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
   version: 2.5.0
@@ -1827,6 +1827,17 @@ paths:
         upstream: http://127.0.0.1:3000
         binding: [namespace, jobRef, jobUid, podUid, generation, devSessionRef]
         credentialForwarding: forbidden
+        responseHeaderAllowlist:
+          - Content-Type
+          - Content-Encoding
+          - Content-Length
+          - Location
+          - ETag
+          - Last-Modified
+          - Cache-Control
+          - Vary
+          - Accept-Ranges
+        locationPolicy: same-relay-path-only
       x-kcs-error-codes: *DevSessionErrors
       responses:
         '101':
@@ -1837,7 +1848,11 @@ paths:
           description: Authenticated bounded HTTP response from the loopback OpenVSCode process.
           x-kcs-required-headers: [Cache-Control]
           headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
-          content: {application/octet-stream: {schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}}}
+          content:
+            application/octet-stream:
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}
+            '*/*':
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}
         '401': *NoStoreError
         '403': *NoStoreError
         '404': *NoStoreError

@@ -36,6 +36,8 @@ class V2RuntimeSettings:
     prometheus_timeout_seconds: float = 3.0
     event_db_path: Path = DEFAULT_EVENT_DB_PATH
     native_recipe_registry_path: Path | None = None
+    native_openvscode_image_volume: str | None = None
+    native_dev_session_relay_image: str | None = None
     model_gateway_openai_base_url: str | None = None
     model_gateway_anthropic_base_url: str | None = None
     native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
@@ -106,6 +108,22 @@ class V2RuntimeSettings:
         ):
             raise ValueError("KCS_V2_NATIVE_RECIPE_REGISTRY must be absolute")
 
+        native_openvscode_image_volume = _optional_image_digest(
+            environ.get("KCS_V2_OPENVSCODE_IMAGE_VOLUME"),
+            "KCS_V2_OPENVSCODE_IMAGE_VOLUME",
+        )
+        native_dev_session_relay_image = _optional_image_digest(
+            environ.get("KCS_V2_DEV_SESSION_RELAY_IMAGE"),
+            "KCS_V2_DEV_SESSION_RELAY_IMAGE",
+        )
+        if (native_openvscode_image_volume is None) != (
+            native_dev_session_relay_image is None
+        ):
+            raise ValueError(
+                "KCS_V2_OPENVSCODE_IMAGE_VOLUME and KCS_V2_DEV_SESSION_RELAY_IMAGE "
+                "must be configured together"
+            )
+
         openai_base = _optional_https_url(
             environ.get("KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL"),
             "KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL",
@@ -137,6 +155,8 @@ class V2RuntimeSettings:
             prometheus_timeout_seconds=prometheus_timeout_seconds,
             event_db_path=event_db_path,
             native_recipe_registry_path=native_recipe_registry_path,
+            native_openvscode_image_volume=native_openvscode_image_volume,
+            native_dev_session_relay_image=native_dev_session_relay_image,
             model_gateway_openai_base_url=openai_base,
             model_gateway_anthropic_base_url=anthropic_base,
             native_provision_seconds=native_provision_seconds,
@@ -159,6 +179,14 @@ def _optional_https_url(raw: str | None, name: str) -> str | None:
     ):
         raise ValueError(f"{name} must be an operator-controlled HTTPS URL")
     return raw.rstrip("/")
+
+
+def _optional_image_digest(raw: str | None, name: str) -> str | None:
+    if raw is None:
+        return None
+    if re.fullmatch(r".+@sha256:[0-9a-f]{64}", raw) is None:
+        raise ValueError(f"{name} must be an exact OCI image digest")
+    return raw
 
 
 def _bounded_seconds(raw: str, name: str) -> int:

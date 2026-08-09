@@ -9,6 +9,10 @@ _ROUTE_EXPORTS = {
     "clusters_router": ("kcs.server.routes.clusters", "router"),
     "containers_router": ("kcs.server.routes.containers", "router"),
     "create_jobs_router": ("kcs.server.routes.jobs", "create_jobs_router"),
+    "install_dev_session_websocket": (
+        "kcs.server.routes.jobs",
+        "install_dev_session_websocket",
+    ),
     "shell_proxy_router": ("kcs.server.routes.shell_proxy_routes", "router"),
     "shell_sessions_router": ("kcs.server.routes.shell_sessions", "router"),
     "system_router": ("kcs.server.routes.system", "router"),
@@ -33,4 +37,5 @@ __all__ = [
     "shell_proxy_router",
     "shell_sessions_router",
     "create_jobs_router",
+    "install_dev_session_websocket",
 ]

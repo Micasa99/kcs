@@ -92,6 +92,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
             observability=observability,
             hosted_admission=False,
+            openvscode_image_ref=settings.native_openvscode_image_volume,
         )
     return _v2_provider
 

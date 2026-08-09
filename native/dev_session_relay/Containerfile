@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.7
+ARG SOURCE_REVISION
+FROM --platform=linux/amd64 golang:1.23.12-bookworm@sha256:e87b2a5f6df2dff71ea330d55d54f4979eb380ae58a7e3aabc9d53121243e689 AS build
+ARG SOURCE_REVISION
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+WORKDIR /src
+COPY native/dev_session_relay/go.mod ./
+COPY native/dev_session_relay/*.go ./
+RUN test -n "$SOURCE_REVISION" \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./... \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/rc-dev-session-relay .
+
+FROM scratch
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/TitiSkywalker/kcs" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.licenses="MIT"
+COPY --from=build /out/rc-dev-session-relay /bin/rc-dev-session-relay
+USER 10002:10001
+ENTRYPOINT ["/bin/rc-dev-session-relay"]
