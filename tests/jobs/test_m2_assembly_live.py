@@ -225,12 +225,17 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
     sidecars = {item.name: item for item in pod.init_containers}
     assert sidecars["openvscode"].restart_policy == "Always"
     assert sidecars["relay"].restart_policy == "Always"
+    assert sidecars["openvscode"].security_context.run_as_user == 10002
+    assert sidecars["relay"].security_context.run_as_user == 0
+    assert sidecars["relay"].security_context.capabilities.drop == ["ALL"]
     assert all(
         mount.name != "rc-dev-session-credential" for mount in sidecars["openvscode"].volume_mounts
     )
     assert [mount.name for mount in sidecars["relay"].volume_mounts] == [
         "rc-dev-session-credential"
     ]
+    dev_credential = volumes["rc-dev-session-credential"]
+    assert dev_credential.secret.default_mode == 0o400
 
 
 def test_live_snapshot_rpc_is_immutable_bounded_and_releasable(tmp_path: Path) -> None:

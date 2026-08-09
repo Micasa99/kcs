@@ -528,7 +528,7 @@ class V2JobRenderer:
                         secret=client.V1SecretVolumeSource(
                             secret_name=dev_session_secret_name(job_ref),
                             optional=True,
-                            default_mode=0o440,
+                            default_mode=0o400,
                         ),
                     ),
                 ]
@@ -560,9 +560,21 @@ class V2JobRenderer:
         relay_image = self._settings.native_dev_session_relay_image
         if relay_image is None:
             raise PolicyViolationError("native dev-session relay image is not configured")
-        identity = client.V1SecurityContext(
+        terminal_identity = client.V1SecurityContext(
             run_as_user=10002,
             run_as_group=10001,
+            privileged=False,
+            allow_privilege_escalation=False,
+            read_only_root_filesystem=True,
+            capabilities=client.V1Capabilities(drop=["ALL"]),
+            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+        )
+        # The relay is the sole consumer of the root-owned 0400 session
+        # credential.  It has no workspace mount, no service-account token and
+        # no capabilities; OpenVSCode remains the unprivileged terminal user.
+        relay_identity = client.V1SecurityContext(
+            run_as_user=0,
+            run_as_group=0,
             privileged=False,
             allow_privilege_escalation=False,
             read_only_root_filesystem=True,
@@ -605,7 +617,7 @@ class V2JobRenderer:
                     requests={"cpu": "250m", "memory": "512Mi", "ephemeral-storage": "512Mi"},
                     limits={"cpu": "2", "memory": "2Gi", "ephemeral-storage": "2Gi"},
                 ),
-                security_context=identity,
+                security_context=terminal_identity,
                 restart_policy="Always",
                 volume_mounts=[
                     client.V1VolumeMount(name=WORKSPACE_VOLUME, mount_path="/workspace"),
@@ -638,7 +650,7 @@ class V2JobRenderer:
                     requests={"cpu": "50m", "memory": "32Mi", "ephemeral-storage": "32Mi"},
                     limits={"cpu": "250m", "memory": "128Mi", "ephemeral-storage": "128Mi"},
                 ),
-                security_context=identity,
+                security_context=relay_identity,
                 restart_policy="Always",
                 volume_mounts=[
                     client.V1VolumeMount(
