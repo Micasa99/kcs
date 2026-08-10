@@ -521,6 +521,7 @@ class V2JobProvider:
             openvscode_image_ref=openvscode_image_ref,
             binding_resolver=self._native_live_binding,
             clock=self._clock,
+            sleeper=self._sleeper,
         )
         self._native_metrics_lock = threading.Lock()
         self._native_recipe_forbidden_total = 0
