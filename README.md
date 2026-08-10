@@ -149,6 +149,15 @@ Skill/Tool activation, and explicit cursor-gap errors; it does not add another P
 or runtime fallback. Production activation remains an operator checkpoint. See
 `docs/v2-native-runner-m2-probe-evidence.md`.
 
+OpenAPI 2.6 adds the durable Project Workspace boundary without changing the
+Attempt evidence boundary. A Project owns one persistent Git history and CPU-only
+IDE service; every Attempt still receives an isolated checkout, produces its
+existing sealed `WorkspaceRevision`, and imports that revision as a new retained
+Project checkout. Project and Attempt never share a mutable `.git` directory or
+PVC. The active contract SHA-256 is
+`28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd`.
+See `docs/v2-project-workspace-handoff.md`.
+
 `scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation
 drives the normal, cancel, and UID-precondition Pod-loss branches and retains raw API,
 role-log, transfer, and operator-checkpoint evidence. It is valid only against the
