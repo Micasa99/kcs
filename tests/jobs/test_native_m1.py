@@ -8,10 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from kcs.jobs.canonical import canonical_digest
-from kcs.jobs.contracts import CreateJobRequest
+from kcs.jobs.contracts import CreateJobRequest, JobBindingState
 from kcs.jobs.errors import RuntimeRecipeForbiddenError
 from kcs.jobs.native_contracts import NativeCreateJobRequest, NativeRunnerGenerationSnapshot
-from kcs.jobs.provider import V2JobProvider, _native_post_ack_delivery_loss
+from kcs.jobs.provider import (
+    V2JobProvider,
+    _native_post_ack_delivery_loss,
+    _native_post_ack_runtime_loss,
+)
 from kcs.jobs.recipe_registry import (
     NativeRecipeRegistry,
     runtime_recipe_digest,
@@ -208,6 +212,33 @@ def test_post_ack_emptydir_eviction_is_output_loss_but_pre_ack_is_not() -> None:
     assert (
         _native_post_ack_delivery_loss(
             {"deliveryFailure": "emptydir_evicted"}, not_started
+        )
+        is None
+    )
+
+
+def test_post_ack_job_failure_is_runtime_loss_but_pre_ack_is_not() -> None:
+    payload = json.loads(
+        (ROOT / "openapi/native-fixtures/runner-generation.json").read_text()
+    )
+    started = NativeRunnerGenerationSnapshot.model_validate(payload)
+
+    assert (
+        _native_post_ack_runtime_loss(
+            JobBindingState.FAILED,
+            "BackoffLimitExceeded",
+            started,
+        )
+        == "BackoffLimitExceeded"
+    )
+
+    payload["credentialAcknowledgedAt"] = None
+    not_started = NativeRunnerGenerationSnapshot.model_validate(payload)
+    assert (
+        _native_post_ack_runtime_loss(
+            JobBindingState.FAILED,
+            "BackoffLimitExceeded",
+            not_started,
         )
         is None
     )

@@ -4915,6 +4915,23 @@ class V2JobProvider:
                 "native runtime delivery failed after runner start acknowledgment: "
                 f"{post_ack_delivery_loss}"
             )
+        post_ack_runtime_loss = _native_post_ack_runtime_loss(
+            binding_state,
+            binding_reason,
+            latest,
+        )
+        if post_ack_runtime_loss is not None:
+            # A native Job must remain alive after the child exits so RC can
+            # capture the workspace before finalize.  Therefore a failed Job
+            # after start ACK, with no capture barrier, is loss of the runtime
+            # substrate rather than an ordinary runner exit.  Preserve that
+            # uncertainty instead of leaving the durable generation "running"
+            # forever or reporting a deterministic failure.
+            binding_state = JobBindingState.INDETERMINATE
+            binding_reason = (
+                "native runtime disappeared after runner start acknowledgment: "
+                f"{post_ack_runtime_loss}"
+            )
         created_at = _as_datetime(_field(record, "created_at", None), observed_at)
         hard_seconds = int(
             _optional_path_text(
@@ -5032,6 +5049,7 @@ class V2JobProvider:
             ),
             "deleteAction": _not_requested_action().model_dump(mode="json", by_alias=True),
             "outputLossPossible": post_ack_delivery_loss is not None
+            or post_ack_runtime_loss is not None
             or replacement_reason is not None
             or deadline_payload["hardDeadlineTriggeredAt"] is not None,
             "cleanup": cleanup,
@@ -6126,6 +6144,20 @@ def _native_post_ack_delivery_loss(
     if failure not in {"enospc", "emptydir_evicted"}:
         return None
     return failure if generation.root.get("credentialAcknowledgedAt") is not None else None
+
+
+def _native_post_ack_runtime_loss(
+    binding_state: JobBindingState,
+    binding_reason: str | None,
+    generation: NativeRunnerGenerationSnapshot | None,
+) -> str | None:
+    """Classify a failed native Job after start ACK as possible output loss."""
+
+    if binding_state is not JobBindingState.FAILED or generation is None:
+        return None
+    if generation.root.get("credentialAcknowledgedAt") is None:
+        return None
+    return binding_reason or "job_failed"
 
 
 def _prometheus_counter_lines(
