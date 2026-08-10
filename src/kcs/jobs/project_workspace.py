@@ -1215,6 +1215,12 @@ class ProjectWorkspaceService:
                 "expires-at": base64.b64encode(
                     str(int(expires.timestamp())).encode("ascii")
                 ).decode("ascii"),
+                # The fixed Secret slot is patched in place so the long-lived
+                # Workspace Pod observes credential rotation without restart.
+                # Explicit null removes the revoke marker left by the previous
+                # session; omitting it would preserve that map key and every
+                # subsequent session would remain permanently revoked.
+                "revoked": None,
             },
         }
 
