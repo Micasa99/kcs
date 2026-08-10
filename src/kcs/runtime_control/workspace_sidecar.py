@@ -1798,17 +1798,20 @@ class RuntimeControlSidecar:
         )
         commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
         if os.geteuid() == 0:
-            for root, directories, files in os.walk(git_dir):
-                os.chown(root, _EXPERIMENT_UID, _EXPERIMENT_GID)
-                os.chmod(root, os.stat(root, follow_symlinks=False).st_mode | 0o2070)
-                for name in directories:
-                    path = Path(root) / name
-                    os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
-                    os.chmod(path, os.stat(path, follow_symlinks=False).st_mode | 0o2070)
+            # The control container intentionally runs without CAP_FOWNER.  Once a
+            # path is chowned to the experiment user, PID 1 can no longer chmod it.
+            # Walk bottom-up and apply mode before ownership so the whole repository
+            # is handed over atomically enough for the experiment process to use it.
+            for root, _directories, files in os.walk(git_dir, topdown=False):
                 for name in files:
                     path = Path(root) / name
+                    mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+                    os.chmod(path, mode | 0o060)
                     os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
-                    os.chmod(path, os.stat(path, follow_symlinks=False).st_mode | 0o060)
+                root_path = Path(root)
+                mode = stat.S_IMODE(os.stat(root_path, follow_symlinks=False).st_mode)
+                os.chmod(root_path, mode | 0o2070)
+                os.chown(root_path, _EXPERIMENT_UID, _EXPERIMENT_GID)
         return branch, commit
 
     def _create_project_workspace_snapshot(
