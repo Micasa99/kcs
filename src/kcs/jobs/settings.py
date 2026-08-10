@@ -39,8 +39,8 @@ class V2RuntimeSettings:
     native_capability_registry_path: Path | None = None
     native_openvscode_image_volume: str | None = None
     native_dev_session_relay_image: str | None = None
-    model_gateway_openai_base_url: str | None = None
-    model_gateway_anthropic_base_url: str | None = None
+    model_gateway_openai_base_urls: tuple[str, ...] = ()
+    model_gateway_anthropic_base_urls: tuple[str, ...] = ()
     native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
     native_capture_seconds: int = DEFAULT_NATIVE_CAPTURE_SECONDS
     native_finalize_seconds: int = DEFAULT_NATIVE_FINALIZE_SECONDS
@@ -134,11 +134,11 @@ class V2RuntimeSettings:
                 "must be configured together"
             )
 
-        openai_base = _optional_https_url(
+        openai_bases = _optional_https_urls(
             environ.get("KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL"),
             "KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL",
         )
-        anthropic_base = _optional_https_url(
+        anthropic_bases = _optional_https_urls(
             environ.get("KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL"),
             "KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL",
         )
@@ -168,28 +168,32 @@ class V2RuntimeSettings:
             native_capability_registry_path=native_capability_registry_path,
             native_openvscode_image_volume=native_openvscode_image_volume,
             native_dev_session_relay_image=native_dev_session_relay_image,
-            model_gateway_openai_base_url=openai_base,
-            model_gateway_anthropic_base_url=anthropic_base,
+            model_gateway_openai_base_urls=openai_bases,
+            model_gateway_anthropic_base_urls=anthropic_bases,
             native_provision_seconds=native_provision_seconds,
             native_capture_seconds=native_capture_seconds,
             native_finalize_seconds=native_finalize_seconds,
         )
 
 
-def _optional_https_url(raw: str | None, name: str) -> str | None:
+def _optional_https_urls(raw: str | None, name: str) -> tuple[str, ...]:
     if raw is None:
-        return None
-    parsed = urlsplit(raw)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(f"{name} must be an operator-controlled HTTPS URL")
-    return raw.rstrip("/")
+        return ()
+    values = tuple(value.strip().rstrip("/") for value in raw.split(",") if value.strip())
+    if not values or len(values) > 16 or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain 1 to 16 unique HTTPS URLs")
+    for value in values:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"{name} must contain operator-controlled HTTPS URLs")
+    return values
 
 
 def _optional_image_digest(raw: str | None, name: str) -> str | None:

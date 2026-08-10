@@ -666,14 +666,15 @@ class V2JobRenderer:
 
     def _validate_gateway(self, model_env: dict[str, str]) -> None:
         if (
-            self._settings.model_gateway_openai_base_url is None
-            or self._settings.model_gateway_anthropic_base_url is None
+            not self._settings.model_gateway_openai_base_urls
+            or not self._settings.model_gateway_anthropic_base_urls
         ):
             raise PolicyViolationError("native model gateway endpoints are not configured")
         if (
-            model_env["OPENAI_BASE_URL"].rstrip("/") != self._settings.model_gateway_openai_base_url
+            model_env["OPENAI_BASE_URL"].rstrip("/")
+            not in self._settings.model_gateway_openai_base_urls
             or model_env["ANTHROPIC_BASE_URL"].rstrip("/")
-            != self._settings.model_gateway_anthropic_base_url
+            not in self._settings.model_gateway_anthropic_base_urls
         ):
             raise PolicyViolationError("native model gateway endpoints differ from policy")
 

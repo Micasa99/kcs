@@ -117,8 +117,8 @@ def test_native_renderer_builds_only_runner_control_and_no_replacement(tmp_path:
         node_selector={"researchcosmos.io/pool": "gpu"},
         api_mode="v2",
         service_token=None,
-        model_gateway_openai_base_url="https://model-gateway.example/openai/v1",
-        model_gateway_anthropic_base_url="https://model-gateway.example/anthropic",
+        model_gateway_openai_base_urls=("https://model-gateway.example/openai/v1",),
+        model_gateway_anthropic_base_urls=("https://model-gateway.example/anthropic",),
     )
 
     job = V2JobRenderer(settings, _registry(tmp_path)).render(request)

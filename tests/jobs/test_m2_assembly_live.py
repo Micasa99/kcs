@@ -257,8 +257,8 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
         node_selector={"researchcosmos.io/pool": "gpu"},
         api_mode="v2",
         service_token=None,
-        model_gateway_openai_base_url="https://model-gateway.example/openai/v1",
-        model_gateway_anthropic_base_url="https://model-gateway.example/anthropic",
+        model_gateway_openai_base_urls=("https://model-gateway.example/openai/v1",),
+        model_gateway_anthropic_base_urls=("https://model-gateway.example/anthropic",),
         native_openvscode_image_volume=f"registry.example/openvscode@sha256:{'3' * 64}",
         native_dev_session_relay_image=f"registry.example/relay@sha256:{'4' * 64}",
     )

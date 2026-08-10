@@ -68,6 +68,31 @@ def test_settings_repr_never_discloses_the_service_token() -> None:
     assert "unit-test-placeholder" not in repr(settings)
 
 
+def test_settings_parse_exact_model_gateway_allowlists() -> None:
+    settings = V2RuntimeSettings.from_env(
+        {
+            "KCS_ENV": "test",
+            "KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL": (
+                "https://product.example/main/openai/v1,"
+                "https://product.example/test/openai/v1"
+            ),
+            "KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL": (
+                "https://product.example/main/anthropic,"
+                "https://product.example/test/anthropic"
+            ),
+        }
+    )
+
+    assert settings.model_gateway_openai_base_urls == (
+        "https://product.example/main/openai/v1",
+        "https://product.example/test/openai/v1",
+    )
+    assert settings.model_gateway_anthropic_base_urls == (
+        "https://product.example/main/anthropic",
+        "https://product.example/test/anthropic",
+    )
+
+
 @pytest.mark.parametrize(
     "selector",
     [
