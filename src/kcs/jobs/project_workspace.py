@@ -377,7 +377,7 @@ class ProjectWorkspaceRenderer:
                         run_as_group=0,
                         allow_privilege_escalation=False,
                         capabilities=client.V1Capabilities(
-                            drop=["ALL"], add=["CHOWN", "FOWNER"]
+                            drop=["ALL"], add=["CHOWN", "FOWNER", "DAC_OVERRIDE"]
                         ),
                         seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
                     ),
@@ -490,7 +490,15 @@ class ProjectWorkspaceRenderer:
                     ),
                     security_context=ide_identity,
                     readiness_probe=client.V1Probe(
-                        tcp_socket=client.V1TCPSocketAction(port=3000), period_seconds=3
+                        _exec=client.V1ExecAction(
+                            command=[
+                                "python",
+                                "-c",
+                                "import socket; "
+                                "socket.create_connection(('127.0.0.1', 3000), 1).close()",
+                            ]
+                        ),
+                        period_seconds=3,
                     ),
                     volume_mounts=[
                         workspace_mount,
@@ -562,7 +570,7 @@ class ProjectWorkspaceRenderer:
                     name=SESSION_VOLUME,
                     secret=client.V1SecretVolumeSource(
                         secret_name=project_session_secret_name(workspace_ref),
-                        optional=True,
+                        optional=False,
                         default_mode=0o400,
                     ),
                 ),
@@ -644,7 +652,7 @@ class ProjectWorkspaceService:
             "observedAt": now.isoformat(),
         }
         record, created = self._store.reserve_runtime(
-            "project-workspace", ref, ref, values
+            "project-workspace", ref, ref, values, owner_job_ref=False
         )
         if record.values.get("identityDigest") != request.request_digest:
             raise IdentityDigestConflict()
@@ -656,6 +664,24 @@ class ProjectWorkspaceService:
             except Exception as error:
                 if getattr(error, "status", None) != 409:
                     raise
+        session_secret_name = project_session_secret_name(ref)
+        if self._kube.read_secret(session_secret_name) is None:
+            self._kube.upsert_secret(
+                session_secret_name,
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": session_secret_name,
+                        "labels": {
+                            "researchcosmos.io/managed-by": MANAGED_BY,
+                            "researchcosmos.io/project-workspace-hash": _short_hash(ref, 16),
+                        },
+                    },
+                    "type": "Opaque",
+                    "data": {"revoked": ""},
+                },
+            )
         if self._kube.read_deployment(project_deployment_name(ref)) is None:
             try:
                 self._kube.create_deployment(self._renderer.deployment(ref))
@@ -759,7 +785,11 @@ class ProjectWorkspaceService:
             "observedAt": now.isoformat(),
         }
         record, created = self._store.reserve_runtime(
-            "project-dev-session", request.dev_session_ref, workspace_ref, values
+            "project-dev-session",
+            request.dev_session_ref,
+            workspace_ref,
+            values,
+            owner_job_ref=False,
         )
         if not created:
             retained = dict(record.values)
@@ -905,7 +935,11 @@ class ProjectWorkspaceService:
                 "createdAt": str(data["createdAt"]),
             }
             record, created = self._store.reserve_runtime(
-                "project-snapshot", request.snapshot_ref, workspace_ref, values
+                "project-snapshot",
+                request.snapshot_ref,
+                workspace_ref,
+                values,
+                owner_job_ref=False,
             )
             return self._tree_snapshot(record), created
         finally:
@@ -960,7 +994,11 @@ class ProjectWorkspaceService:
             "observedAt": now.isoformat(),
         }
         record, created = self._store.reserve_runtime(
-            "project-import", request.import_ref, workspace_ref, values
+            "project-import",
+            request.import_ref,
+            workspace_ref,
+            values,
+            owner_job_ref=False,
         )
         return self._import_snapshot(record), created
 

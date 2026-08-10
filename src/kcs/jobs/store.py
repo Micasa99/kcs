@@ -148,6 +148,7 @@ class RuntimeRecord:
     identity: str
     job_ref: str
     values: Mapping[str, str]
+    owner_job_ref: bool = True
     resource_version: str | None = None
     storage_name: str | None = None
 
@@ -472,7 +473,13 @@ class V2JobStore:
         return sorted(records, key=lambda item: (item.created_at, item.job_ref))
 
     def reserve_runtime(
-        self, kind: str, identity: str, job_ref: str, values: Mapping[str, str]
+        self,
+        kind: str,
+        identity: str,
+        job_ref: str,
+        values: Mapping[str, str],
+        *,
+        owner_job_ref: bool = True,
     ) -> tuple[RuntimeRecord, bool]:
         """Reserve one non-secret runtime identity before side effects."""
         existing = self.read_runtime(kind, job_ref, identity)
@@ -480,7 +487,13 @@ class V2JobStore:
             if existing.values.get("identityDigest") != values.get("identityDigest"):
                 raise IdentityDigestConflict()
             return existing, False
-        record = RuntimeRecord(kind=kind, identity=identity, job_ref=job_ref, values=dict(values))
+        record = RuntimeRecord(
+            kind=kind,
+            identity=identity,
+            job_ref=job_ref,
+            values=dict(values),
+            owner_job_ref=owner_job_ref,
+        )
         try:
             created = self._kube.create_config_map(_runtime_config_map_body(record))
         except Exception as exc:
@@ -611,6 +624,7 @@ class V2JobStore:
                 identity=identity,
                 job_ref=current.job_ref,
                 values=dict(values),
+                owner_job_ref=current.owner_job_ref,
                 resource_version=current.resource_version,
                 storage_name=current.storage_name,
             )
@@ -652,6 +666,7 @@ class V2JobStore:
             identity=identity,
             job_ref=current.job_ref,
             values=dict(values),
+            owner_job_ref=current.owner_job_ref,
             resource_version=current.resource_version,
             storage_name=storage_name,
         )
@@ -896,8 +911,10 @@ def _runtime_config_map_body(
             RECORD_KIND_LABEL: f"runtime-{record.kind}",
             JOB_REF_HASH_LABEL: _short_hash(record.job_ref),
         },
-        "ownerReferences": _runtime_owner_references(record),
     }
+    owner_references = _runtime_owner_references(record)
+    if owner_references:
+        metadata["ownerReferences"] = owner_references
     if resource_version is not None:
         metadata["resourceVersion"] = resource_version
     data = {
@@ -905,12 +922,15 @@ def _runtime_config_map_body(
         "kind": record.kind,
         "identity": record.identity,
         "jobRef": record.job_ref,
+        "ownerScope": "job" if record.owner_job_ref else "independent",
     }
     data.update(dict(record.values))
     return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata, "data": data}
 
 
 def _runtime_owner_references(record: RuntimeRecord) -> list[dict[str, object]]:
+    if not record.owner_job_ref:
+        return []
     job_uid = record.values.get("jobUid")
     if not job_uid:
         raise ValueError("runtime records require the bound Job UID")
@@ -934,13 +954,14 @@ def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:
     values = {
         key: value
         for key, value in data.items()
-        if key not in {"recordVersion", "kind", "identity", "jobRef"}
+        if key not in {"recordVersion", "kind", "identity", "jobRef", "ownerScope"}
     }
     return RuntimeRecord(
         kind=_required(data, "kind"),
         identity=_required(data, "identity"),
         job_ref=_required(data, "jobRef"),
         values=MappingProxyType(values),
+        owner_job_ref=data.get("ownerScope", "job") == "job",
         resource_version=_value(metadata, "resource_version")
         or _value(metadata, "resourceVersion"),
         storage_name=_value(metadata, "name"),
