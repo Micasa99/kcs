@@ -2931,7 +2931,13 @@ class V2JobProvider:
 
             try:
                 self._dev_sessions.revoke_for_job(job_ref, "native_finalize")
-                result = self._native.finalize(job_ref, binding, request, transfers_terminal)
+                result = self._native.finalize(
+                    job_ref,
+                    binding,
+                    request,
+                    transfers_terminal,
+                    lambda: self._native_control_shutdown_observed(job_ref, binding),
+                )
                 close.phase("succeeded", closed=True)
             except KcsV2Error:
                 close.phase("indeterminate")
@@ -4801,6 +4807,31 @@ class V2JobProvider:
             ),
             "podUid": str(pod_uid) if pod_uid is not None else "",
         }
+
+    def _native_control_shutdown_observed(
+        self, job_ref: str, binding: Mapping[str, Any]
+    ) -> bool:
+        """Prove a lost shutdown reply from the exact native Pod incarnation."""
+
+        job = self._read_job(job_ref)
+        if job is None or _required_text(job, "metadata", "uid") != str(binding["jobUid"]):
+            return False
+        matches = [
+            pod
+            for pod in self._list_job_pods(job_ref, str(binding["jobUid"]))
+            if _required_text(pod, "metadata", "uid") == str(binding["podUid"])
+        ]
+        if len(matches) != 1:
+            return False
+        status = _named_container_status(matches[0], "control")
+        if status is None:
+            return False
+        state, reason, exit_code, _started, _finished = _container_state(status)
+        return (
+            state is RoleState.TERMINATED
+            and exit_code == 0
+            and reason == "Completed"
+        )
 
     def _native_snapshot(
         self,

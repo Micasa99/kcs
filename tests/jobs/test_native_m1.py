@@ -249,3 +249,48 @@ def test_production_provider_refuses_new_hosted_jobs() -> None:
 
     with pytest.raises(RuntimeRecipeForbiddenError, match="hosted Job admission is retired"):
         provider.create(request)
+
+
+def test_lost_native_shutdown_reply_requires_exact_completed_control_incarnation() -> None:
+    class Kube:
+        pod_uid = "pod-native-001"
+        exit_code = 0
+
+        @staticmethod
+        def read_job(_job_ref: str) -> dict[str, object]:
+            return {"metadata": {"uid": "job-native-001"}}
+
+        @classmethod
+        def list_job_pods(cls, _job_ref: str, _job_uid: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "metadata": {"uid": cls.pod_uid},
+                    "status": {
+                        "container_statuses": [
+                            {
+                                "name": "control",
+                                "state": {
+                                    "terminated": {
+                                        "reason": "Completed",
+                                        "exit_code": cls.exit_code,
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+
+    provider = object.__new__(V2JobProvider)
+    provider._kube = Kube()
+    binding = {
+        "jobUid": "job-native-001",
+        "podUid": "pod-native-001",
+    }
+
+    assert provider._native_control_shutdown_observed("job-ref", binding) is True
+    Kube.pod_uid = "replacement-pod"
+    assert provider._native_control_shutdown_observed("job-ref", binding) is False
+    Kube.pod_uid = "pod-native-001"
+    Kube.exit_code = 1
+    assert provider._native_control_shutdown_observed("job-ref", binding) is False

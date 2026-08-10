@@ -584,6 +584,7 @@ class NativeRuntimeController:
         binding: Mapping[str, Any],
         request: NativeFinalizeJobRequest,
         transfers_terminal: Callable[[list[str]], bool],
+        control_shutdown_observed: Callable[[], bool] | None = None,
     ) -> NativeMutationResult:
         body = request.root
         barrier = body["spec"]["captureBarrier"]
@@ -673,7 +674,21 @@ class NativeRuntimeController:
                 if response.get("ok") is not True:
                     raise DependencyUnavailableError()
         except Exception as error:
-            raise DependencyUnavailableError("control sidecar did not finalize") from error
+            # The control sidecar commits the launcher receipt before replying,
+            # then exits after sending the reply. Kubernetes exec can therefore
+            # lose the response even though the exact control incarnation
+            # completed successfully. Adopt only that externally observed,
+            # identity-bound terminal fact; every ambiguous outcome keeps the
+            # existing retry_same behavior.
+            try:
+                adopted = bool(
+                    control_shutdown_observed is not None
+                    and control_shutdown_observed()
+                )
+            except Exception:
+                adopted = False
+            if not adopted:
+                raise DependencyUnavailableError("control sidecar did not finalize") from error
         payload.update(state="succeeded", observedAt=self._now().isoformat())
         record = self._store.update_runtime(
             "native-finalize",
