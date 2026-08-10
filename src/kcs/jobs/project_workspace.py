@@ -224,7 +224,13 @@ class RegisterProjectImportRequest(_WireModel):
     @model_validator(mode="after")
     def validate_digest(self) -> RegisterProjectImportRequest:
         if (
-            canonical_digest(self.spec.model_dump(mode="json", by_alias=True))
+            canonical_digest(
+                self.spec.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_unset=True,
+                )
+            )
             != self.request_digest
         ):
             raise ValueError("requestDigest does not match Project import spec")
