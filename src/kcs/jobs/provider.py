@@ -5091,7 +5091,16 @@ class V2JobProvider:
         native_spec = _field(spec_payload, "native", {})
         resources = dict(_field(native_spec, "resources", {}))
         delivery = recipe.root["delivery"]
-        active = bool(runner and control and runner["ready"] and control["ready"])
+        # Activation is a retained delivery fact, not a live readiness gauge.
+        # Once both runtime roles have started, a normal runner exit/finalize
+        # must not make the exact recipe receipt regress from ``active`` back
+        # to ``pending``. Delivery failures still take precedence below.
+        active = bool(
+            runner
+            and control
+            and runner.get("startedAt")
+            and control.get("startedAt")
+        )
         failure = _native_delivery_failure(pod)
         state = "failed" if failure != "none" else ("active" if active else "pending")
         if delivery["mode"] == "assembled":

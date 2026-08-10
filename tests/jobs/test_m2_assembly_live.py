@@ -160,6 +160,70 @@ def test_exact_assembly_survives_provider_restart_with_opaque_owner_lock(
     assert restored_plan.root == plan
 
 
+def test_recipe_activation_remains_active_after_runner_exit(tmp_path: Path) -> None:
+    resolver, _recipe_digest = _assembly_resolver(tmp_path)
+    provider = object.__new__(V2JobProvider)
+    provider._native_admitted_resources = lambda _pod: {
+        "cpuRequestMillis": 1000,
+        "cpuLimitMillis": 2000,
+        "memoryRequestMiB": 1024,
+        "memoryLimitMiB": 2048,
+        "ephemeralStorageRequestMiB": 2048,
+        "ephemeralStorageLimitMiB": 4096,
+        "accelerator": {"kind": "none", "count": 0},
+    }
+    record = SimpleNamespace(
+        job_ref="job-terminal-receipt",
+        job_uid="11111111-1111-4111-8111-111111111111",
+        spec_payload={
+            "native": {
+                "assemblyDigest": "a" * 64,
+                "resources": {
+                    "cpuMillis": 1000,
+                    "memoryMiB": 1024,
+                    "accelerator": {"kind": "none", "count": 0},
+                    "ephemeralStorageMiB": 2048,
+                },
+            }
+        },
+    )
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(uid="22222222-2222-4222-8222-222222222222"),
+        spec=SimpleNamespace(node_name="worker-1"),
+    )
+    observed = {
+        "cpuMillis": None,
+        "memoryMiB": None,
+        "peakEphemeralStorageMiB": None,
+        "acceleratorKind": None,
+        "acceleratorCount": None,
+    }
+    runner = {
+        "ready": False,
+        "startedAt": "2026-08-10T01:00:00+00:00",
+        "imageId": "runner@sha256:" + "1" * 64,
+        "observed": observed,
+    }
+    control = {
+        "ready": False,
+        "startedAt": "2026-08-10T01:00:01+00:00",
+        "imageId": "control@sha256:" + "2" * 64,
+    }
+
+    activation = provider._native_activation(
+        record,
+        pod,
+        runner,
+        control,
+        resolver._recipes.resolve(RUNNER_REF, ENVIRONMENT_REF),
+        NOW,
+    )
+
+    assert activation is not None
+    assert activation["state"] == "active"
+    assert activation["activatedAt"] == runner["startedAt"]
+
+
 def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
     tmp_path: Path,
 ) -> None:
