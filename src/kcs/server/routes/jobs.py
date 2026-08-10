@@ -94,6 +94,17 @@ from kcs.jobs.native_contracts import (
     RunnerStopSnapshot,
 )
 from kcs.jobs.native_runtime import RunnerCredentialGrantMetadata
+from kcs.jobs.project_workspace import (
+    CreateProjectSnapshotRequest,
+    EnsureProjectWorkspaceRequest,
+    ProjectDevSessionCreateRequest,
+    ProjectDevSessionRenewRequest,
+    ProjectDevSessionSnapshot,
+    ProjectImportSnapshot,
+    ProjectTreeSnapshot,
+    ProjectWorkspaceSnapshot,
+    RegisterProjectImportRequest,
+)
 from kcs.jobs.provider import (
     DEFAULT_LOG_LIMIT_BYTES,
     DEFAULT_PAGE_SIZE,
@@ -104,7 +115,7 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.5.0"
+API_VERSION = "2.6.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -332,6 +343,12 @@ async def _transfer_body_file(request: Request, content_length: int) -> Path:
 
 def _content_chunks(content: VerifiedContent) -> Iterator[bytes]:
     with content.path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            yield chunk
+
+
+def _file_chunks(path: Path) -> Iterator[bytes]:
+    with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             yield chunk
 
@@ -792,6 +809,331 @@ def create_jobs_router(
             headers=headers,
             background=BackgroundTask(upstream.close),
         )
+
+    @router.post(
+        "/api/v2/project-workspaces",
+        operation_id="ensureProjectWorkspace",
+        tags=["Project workspaces"],
+        status_code=201,
+        response_model=ProjectWorkspaceSnapshot,
+        responses=_error_responses(200, 400, 401, 403, 409, 415, 422, 429, 500, 503),
+    )
+    def ensure_project_workspace(payload: EnsureProjectWorkspaceRequest) -> Response:
+        result = provider.ensure_project_workspace(payload)
+        return _json_model(result.snapshot, status_code=201 if result.created else 200)
+
+    @router.get(
+        "/api/v2/project-workspaces/{workspaceRef}",
+        operation_id="inspectProjectWorkspace",
+        tags=["Project workspaces"],
+        response_model=ProjectWorkspaceSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 500, 503),
+    )
+    def inspect_project_workspace(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+    ) -> Response:
+        return _json_model(provider.inspect_project_workspace(workspace_ref))
+
+    @router.post(
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions",
+        operation_id="createProjectDevSession",
+        tags=["Project workspace sessions"],
+        status_code=201,
+        response_model=ProjectDevSessionSnapshot,
+        responses=_error_responses(
+            200, 400, 401, 403, 404, 409, 410, 415, 422, 500, 503
+        ),
+    )
+    def create_project_dev_session(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: ProjectDevSessionCreateRequest,
+    ) -> Response:
+        result = provider.create_project_dev_session(workspace_ref, payload)
+        response = _json_model(
+            result.snapshot, status_code=201 if result.created else 200
+        )
+        response.headers["KCS-Dev-Session-Credential"] = result.credential or ""
+        return response
+
+    @router.get(
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}",
+        operation_id="inspectProjectDevSession",
+        tags=["Project workspace sessions"],
+        response_model=ProjectDevSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def inspect_project_dev_session(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(
+            provider.inspect_project_dev_session(
+                workspace_ref, dev_session_ref, credential
+            )
+        )
+
+    @router.post(
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/renew",
+        operation_id="renewProjectDevSession",
+        tags=["Project workspace sessions"],
+        response_model=ProjectDevSessionSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 410, 415, 422, 500, 503),
+    )
+    def renew_project_dev_session(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: ProjectDevSessionRenewRequest,
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        result = provider.renew_project_dev_session(
+            workspace_ref, dev_session_ref, credential, payload
+        )
+        response = _json_model(result.snapshot)
+        response.headers["KCS-Dev-Session-Credential"] = result.credential or ""
+        return response
+
+    @router.delete(
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}",
+        operation_id="revokeProjectDevSession",
+        tags=["Project workspace sessions"],
+        response_model=ProjectDevSessionSnapshot,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def revoke_project_dev_session(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        return _json_model(
+            provider.revoke_project_dev_session(
+                workspace_ref, dev_session_ref, credential
+            )
+        )
+
+    @router.get(
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/relay",
+        operation_id="relayProjectDevSession",
+        tags=["Project workspace sessions"],
+        response_class=Response,
+        responses=_error_responses(401, 403, 404, 409, 410, 500, 503),
+    )
+    def relay_project_dev_session(
+        request: Request,
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        dev_session_ref: Annotated[
+            str, ApiPath(alias="devSessionRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        path: Annotated[str, Query(min_length=1, max_length=4096, pattern=r"^/")],
+        credential: Annotated[
+            str,
+            Header(
+                alias="KCS-Dev-Session-Credential",
+                min_length=32,
+                max_length=128,
+                pattern=_OPAQUE_TOKEN_PATTERN,
+            ),
+        ],
+    ) -> Response:
+        target = provider.project_dev_session_relay_target(
+            workspace_ref, dev_session_ref, credential, path
+        )
+        forward_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.casefold()
+            in {
+                "accept",
+                "accept-encoding",
+                "accept-language",
+                "range",
+                "if-none-match",
+                "if-modified-since",
+                "user-agent",
+            }
+        }
+        forward_headers["X-RC-Dev-Session-Credential"] = credential
+        try:
+            upstream = requests.get(
+                f"http://{target.host}:{target.port}{target.path}",
+                headers=forward_headers,
+                allow_redirects=False,
+                stream=True,
+                timeout=(3, 30),
+            )
+            upstream.raw.decode_content = False
+        except requests.RequestException as error:
+            raise DevSessionRelayDownError() from error
+        if upstream.status_code in {401, 410, 429, 503}:
+            upstream.close()
+            raise DevSessionRelayDownError()
+        provider.observe_project_dev_session_relay_ready(
+            workspace_ref, dev_session_ref, credential
+        )
+        headers = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.casefold() in _DEV_RELAY_RESPONSE_HEADERS
+        }
+        location = upstream.headers.get("Location")
+        if location:
+            parsed = urlsplit(location)
+            relocated = parsed.path or "/"
+            if parsed.query:
+                relocated += f"?{parsed.query}"
+            headers["Location"] = (
+                f"/api/v2/project-workspaces/{quote(workspace_ref, safe='')}/"
+                f"dev-sessions/{quote(dev_session_ref, safe='')}/relay?"
+                f"path={quote(relocated, safe='')}"
+            )
+        headers["Cache-Control"] = "no-store"
+        media_type = headers.pop("Content-Type", headers.pop("content-type", None))
+
+        def relay_chunks() -> Iterator[bytes]:
+            try:
+                yield from upstream.raw.stream(64 * 1024, decode_content=False)
+            finally:
+                upstream.close()
+
+        return StreamingResponse(
+            relay_chunks(),
+            status_code=upstream.status_code,
+            media_type=media_type,
+            headers=headers,
+            background=BackgroundTask(upstream.close),
+        )
+
+    @router.post(
+        "/api/v2/project-workspaces/{workspaceRef}/snapshots",
+        operation_id="createProjectWorkspaceSnapshot",
+        tags=["Project workspace snapshots"],
+        status_code=201,
+        response_model=ProjectTreeSnapshot,
+        responses=_error_responses(
+            200, 400, 401, 403, 404, 409, 413, 415, 422, 500, 503
+        ),
+    )
+    def create_project_workspace_snapshot(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: CreateProjectSnapshotRequest,
+    ) -> Response:
+        snapshot, created = provider.create_project_snapshot(workspace_ref, payload)
+        return _json_model(snapshot, status_code=201 if created else 200)
+
+    @router.get(
+        "/api/v2/project-workspaces/{workspaceRef}/snapshots/{snapshotRef}/content",
+        operation_id="readProjectWorkspaceSnapshotContent",
+        tags=["Project workspace snapshots"],
+        response_class=Response,
+        responses=_error_responses(401, 403, 404, 409, 413, 500, 503),
+    )
+    def read_project_workspace_snapshot_content(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        snapshot_ref: Annotated[
+            str, ApiPath(alias="snapshotRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+    ) -> Response:
+        content = provider.open_project_snapshot_content(workspace_ref, snapshot_ref)
+        return StreamingResponse(
+            _file_chunks(content.path),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Length": str(content.size),
+                "KCS-Content-SHA256": content.sha256,
+            },
+            background=BackgroundTask(content.cleanup),
+        )
+
+    @router.post(
+        "/api/v2/project-workspaces/{workspaceRef}/imports",
+        operation_id="registerProjectWorkspaceImport",
+        tags=["Project workspace snapshots"],
+        status_code=201,
+        response_model=ProjectImportSnapshot,
+        responses=_error_responses(200, 400, 401, 403, 404, 409, 415, 422, 500, 503),
+    )
+    def register_project_workspace_import(
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        payload: RegisterProjectImportRequest,
+    ) -> Response:
+        snapshot, created = provider.register_project_import(workspace_ref, payload)
+        return _json_model(snapshot, status_code=201 if created else 200)
+
+    @router.put(
+        "/api/v2/project-workspaces/{workspaceRef}/imports/{importRef}/content",
+        operation_id="putProjectWorkspaceImportContent",
+        tags=["Project workspace snapshots"],
+        response_model=ProjectImportSnapshot,
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 415, 422, 500, 503),
+    )
+    async def put_project_workspace_import_content(
+        request: Request,
+        workspace_ref: Annotated[
+            str, ApiPath(alias="workspaceRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        import_ref: Annotated[
+            str, ApiPath(alias="importRef", pattern=_OPAQUE_REF_PATTERN)
+        ],
+        content_length: Annotated[
+            int, Header(alias="Content-Length", ge=1, le=134217728)
+        ],
+    ) -> Response:
+        content = await _transfer_body_file(request, content_length)
+        try:
+            return _json_model(
+                provider.put_project_import(workspace_ref, import_ref, content)
+            )
+        finally:
+            content.unlink(missing_ok=True)
 
     @router.post(
         "/api/v2/jobs",
@@ -1746,4 +2088,121 @@ def install_dev_session_websocket(
                 await websocket.close(code=1013, reason="relay unavailable")
 
 
-__all__ = ["V2Caller", "create_jobs_router", "install_dev_session_websocket"]
+def install_project_dev_session_websocket(
+    app: FastAPI,
+    provider: V2JobProvider,
+    service_token: str,
+) -> None:
+    """Install the Project Workspace IDE WebSocket relay on the frozen HTTP path."""
+
+    expected_token = hashlib.sha256(service_token.encode("utf-8")).digest()
+
+    @app.websocket(
+        "/api/v2/project-workspaces/{workspace_ref}/dev-sessions/"
+        "{dev_session_ref}/relay",
+        name="relayProjectDevSessionWebSocket",
+    )
+    async def relay_project_dev_session_websocket(
+        websocket: WebSocket,
+        workspace_ref: str,
+        dev_session_ref: str,
+    ) -> None:
+        authorization = websocket.headers.get("authorization", "")
+        scheme, separator, supplied_token = authorization.partition(" ")
+        authenticated = (
+            separator == " "
+            and scheme.casefold() == "bearer"
+            and hmac.compare_digest(
+                hashlib.sha256(supplied_token.encode("utf-8")).digest(),
+                expected_token,
+            )
+        )
+        credential = websocket.headers.get("kcs-dev-session-credential", "")
+        relay_path = websocket.query_params.get("path", "")
+        if not authenticated or not credential:
+            await websocket.close(code=4401, reason="unauthenticated")
+            return
+        if not relay_path.startswith("/") or len(relay_path) > 4096:
+            await websocket.close(code=4400, reason="invalid relay path")
+            return
+        try:
+            target = await asyncio.to_thread(
+                provider.project_dev_session_relay_target,
+                workspace_ref,
+                dev_session_ref,
+                credential,
+                relay_path,
+            )
+        except KcsV2Error as error:
+            await websocket.close(
+                code=4410 if error.status_code == 410 else 4403,
+                reason=error.code,
+            )
+            return
+
+        offered = websocket.headers.get("sec-websocket-protocol", "")
+        subprotocols = [item.strip() for item in offered.split(",") if item.strip()]
+        try:
+            async with websocket_connect(
+                f"ws://{target.host}:{target.port}{target.path}",
+                additional_headers={"X-RC-Dev-Session-Credential": credential},
+                subprotocols=subprotocols or None,
+                open_timeout=3,
+                close_timeout=3,
+                max_size=8 * 1024 * 1024,
+            ) as upstream:
+                await asyncio.to_thread(
+                    provider.observe_project_dev_session_relay_ready,
+                    workspace_ref,
+                    dev_session_ref,
+                    credential,
+                )
+                await websocket.accept(subprotocol=upstream.subprotocol)
+
+                async def browser_to_relay() -> None:
+                    while True:
+                        message = await websocket.receive()
+                        if message.get("type") == "websocket.disconnect":
+                            return
+                        if message.get("bytes") is not None:
+                            await upstream.send(message["bytes"])
+                        elif message.get("text") is not None:
+                            await upstream.send(message["text"])
+
+                async def relay_to_browser() -> None:
+                    async for message in upstream:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+
+                tasks = {
+                    asyncio.create_task(browser_to_relay()),
+                    asyncio.create_task(relay_to_browser()),
+                }
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
+        except (ConnectionClosed, DevSessionRelayDownError):
+            if websocket.client_state.name != "DISCONNECTED":
+                await websocket.close(code=1011, reason="relay disconnected")
+        except Exception:
+            log.exception(
+                "Project dev-session WebSocket relay failed workspaceRef=%s",
+                workspace_ref,
+            )
+            if websocket.client_state.name != "DISCONNECTED":
+                await websocket.close(code=1013, reason="relay unavailable")
+
+
+__all__ = [
+    "V2Caller",
+    "create_jobs_router",
+    "install_dev_session_websocket",
+    "install_project_dev_session_websocket",
+]

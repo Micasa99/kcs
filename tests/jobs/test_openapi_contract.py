@@ -51,6 +51,16 @@ EXPECTED_PATHS = {
     "/api/v2/jobs/{jobRef}/operations/{operationRef}",
     "/api/v2/jobs/{jobRef}/finalize",
     "/api/v2/jobs/{jobRef}/cancel",
+    "/api/v2/project-workspaces",
+    "/api/v2/project-workspaces/{workspaceRef}",
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions",
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}",
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/renew",
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/relay",
+    "/api/v2/project-workspaces/{workspaceRef}/snapshots",
+    "/api/v2/project-workspaces/{workspaceRef}/snapshots/{snapshotRef}/content",
+    "/api/v2/project-workspaces/{workspaceRef}/imports",
+    "/api/v2/project-workspaces/{workspaceRef}/imports/{importRef}/content",
     "/api/v2/openapi.json",
 }
 EXPECTED_OPERATIONS = {
@@ -93,6 +103,23 @@ EXPECTED_OPERATIONS = {
     "/api/v2/jobs/{jobRef}/operations/{operationRef}": {"get"},
     "/api/v2/jobs/{jobRef}/finalize": {"post"},
     "/api/v2/jobs/{jobRef}/cancel": {"post"},
+    "/api/v2/project-workspaces": {"post"},
+    "/api/v2/project-workspaces/{workspaceRef}": {"get"},
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions": {"post"},
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}": {
+        "get",
+        "delete",
+    },
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/renew": {
+        "post"
+    },
+    "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/relay": {
+        "get"
+    },
+    "/api/v2/project-workspaces/{workspaceRef}/snapshots": {"post"},
+    "/api/v2/project-workspaces/{workspaceRef}/snapshots/{snapshotRef}/content": {"get"},
+    "/api/v2/project-workspaces/{workspaceRef}/imports": {"post"},
+    "/api/v2/project-workspaces/{workspaceRef}/imports/{importRef}/content": {"put"},
     "/api/v2/openapi.json": {"get"},
 }
 EXPECTED_ERROR_STATUSES = {
@@ -129,7 +156,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.5.0"
+    assert openapi["info"]["version"] == "2.6.0"
     assert openapi["x-kcs-contract-status"] == "active"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {

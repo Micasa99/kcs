@@ -81,6 +81,17 @@ NO_STORE_OPERATION_IDS = {
     "renewDevSession",
     "revokeDevSession",
     "relayDevSession",
+    "ensureProjectWorkspace",
+    "inspectProjectWorkspace",
+    "createProjectDevSession",
+    "inspectProjectDevSession",
+    "renewProjectDevSession",
+    "revokeProjectDevSession",
+    "relayProjectDevSession",
+    "createProjectWorkspaceSnapshot",
+    "readProjectWorkspaceSnapshotContent",
+    "registerProjectWorkspaceImport",
+    "putProjectWorkspaceImportContent",
 }
 MUTATION_OPERATION_IDS = {
     "createJob",
@@ -101,6 +112,11 @@ MUTATION_OPERATION_IDS = {
     "createLiveWorkspaceSnapshot",
     "createDevSession",
     "renewDevSession",
+    "ensureProjectWorkspace",
+    "createProjectDevSession",
+    "renewProjectDevSession",
+    "createProjectWorkspaceSnapshot",
+    "registerProjectWorkspaceImport",
 }
 OPERATION_AUTHORIZATION = {
     "getCapacity": "v2-reader",
@@ -150,6 +166,17 @@ OPERATION_AUTHORIZATION = {
     "renewDevSession": "v2-mutator",
     "revokeDevSession": "v2-mutator",
     "relayDevSession": "v2-reader",
+    "ensureProjectWorkspace": "v2-mutator",
+    "inspectProjectWorkspace": "v2-reader",
+    "createProjectDevSession": "v2-mutator",
+    "inspectProjectDevSession": "v2-reader",
+    "renewProjectDevSession": "v2-mutator",
+    "revokeProjectDevSession": "v2-mutator",
+    "relayProjectDevSession": "v2-reader",
+    "createProjectWorkspaceSnapshot": "v2-mutator",
+    "readProjectWorkspaceSnapshotContent": "v2-reader",
+    "registerProjectWorkspaceImport": "v2-mutator",
+    "putProjectWorkspaceImportContent": "v2-mutator",
 }
 EXPECTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
@@ -265,6 +292,44 @@ EXPECTED_OPERATION_LOCATIONS = {
         "get",
         "/api/v2/jobs/{jobRef}/dev-sessions/{devSessionRef}/relay",
     ),
+    "ensureProjectWorkspace": ("post", "/api/v2/project-workspaces"),
+    "inspectProjectWorkspace": ("get", "/api/v2/project-workspaces/{workspaceRef}"),
+    "createProjectDevSession": (
+        "post",
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions",
+    ),
+    "inspectProjectDevSession": (
+        "get",
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}",
+    ),
+    "renewProjectDevSession": (
+        "post",
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/renew",
+    ),
+    "revokeProjectDevSession": (
+        "delete",
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}",
+    ),
+    "relayProjectDevSession": (
+        "get",
+        "/api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/relay",
+    ),
+    "createProjectWorkspaceSnapshot": (
+        "post",
+        "/api/v2/project-workspaces/{workspaceRef}/snapshots",
+    ),
+    "readProjectWorkspaceSnapshotContent": (
+        "get",
+        "/api/v2/project-workspaces/{workspaceRef}/snapshots/{snapshotRef}/content",
+    ),
+    "registerProjectWorkspaceImport": (
+        "post",
+        "/api/v2/project-workspaces/{workspaceRef}/imports",
+    ),
+    "putProjectWorkspaceImportContent": (
+        "put",
+        "/api/v2/project-workspaces/{workspaceRef}/imports/{importRef}/content",
+    ),
 }
 EXPECTED_ROOT_FEATURES = {
     "transferModes": ["direct"],
@@ -273,6 +338,7 @@ EXPECTED_ROOT_FEATURES = {
     "nativeRunner": True,
     "liveWorkspaceSnapshots": True,
     "devSessionRelay": "openvscode",
+    "durableProjectWorkspace": True,
     "exactCapabilityActivation": True,
     "runtimeRecipeDeliveryModes": ["assembled", "prebuilt"],
     "runtimeRecipeDeliveryDefault": "assembled.imageVolume",
@@ -300,9 +366,11 @@ EXPECTED_ROOT_LIMITS = {
     "liveSnapshotTtlMaximumSeconds": 300,
     "devSessionTtlMaximumSeconds": 900,
     "devSessionMaximumConnections": 4,
+    "projectWorkspaceBundleBytes": 134217728,
+    "projectWorkspaceMaximumFiles": 4096,
 }
-CANONICAL_X_KCS_POLICY_SHA256 = "1c460cfdb04310492e555bdb8e4a39c0663ff7bc60fe09111cb168d3b909170e"
-CANONICAL_OPENAPI_SHA256 = "89fe3c925c1b5f8d97d60b3fb3998e0ac361a4c0fea30dc3d377e9b89d8089e9"
+CANONICAL_X_KCS_POLICY_SHA256 = "1f3bd1f1b4bb1c126e04ca000c9a98175924cdf787a13e3de87a3649ad59f07f"
+CANONICAL_OPENAPI_SHA256 = "28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -896,7 +964,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.5.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.6.0"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -3060,8 +3128,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.5.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.5.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.6.0":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.6.0")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")

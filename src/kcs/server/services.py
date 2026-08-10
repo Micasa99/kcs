@@ -54,6 +54,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
 
         from kcs.jobs.kube import V2KubeAdapter
         from kcs.jobs.observability import EventStore, PrometheusClient, V2Observability
+        from kcs.jobs.project_workspace import ProjectWorkspaceService
         from kcs.jobs.provider import V2JobProvider
         from kcs.jobs.recipe_registry import NativeRecipeRegistry
         from kcs.jobs.renderer import V2JobRenderer
@@ -69,10 +70,12 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
         config.load_incluster_config()
         batch_api = client.BatchV1Api(api_client=client.ApiClient())
         core_api = client.CoreV1Api(api_client=client.ApiClient())
+        apps_api = client.AppsV1Api(api_client=client.ApiClient())
         kube = V2KubeAdapter(
             settings.namespace,
             batch_api,
             core_api,
+            apps_api=apps_api,
             metrics_api=client.CustomObjectsApi(api_client=client.ApiClient()),
             # kubernetes.stream.stream temporarily replaces its ApiClient's
             # request transport with a websocket transport.  A fresh client
@@ -94,17 +97,23 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             recipes,
             NativeCapabilityRegistry(settings.native_capability_registry_path),
         )
+        store = V2JobStore(kube)
+        workspace_transport = ExecWorkspaceRpcTransport(kube.exec_workspace_rpc)
+        project_workspaces = ProjectWorkspaceService(
+            store, kube, workspace_transport, settings
+        )
         _v2_provider = V2JobProvider(
             kube,
-            V2JobStore(kube),
+            store,
             renderer,
             namespace=settings.namespace,
             transport=ExecRpcTransport(kube.exec_supervisor_rpc),
-            workspace_transport=ExecWorkspaceRpcTransport(kube.exec_workspace_rpc),
+            workspace_transport=workspace_transport,
             observability=observability,
             hosted_admission=False,
             openvscode_image_ref=settings.native_openvscode_image_volume,
             runtime_assembly_resolver=assembly_resolver,
+            project_workspaces=project_workspaces,
         )
     return _v2_provider
 

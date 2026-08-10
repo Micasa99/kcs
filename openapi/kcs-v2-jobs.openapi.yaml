@@ -2,7 +2,7 @@ openapi: 3.1.0
 x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
-  version: 2.5.0
+  version: 2.6.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -13,6 +13,7 @@ info:
     nativeRunner: true
     liveWorkspaceSnapshots: true
     devSessionRelay: openvscode
+    durableProjectWorkspace: true
     exactCapabilityActivation: true
     runtimeRecipeDeliveryModes: [assembled, prebuilt]
     runtimeRecipeDeliveryDefault: assembled.imageVolume
@@ -39,6 +40,8 @@ info:
     liveSnapshotTtlMaximumSeconds: 300
     devSessionTtlMaximumSeconds: 900
     devSessionMaximumConnections: 4
+    projectWorkspaceBundleBytes: 134217728
+    projectWorkspaceMaximumFiles: 4096
 x-kcs-legacy-authorization:
   v2NamespaceAccess: denied
   podsExec: denied
@@ -62,6 +65,9 @@ tags:
   - {name: Workspace terminal}
   - {name: Live workspace}
   - {name: Dev sessions}
+  - {name: Project workspaces}
+  - {name: Project workspace sessions}
+  - {name: Project workspace snapshots}
   - {name: Cluster observations}
   - {name: Contract}
 paths:
@@ -833,6 +839,7 @@ paths:
         FORBIDDEN: {status: 403, recoveryAction: none}
         CAPABILITY_ACTIVATION_INCOMPATIBLE: {status: 422, recoveryAction: none}
         DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
         INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
         DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
       requestBody:
@@ -849,6 +856,7 @@ paths:
         '400': *NoStoreError
         '401': *NoStoreError
         '403': *NoStoreError
+        '415': *NoStoreError
         '422': *NoStoreError
         '500': *NoStoreError
         '503': *NoStoreError
@@ -1860,6 +1868,422 @@ paths:
         '410': *NoStoreError
         '500': *NoStoreError
         '503': *NoStoreError
+  /api/v2/project-workspaces:
+    post:
+      tags: [Project workspaces]
+      operationId: ensureProjectWorkspace
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: &ProjectWorkspaceErrors
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: retry_same}
+        PAYLOAD_TOO_LARGE: {status: 413, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        MATERIALIZATION_FAILED: {status: 422, recoveryAction: retry_same}
+        QUOTA_EXCEEDED: {status: 429, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+        STORAGE_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: [{in: body, name: workspaceRef}]
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: none
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EnsureProjectWorkspaceRequest'}}}
+      responses:
+        '201': &ProjectWorkspaceReady
+          description: Durable CPU-only Project Workspace was created.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectWorkspaceSnapshot'}}}
+        '200': *ProjectWorkspaceReady
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+    get:
+      tags: [Project workspaces]
+      operationId: inspectProjectWorkspace
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: *ProjectWorkspaceErrors
+      responses:
+        '200': *ProjectWorkspaceReady
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/dev-sessions:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+    post:
+      tags: [Project workspace sessions]
+      operationId: createProjectDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: &ProjectSessionErrors
+        INVALID_REQUEST: {status: 400, recoveryAction: none}
+        UNAUTHENTICATED: {status: 401, recoveryAction: none}
+        DEV_SESSION_CREDENTIAL_INVALID: {status: 401, recoveryAction: none}
+        FORBIDDEN: {status: 403, recoveryAction: none}
+        NOT_FOUND: {status: 404, recoveryAction: none}
+        IDENTITY_CONFLICT: {status: 409, recoveryAction: none}
+        STALE_BINDING: {status: 409, recoveryAction: reattach}
+        DEV_SESSION_EXPIRED: {status: 410, recoveryAction: reattach}
+        DEV_SESSION_REVOKED: {status: 410, recoveryAction: none}
+        UNSUPPORTED_MEDIA_TYPE: {status: 415, recoveryAction: none}
+        DIGEST_MISMATCH: {status: 422, recoveryAction: none}
+        INTERNAL_ERROR: {status: 500, recoveryAction: reconcile}
+        DEV_SESSION_RELAY_DOWN: {status: 503, recoveryAction: retry_same}
+        DEPENDENCY_UNAVAILABLE: {status: 503, recoveryAction: retry_same}
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: workspaceRef}
+          - {in: body, name: devSessionRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: none
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ProjectDevSessionCreateRequest'}}}
+      responses:
+        '201': &ProjectSessionCreated
+          description: Scoped Project Workspace IDE session; credential is returned only in this header.
+          x-kcs-required-headers: [Cache-Control, KCS-Dev-Session-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Dev-Session-Credential: {$ref: '#/components/headers/DevSessionCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectDevSessionSnapshot'}}}
+        '200': *ProjectSessionCreated
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+    get:
+      tags: [Project workspace sessions]
+      operationId: inspectProjectDevSession
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: *ProjectSessionErrors
+      responses: &ProjectSessionSnapshotResponses
+        '200':
+          description: Non-secret session state bound to one exact Workspace Pod incarnation.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectDevSessionSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+    delete:
+      tags: [Project workspace sessions]
+      operationId: revokeProjectDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: *ProjectSessionErrors
+      responses: *ProjectSessionSnapshotResponses
+  /api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/renew:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+    post:
+      tags: [Project workspace sessions]
+      operationId: renewProjectDevSession
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-error-codes: *ProjectSessionErrors
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: workspaceRef}
+          - {in: path, name: devSessionRef}
+          - {in: body, name: renewRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 200
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: none
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ProjectDevSessionRenewRequest'}}}
+      responses:
+        '200':
+          description: Project Workspace session lease renewed and credential rotated.
+          x-kcs-required-headers: [Cache-Control, KCS-Dev-Session-Credential]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            KCS-Dev-Session-Credential: {$ref: '#/components/headers/DevSessionCredential'}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectDevSessionSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/dev-sessions/{devSessionRef}/relay:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+      - {$ref: '#/components/parameters/DevSessionRef'}
+      - {$ref: '#/components/parameters/DevSessionCredential'}
+      - {$ref: '#/components/parameters/DevSessionRelayPath'}
+    get:
+      tags: [Project workspace sessions]
+      operationId: relayProjectDevSession
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-redact-headers: [Authorization, KCS-Dev-Session-Credential]
+      x-kcs-websocket-relay:
+        upstream: http://127.0.0.1:3000
+        binding: [namespace, workspaceRef, generation, podUid, devSessionRef]
+        credentialForwarding: forbidden
+        locationPolicy: same-relay-path-only
+      x-kcs-error-codes: *ProjectSessionErrors
+      responses:
+        '101':
+          description: Authenticated WebSocket upgrade to Project OpenVSCode.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+        '200':
+          description: Authenticated bounded HTTP response from Project OpenVSCode.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content:
+            application/octet-stream:
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}
+            '*/*':
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 8388608}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '410': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/snapshots:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+    post:
+      tags: [Project workspace snapshots]
+      operationId: createProjectWorkspaceSnapshot
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: *ProjectWorkspaceErrors
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: workspaceRef}
+          - {in: body, name: snapshotRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: none
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateProjectSnapshotRequest'}}}
+      responses:
+        '201': &ProjectSnapshotReady
+          description: Immutable exact Project tree export and Git receipt.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectTreeSnapshot'}}}
+        '200': *ProjectSnapshotReady
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/snapshots/{snapshotRef}/content:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+      - {$ref: '#/components/parameters/SnapshotRef'}
+    get:
+      tags: [Project workspace snapshots]
+      operationId: readProjectWorkspaceSnapshotContent
+      x-kcs-service-authorization: v2-reader
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: *ProjectWorkspaceErrors
+      responses:
+        '200':
+          description: Exact bounded Project snapshot bundle.
+          x-kcs-required-headers: [Cache-Control, Content-Length, KCS-Content-SHA256]
+          headers:
+            Cache-Control: {$ref: '#/components/headers/NoStore'}
+            Content-Length: {schema: {type: integer, minimum: 1, maximum: 134217728}}
+            KCS-Content-SHA256: {$ref: '#/components/headers/ContentSha256'}
+          content:
+            application/octet-stream:
+              schema: {type: string, contentMediaType: application/octet-stream, maxLength: 134217728}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/imports:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+    post:
+      tags: [Project workspace snapshots]
+      operationId: registerProjectWorkspaceImport
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-error-codes: *ProjectWorkspaceErrors
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          - {in: path, name: workspaceRef}
+          - {in: body, name: importRef}
+        digest: requestDigest
+        digestLocation: body
+        projection: {source: requestBody, field: spec}
+      x-kcs-replay:
+        newStatus: 201
+        replayStatus: 200
+        conflictStatus: 409
+        conflictCode: IDENTITY_CONFLICT
+        recoveryAction: none
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RegisterProjectImportRequest'}}}
+      responses:
+        '201': &ProjectImportRegistered
+          description: Idempotent import reservation; bytes follow through the content route.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectImportSnapshot'}}}
+        '200': *ProjectImportRegistered
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
+  /api/v2/project-workspaces/{workspaceRef}/imports/{importRef}/content:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectWorkspaceRef'}
+      - {$ref: '#/components/parameters/ProjectImportRef'}
+      - {$ref: '#/components/parameters/ProjectContentLengthHeader'}
+    put:
+      tags: [Project workspace snapshots]
+      operationId: putProjectWorkspaceImportContent
+      x-kcs-service-authorization: v2-mutator
+      x-kcs-cache-control: no-store
+      x-kcs-no-request-body-log: true
+      x-kcs-error-codes: *ProjectWorkspaceErrors
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, contentMediaType: application/octet-stream, maxLength: 134217728}
+      responses:
+        '200':
+          description: Sealed WorkspaceRevision materialized as a new retained Project checkout.
+          x-kcs-required-headers: [Cache-Control]
+          headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ProjectImportSnapshot'}}}
+        '400': *NoStoreError
+        '401': *NoStoreError
+        '403': *NoStoreError
+        '404': *NoStoreError
+        '409': *NoStoreError
+        '413': *NoStoreError
+        '415': *NoStoreError
+        '422': *NoStoreError
+        '429': *NoStoreError
+        '500': *NoStoreError
+        '503': *NoStoreError
   /api/v2/jobs/{jobRef}/operations/{operationRef}:
     parameters:
       - {$ref: '#/components/parameters/JobRef'}
@@ -2127,7 +2551,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.5.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.6.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -2151,6 +2575,8 @@ components:
     OperationRef: {name: operationRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     SnapshotRef: {name: snapshotRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     DevSessionRef: {name: devSessionRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    ProjectWorkspaceRef: {name: workspaceRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
+    ProjectImportRef: {name: importRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     Container: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace]}}
     AnyContainer: {name: container, in: query, required: true, schema: {type: string, enum: [agent, workspace, runner, control]}}
     Cursor: {name: cursor, in: query, schema: {$ref: '#/components/schemas/OpaqueCursor'}}
@@ -2194,6 +2620,7 @@ components:
     CredentialTtlHeader: {name: KCS-Credential-TTL-Seconds, in: header, required: true, schema: {type: integer, minimum: 1, maximum: 900}}
     ContentSha256Header: {name: KCS-Content-SHA256, in: header, required: true, schema: {$ref: '#/components/schemas/Sha256'}}
     ContentLengthHeader: {name: Content-Length, in: header, required: true, schema: {type: integer, minimum: 0, maximum: 107374182400}}
+    ProjectContentLengthHeader: {name: Content-Length, in: header, required: true, schema: {type: integer, minimum: 1, maximum: 134217728}}
     OperationRefHeader: {name: KCS-Operation-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     TerminalRef: {name: terminalRef, in: path, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
     TerminalSubject: {name: KCS-Subject-Ref, in: header, required: true, schema: {$ref: '#/components/schemas/OpaqueRef'}}
@@ -2273,6 +2700,200 @@ components:
       oneOf: [{$ref: '#/components/schemas/OpaqueRef'}, {type: 'null'}]
     NullableSha256:
       oneOf: [{$ref: '#/components/schemas/Sha256'}, {type: 'null'}]
+    ProjectWorkspaceSpec:
+      type: object
+      additionalProperties: false
+      required: [tenantRef, principalRef, conversationRef, storageGiB]
+      properties:
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        storageGiB: {type: integer, minimum: 1, maximum: 1024}
+    EnsureProjectWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity:
+          digestField: requestDigest
+          value: spec
+      required: [workspaceRef, requestDigest, spec]
+      properties:
+        workspaceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/ProjectWorkspaceSpec'}
+    ProjectWorkspaceStorageObservation:
+      type: object
+      additionalProperties: false
+      required: [requestedGiB, allocatedGiB, usedBytes, persistent]
+      properties:
+        requestedGiB: {type: integer, minimum: 1, maximum: 1024}
+        allocatedGiB:
+          oneOf: [{type: integer, minimum: 1, maximum: 1024}, {type: 'null'}]
+        usedBytes:
+          oneOf: [{type: integer, minimum: 0}, {type: 'null'}]
+        persistent: {type: boolean, const: true}
+    ProjectWorkspaceServiceObservation:
+      type: object
+      additionalProperties: false
+      required: [controlReady, ideReady, relayReady]
+      properties:
+        controlReady: {type: boolean}
+        ideReady: {type: boolean}
+        relayReady: {type: boolean}
+    ProjectWorkspaceSnapshot:
+      type: object
+      additionalProperties: false
+      required: [workspaceRef, requestDigest, tenantRef, principalRef, conversationRef, generation, state, storage, service, createdAt, observedAt]
+      properties:
+        workspaceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        state: {type: string, enum: [provisioning, ready, degraded]}
+        storage: {$ref: '#/components/schemas/ProjectWorkspaceStorageObservation'}
+        service: {$ref: '#/components/schemas/ProjectWorkspaceServiceObservation'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    ProjectDevSessionSpec:
+      type: object
+      additionalProperties: false
+      required: [tenantRef, principalRef, conversationRef, generation, ttlSeconds]
+      properties:
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        ttlSeconds: {type: integer, minimum: 60, maximum: 3600}
+    ProjectDevSessionCreateRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: {digestField: requestDigest, value: spec}
+      required: [devSessionRef, requestDigest, spec]
+      properties:
+        devSessionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/ProjectDevSessionSpec'}
+    ProjectDevSessionRenewSpec:
+      type: object
+      additionalProperties: false
+      required: [ttlSeconds]
+      properties:
+        ttlSeconds: {type: integer, minimum: 60, maximum: 3600}
+    ProjectDevSessionRenewRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: {digestField: requestDigest, value: spec}
+      required: [renewRef, requestDigest, spec]
+      properties:
+        renewRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/ProjectDevSessionRenewSpec'}
+    ProjectDevSessionSnapshot:
+      type: object
+      additionalProperties: false
+      required: [devSessionRef, requestDigest, workspaceRef, tenantRef, principalRef, conversationRef, generation, state, relayPath, writable, openVscodeImageRef, openVscodeImageId, workspaceExtensionImageRef, workspaceExtensionSha256, createdAt, expiresAt, revokedAt, observedAt]
+      properties:
+        devSessionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        workspaceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
+        principalRef: {$ref: '#/components/schemas/OpaqueRef'}
+        conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        state: {type: string, enum: [opening, ready, revoked, expired, lost]}
+        relayPath: {type: string, minLength: 1, maxLength: 1024, pattern: '^/'}
+        writable: {type: boolean, const: true}
+        openVscodeImageRef: {type: string, minLength: 1, maxLength: 512}
+        openVscodeImageId:
+          oneOf: [{type: string, minLength: 1, maxLength: 512}, {type: 'null'}]
+        workspaceExtensionImageRef: {type: string, pattern: '^.+@sha256:[0-9a-f]{64}$'}
+        workspaceExtensionSha256: {$ref: '#/components/schemas/Sha256'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+        revokedAt: {$ref: '#/components/schemas/NullableTimestamp'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
+    ProjectSnapshotSpec:
+      type: object
+      additionalProperties: false
+      required: [expectedGeneration, maximumFiles, maximumBytes]
+      properties:
+        expectedGeneration: {type: integer, minimum: 1}
+        maximumFiles: {type: integer, minimum: 1, maximum: 4096, default: 4096}
+        maximumBytes: {type: integer, minimum: 1, maximum: 134217728, default: 134217728}
+    CreateProjectSnapshotRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: {digestField: requestDigest, value: spec}
+      required: [snapshotRef, requestDigest, spec]
+      properties:
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/ProjectSnapshotSpec'}
+    ProjectTreeSnapshot:
+      type: object
+      additionalProperties: false
+      required: [snapshotRef, requestDigest, workspaceRef, generation, state, treeDigest, bundleSha256, bundleSizeBytes, entryCount, baseCommit, createdAt]
+      properties:
+        snapshotRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        workspaceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        state: {type: string, const: ready}
+        treeDigest: {$ref: '#/components/schemas/Sha256'}
+        bundleSha256: {$ref: '#/components/schemas/Sha256'}
+        bundleSizeBytes: {type: integer, minimum: 1, maximum: 134217728}
+        entryCount: {type: integer, minimum: 0, maximum: 4096}
+        baseCommit: {type: string, pattern: '^[0-9a-f]{40,64}$'}
+        createdAt: {$ref: '#/components/schemas/Timestamp'}
+    ProjectImportSpec:
+      type: object
+      additionalProperties: false
+      required: [expectedGeneration, sourceRevisionRef, expectedTreeDigest, contentSha256, declaredSizeBytes]
+      properties:
+        expectedGeneration: {type: integer, minimum: 1}
+        sourceRevisionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        expectedTreeDigest: {$ref: '#/components/schemas/Sha256'}
+        contentSha256: {$ref: '#/components/schemas/Sha256'}
+        declaredSizeBytes: {type: integer, minimum: 1, maximum: 134217728}
+        baseCommit:
+          oneOf: [{type: string, pattern: '^[0-9a-f]{40,64}$'}, {type: 'null'}]
+    RegisterProjectImportRequest:
+      type: object
+      additionalProperties: false
+      x-kcs-digest-projection:
+        kind: rfc8785-jcs
+        identity: {digestField: requestDigest, value: spec}
+      required: [importRef, requestDigest, spec]
+      properties:
+        importRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        spec: {$ref: '#/components/schemas/ProjectImportSpec'}
+    ProjectImportSnapshot:
+      type: object
+      additionalProperties: false
+      required: [importRef, requestDigest, workspaceRef, generation, sourceRevisionRef, state, expectedTreeDigest, retainedCheckoutRef, resultCommit, materializedTreeDigest, observedAt]
+      properties:
+        importRef: {$ref: '#/components/schemas/OpaqueRef'}
+        requestDigest: {$ref: '#/components/schemas/Sha256'}
+        workspaceRef: {$ref: '#/components/schemas/OpaqueRef'}
+        generation: {type: integer, minimum: 1}
+        sourceRevisionRef: {$ref: '#/components/schemas/OpaqueRef'}
+        state: {type: string, enum: [registered, completed, failed]}
+        expectedTreeDigest: {$ref: '#/components/schemas/Sha256'}
+        retainedCheckoutRef: {$ref: '#/components/schemas/NullableOpaqueRef'}
+        resultCommit:
+          oneOf: [{type: string, pattern: '^[0-9a-f]{40,64}$'}, {type: 'null'}]
+        materializedTreeDigest: {$ref: '#/components/schemas/NullableSha256'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     Environment:
       type: object
       maxProperties: 32
@@ -4205,7 +4826,7 @@ components:
         earliestRetainedCursor: {$ref: '#/components/schemas/CursorPosition'}
     ErrorCode:
       type: string
-      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, CURSOR_GAP, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, DEV_SESSION_CREDENTIAL_INVALID, DEV_SESSION_EXPIRED, DEV_SESSION_REVOKED, DEV_SESSION_RELAY_DOWN, LIVE_SNAPSHOT_EXPIRED, CAPABILITY_ACTIVATION_INCOMPATIBLE, CAPABILITY_BUNDLE_MISMATCH, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, CAPACITY_LIMIT, RATE_LIMIT, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
+      enum: [INVALID_REQUEST, INVALID_CURSOR, STALE_CURSOR, CURSOR_GAP, INVALID_PAGE_TOKEN, STALE_PAGE_TOKEN, UNAUTHENTICATED, FORBIDDEN, DIGEST_MISMATCH, IDENTITY_CONFLICT, STATE_CONFLICT, PRECONDITION_FAILED, STALE_BINDING, REPLACEMENT_POD, TERMINAL_BUSY, TERMINAL_CREDENTIAL_INVALID, DEV_SESSION_CREDENTIAL_INVALID, DEV_SESSION_EXPIRED, DEV_SESSION_REVOKED, DEV_SESSION_RELAY_DOWN, LIVE_SNAPSHOT_EXPIRED, CAPABILITY_ACTIVATION_INCOMPATIBLE, CAPABILITY_BUNDLE_MISMATCH, TOMBSTONED, NOT_FOUND, GONE, ILLEGAL_GENERATION, CREDENTIAL_ACTIVE, CREDENTIAL_EXPIRED, CREDENTIAL_DESTROY_FAILED, UNSAFE_PATH, OVERWRITE_FORBIDDEN, TRANSFER_BYTES_MISMATCH, TRANSFER_INDETERMINATE, OPERATION_INDETERMINATE, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, MATERIALIZATION_FAILED, QUOTA_EXCEEDED, CAPACITY_LIMIT, RATE_LIMIT, STORAGE_UNAVAILABLE, DEPENDENCY_UNAVAILABLE, DEPENDENCY_TIMEOUT, INTERNAL_ERROR]
     RecoveryAction:
       type: string
       enum: [retry_same, inspect_job, inspect_grant, inspect_runner_credential_grant, inspect_transfer, inspect_operation, inspect_terminal, inspect_live_snapshot, inspect_dev_session, resolve_runtime_assembly, reattach, reconcile, new_attempt, none]

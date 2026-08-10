@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal, Protocol, overload
 from uuid import UUID
 
@@ -152,6 +153,22 @@ from .native_runtime import (
     NativeMutationResult,
     NativeRuntimeController,
     RunnerCredentialGrantMetadata,
+)
+from .project_workspace import (
+    CreateProjectSnapshotRequest,
+    EnsureProjectWorkspaceRequest,
+    ProjectDevSessionCreateRequest,
+    ProjectDevSessionMutation,
+    ProjectDevSessionRenewRequest,
+    ProjectDevSessionSnapshot,
+    ProjectImportSnapshot,
+    ProjectRelayTarget,
+    ProjectSnapshotContent,
+    ProjectTreeSnapshot,
+    ProjectWorkspaceMutation,
+    ProjectWorkspaceService,
+    ProjectWorkspaceSnapshot,
+    RegisterProjectImportRequest,
 )
 from .recipe_registry import runtime_recipe_digest
 from .renderer import (
@@ -471,6 +488,7 @@ class V2JobProvider:
         hosted_admission: bool = True,
         openvscode_image_ref: str | None = None,
         runtime_assembly_resolver: RuntimeAssemblyResolver | None = None,
+        project_workspaces: ProjectWorkspaceService | None = None,
     ) -> None:
         if delete_poll_attempts < 1:
             raise ValueError("delete_poll_attempts must be positive")
@@ -493,6 +511,7 @@ class V2JobProvider:
         self._observability = observability
         self._hosted_admission = hosted_admission
         self._runtime_assembly_resolver = runtime_assembly_resolver
+        self._project_workspaces = project_workspaces
         self._cluster_feed = ClusterFeed(kube, clock=self._clock)
         self._lifecycle = LifecycleGate(store)
         self._startup_reconcile = False
@@ -530,6 +549,85 @@ class V2JobProvider:
         self.reconcile_credentials()
         self.reconcile_terminals()
         self._dev_sessions.reconcile()
+
+    def ensure_project_workspace(
+        self, request: EnsureProjectWorkspaceRequest
+    ) -> ProjectWorkspaceMutation:
+        return self._project_workspace_service().ensure(request)
+
+    def inspect_project_workspace(self, workspace_ref: str) -> ProjectWorkspaceSnapshot:
+        return self._project_workspace_service().inspect(workspace_ref)
+
+    def create_project_dev_session(
+        self, workspace_ref: str, request: ProjectDevSessionCreateRequest
+    ) -> ProjectDevSessionMutation:
+        return self._project_workspace_service().create_dev_session(workspace_ref, request)
+
+    def inspect_project_dev_session(
+        self, workspace_ref: str, session_ref: str, credential: str
+    ) -> ProjectDevSessionSnapshot:
+        return self._project_workspace_service().inspect_dev_session(
+            workspace_ref, session_ref, credential
+        )
+
+    def renew_project_dev_session(
+        self,
+        workspace_ref: str,
+        session_ref: str,
+        credential: str,
+        request: ProjectDevSessionRenewRequest,
+    ) -> ProjectDevSessionMutation:
+        return self._project_workspace_service().renew_dev_session(
+            workspace_ref, session_ref, credential, request
+        )
+
+    def revoke_project_dev_session(
+        self, workspace_ref: str, session_ref: str, credential: str
+    ) -> ProjectDevSessionSnapshot:
+        return self._project_workspace_service().revoke_dev_session(
+            workspace_ref, session_ref, credential
+        )
+
+    def project_dev_session_relay_target(
+        self, workspace_ref: str, session_ref: str, credential: str, path: str
+    ) -> ProjectRelayTarget:
+        return self._project_workspace_service().relay_target(
+            workspace_ref, session_ref, credential, path
+        )
+
+    def observe_project_dev_session_relay_ready(
+        self, workspace_ref: str, session_ref: str, credential: str
+    ) -> ProjectDevSessionSnapshot:
+        return self._project_workspace_service().observe_relay_ready(
+            workspace_ref, session_ref, credential
+        )
+
+    def create_project_snapshot(
+        self, workspace_ref: str, request: CreateProjectSnapshotRequest
+    ) -> tuple[ProjectTreeSnapshot, bool]:
+        return self._project_workspace_service().create_snapshot(workspace_ref, request)
+
+    def open_project_snapshot_content(
+        self, workspace_ref: str, snapshot_ref: str
+    ) -> ProjectSnapshotContent:
+        return self._project_workspace_service().open_snapshot_content(
+            workspace_ref, snapshot_ref
+        )
+
+    def register_project_import(
+        self, workspace_ref: str, request: RegisterProjectImportRequest
+    ) -> tuple[ProjectImportSnapshot, bool]:
+        return self._project_workspace_service().register_import(workspace_ref, request)
+
+    def put_project_import(
+        self, workspace_ref: str, import_ref: str, content: Path
+    ) -> ProjectImportSnapshot:
+        return self._project_workspace_service().put_import(workspace_ref, import_ref, content)
+
+    def _project_workspace_service(self) -> ProjectWorkspaceService:
+        if self._project_workspaces is None:
+            raise DependencyUnavailableError("Project Workspace service is not configured")
+        return self._project_workspaces
 
     def create_dev_session(
         self, job_ref: str, request: DevSessionCreateRequest

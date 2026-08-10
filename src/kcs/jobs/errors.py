@@ -238,6 +238,12 @@ class PayloadTooLargeError(KcsV2Error):
     default_message = "The request body exceeds the allowed size"
 
 
+class MaterializationFailedError(KcsV2Error):
+    code = "MATERIALIZATION_FAILED"
+    status_code = 422
+    default_message = "The exact Workspace tree could not be materialized"
+
+
 class ReplacementPodError(KcsV2Error):
     code = "REPLACEMENT_POD"
     status_code = 409

@@ -92,6 +92,18 @@ class CoreV1Api(Protocol):
 
     def connect_get_namespaced_pod_exec(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
 
+    def create_namespaced_persistent_volume_claim(self, *, namespace: str, body: Any) -> Any: ...
+
+    def read_namespaced_persistent_volume_claim(self, *, name: str, namespace: str) -> Any: ...
+
+
+class AppsV1Api(Protocol):
+    """Deployment surface used only by durable Project Workspace services."""
+
+    def create_namespaced_deployment(self, *, namespace: str, body: Any) -> Any: ...
+
+    def read_namespaced_deployment(self, *, name: str, namespace: str) -> Any: ...
+
 
 class CustomObjectsApi(Protocol):
     """The metrics.k8s.io read used for one bound Pod observation."""
@@ -146,6 +158,7 @@ class V2KubeAdapter:
         batch_api: BatchV1Api,
         core_api: CoreV1Api,
         *,
+        apps_api: AppsV1Api | None = None,
         metrics_api: CustomObjectsApi | None = None,
         exec_core_api_factory: Callable[[], CoreV1Api] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -155,6 +168,7 @@ class V2KubeAdapter:
         self.namespace = namespace
         self._batch = batch_api
         self._core = core_api
+        self._apps = apps_api
         self._metrics = metrics_api
         self._exec_core_api_factory = exec_core_api_factory or (lambda: self._core)
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -164,6 +178,79 @@ class V2KubeAdapter:
     def create_job(self, body: Any) -> Any:
         """Create a rendered Job in the adapter namespace."""
         return self._batch.create_namespaced_job(namespace=self.namespace, body=body)
+
+    def create_persistent_volume_claim(self, body: Any) -> Any:
+        return self._core.create_namespaced_persistent_volume_claim(
+            namespace=self.namespace, body=body
+        )
+
+    def read_persistent_volume_claim(self, name: str) -> Any | None:
+        try:
+            return self._core.read_namespaced_persistent_volume_claim(
+                name=name, namespace=self.namespace
+            )
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise
+
+    def create_deployment(self, body: Any) -> Any:
+        if self._apps is None:
+            raise DependencyUnavailableError("Kubernetes Apps API is not configured")
+        return self._apps.create_namespaced_deployment(namespace=self.namespace, body=body)
+
+    def read_deployment(self, name: str) -> Any | None:
+        if self._apps is None:
+            raise DependencyUnavailableError("Kubernetes Apps API is not configured")
+        try:
+            return self._apps.read_namespaced_deployment(name=name, namespace=self.namespace)
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise
+
+    def list_pods(self, label_selector: str) -> list[Any]:
+        result = self._core.list_namespaced_pod(
+            namespace=self.namespace, label_selector=label_selector
+        )
+        return list(_value(result, "items") or ())
+
+    def read_pod(self, name: str) -> Any | None:
+        try:
+            return self._core.read_namespaced_pod(name=name, namespace=self.namespace)
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise
+
+    def bound_pod(self, pod_name: str, pod_uid: str) -> Any:
+        pod = self.read_pod(pod_name)
+        if pod is None or str(_value(_value(pod, "metadata"), "uid")) != pod_uid:
+            raise StaleCursorError()
+        return pod
+
+    def project_relay_endpoint(self, pod_name: str, pod_uid: str) -> tuple[str, int]:
+        pod = self.bound_pod(pod_name, pod_uid)
+        pod_ip = _value(_value(pod, "status"), "pod_ip") or _value(
+            _value(pod, "status"), "podIP"
+        )
+        if not isinstance(pod_ip, str) or not pod_ip:
+            raise DependencyUnavailableError("the bound Workspace Pod has no relay address")
+        return pod_ip, 8080
+
+    def project_container_image_id(
+        self, pod_name: str, pod_uid: str, container: str
+    ) -> tuple[str | None, bool]:
+        pod = self.bound_pod(pod_name, pod_uid)
+        status = _value(pod, "status")
+        statuses = list(_value(status, "container_statuses") or ()) + list(
+            _value(status, "init_container_statuses") or ()
+        )
+        for item in statuses:
+            if _value(item, "name") == container:
+                image_id = _value(item, "image_id") or _value(item, "imageID")
+                return (str(image_id) if image_id else None, bool(_value(item, "ready")))
+        return None, False
 
     def list_nodes(self) -> list[Any]:
         """List cluster Node facts for the read-only capacity feed."""
@@ -556,15 +643,26 @@ class V2KubeAdapter:
         """Stream raw binary channels through the single fixed workspace RPC argv."""
         from kubernetes.stream import stream
 
-        pod = self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        pod = (
+            self.bound_pod(binding["podName"], binding["podUid"])
+            if binding.get("runtimeLane") == "project"
+            else self._pod_with_uid(binding["jobRef"], binding["podUid"])
+        )
         pod_name = str(_value(_value(pod, "metadata"), "name"))
         exec_core = self._exec_core_api_factory()
-        native = binding.get("runtimeLane") == "native"
+        lane = binding.get("runtimeLane")
+        container = (
+            "workspace-control"
+            if lane == "project"
+            else "control"
+            if lane == "native"
+            else "workspace"
+        )
         websocket: Any = stream(
             exec_core.connect_get_namespaced_pod_exec,
             pod_name,
             self.namespace,
-            container="control" if native else "workspace",
+            container=container,
             command=["/opt/kcs/workspace-sidecar", "rpc"],
             stderr=True,
             stdin=True,

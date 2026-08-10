@@ -32,6 +32,19 @@ M2_OPERATIONS = {
     "revokeDevSession",
     "relayDevSession",
 }
+PROJECT_WORKSPACE_OPERATIONS = {
+    "ensureProjectWorkspace",
+    "inspectProjectWorkspace",
+    "createProjectDevSession",
+    "inspectProjectDevSession",
+    "renewProjectDevSession",
+    "revokeProjectDevSession",
+    "relayProjectDevSession",
+    "createProjectWorkspaceSnapshot",
+    "readProjectWorkspaceSnapshotContent",
+    "registerProjectWorkspaceImport",
+    "putProjectWorkspaceImportContent",
+}
 HOSTED_OPERATION_LOCATIONS = {
     "getCapacity": ("get", "/api/v2/capacity"),
     "getRuntimeEvents": ("get", "/api/v2/events"),
@@ -174,17 +187,17 @@ def _operations(document: dict) -> dict[str, tuple[str, str, dict]]:
     }
 
 
-def test_v25_active_contract_preserves_the_v24_hosted_decode_arm() -> None:
+def test_v26_active_contract_preserves_the_v24_hosted_decode_arm() -> None:
     current = yaml.safe_load(SOURCE.read_text())
     served = json.loads(SERVED_PACKAGE.read_text())
     current_operations = _operations(current)
-    assert served["info"]["version"] == "2.5.0"
-    assert current["info"]["version"] == "2.5.0"
+    assert served["info"]["version"] == "2.6.0"
+    assert current["info"]["version"] == "2.6.0"
     assert current["x-kcs-contract-status"] == "active"
-    assert len(_operations(served)) == 47
-    assert len(current_operations) == 47
+    assert len(_operations(served)) == 58
+    assert len(current_operations) == 58
     assert set(current_operations) - set(HOSTED_OPERATION_LOCATIONS) == (
-        NATIVE_OPERATIONS | M2_OPERATIONS
+        NATIVE_OPERATIONS | M2_OPERATIONS | PROJECT_WORKSPACE_OPERATIONS
     )
 
     for operation_id, expected_location in HOSTED_OPERATION_LOCATIONS.items():

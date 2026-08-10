@@ -39,6 +39,9 @@ class V2RuntimeSettings:
     native_capability_registry_path: Path | None = None
     native_openvscode_image_volume: str | None = None
     native_dev_session_relay_image: str | None = None
+    project_workspace_control_image: str | None = None
+    project_workspace_vsix_image_volume: str | None = None
+    project_workspace_vsix_sha256: str | None = None
     model_gateway_openai_base_urls: tuple[str, ...] = ()
     model_gateway_anthropic_base_urls: tuple[str, ...] = ()
     native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
@@ -133,6 +136,25 @@ class V2RuntimeSettings:
                 "KCS_V2_OPENVSCODE_IMAGE_VOLUME and KCS_V2_DEV_SESSION_RELAY_IMAGE "
                 "must be configured together"
             )
+        project_workspace_control_image = _optional_image_digest(
+            environ.get("KCS_V2_PROJECT_WORKSPACE_CONTROL_IMAGE"),
+            "KCS_V2_PROJECT_WORKSPACE_CONTROL_IMAGE",
+        )
+        project_workspace_vsix_image_volume = _optional_image_digest(
+            environ.get("KCS_V2_PROJECT_WORKSPACE_VSIX_IMAGE_VOLUME"),
+            "KCS_V2_PROJECT_WORKSPACE_VSIX_IMAGE_VOLUME",
+        )
+        project_workspace_vsix_sha256 = _optional_sha256(
+            environ.get("KCS_V2_PROJECT_WORKSPACE_VSIX_SHA256"),
+            "KCS_V2_PROJECT_WORKSPACE_VSIX_SHA256",
+        )
+        if (project_workspace_vsix_image_volume is None) != (
+            project_workspace_vsix_sha256 is None
+        ):
+            raise ValueError(
+                "KCS_V2_PROJECT_WORKSPACE_VSIX_IMAGE_VOLUME and "
+                "KCS_V2_PROJECT_WORKSPACE_VSIX_SHA256 must be configured together"
+            )
 
         openai_bases = _optional_https_urls(
             environ.get("KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL"),
@@ -168,6 +190,9 @@ class V2RuntimeSettings:
             native_capability_registry_path=native_capability_registry_path,
             native_openvscode_image_volume=native_openvscode_image_volume,
             native_dev_session_relay_image=native_dev_session_relay_image,
+            project_workspace_control_image=project_workspace_control_image,
+            project_workspace_vsix_image_volume=project_workspace_vsix_image_volume,
+            project_workspace_vsix_sha256=project_workspace_vsix_sha256,
             model_gateway_openai_base_urls=openai_bases,
             model_gateway_anthropic_base_urls=anthropic_bases,
             native_provision_seconds=native_provision_seconds,
@@ -201,6 +226,14 @@ def _optional_image_digest(raw: str | None, name: str) -> str | None:
         return None
     if re.fullmatch(r".+@sha256:[0-9a-f]{64}", raw) is None:
         raise ValueError(f"{name} must be an exact OCI image digest")
+    return raw
+
+
+def _optional_sha256(raw: str | None, name: str) -> str | None:
+    if raw is None:
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", raw) is None:
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
     return raw
 
 

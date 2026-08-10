@@ -17,6 +17,7 @@ import shutil
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -50,8 +51,8 @@ _MAX_LIVE_CONTENT_RANGE = 1024 * 1024
 _WORKSPACE_TREE_SCHEMA = "cosmos.workspace-tree/1"
 _ENTRY_MODE_BITS = {
     "read_only": 0o444,
-    "read_write": 0o644,
-    "executable": 0o755,
+    "read_write": 0o664,
+    "executable": 0o775,
 }
 _EXPERIMENT_UID = 10001
 _EXPERIMENT_GID = 10001
@@ -188,6 +189,10 @@ class RuntimeControlSidecar:
         self._finalize_receipts = _private_directory(self._control_state, "finalize-receipts")
         self._base_manifests = _private_directory(self._control_state, "base-manifests")
         self._live_snapshots = _private_directory(self._control_state, "live-snapshots")
+        self._project_snapshots = _private_directory(self._private, "project-snapshots")
+        self._project_import_receipts = _private_directory(
+            self._private, "project-import-receipts"
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
         self._transfers: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, dict[str, Any]] = {}
@@ -196,6 +201,7 @@ class RuntimeControlSidecar:
         self._operation_lock = RLock()
         self._finalize_lock = RLock()
         self._live_snapshot_lock = RLock()
+        self._project_snapshot_lock = RLock()
         self._stage_installs = 0
         self._operation_side_effects = 0
         self._native_state_generation = 0
@@ -296,6 +302,12 @@ class RuntimeControlSidecar:
             return self._read_live_workspace_content(request)
         if action == "getLiveWorkspaceDiff":
             return self._get_live_workspace_diff(request), None
+        if action == "createProjectWorkspaceSnapshot":
+            return self._create_project_workspace_snapshot(request)
+        if action == "readProjectWorkspaceSnapshot":
+            return self._read_project_workspace_snapshot(request)
+        if action == "importProjectWorkspaceRevision":
+            return self._import_project_workspace_revision(request, body), None
         if action == "shutdown":
             retained = self._acknowledged_finalize_receipt()
             self._commit_native_finalize(retained)
@@ -1738,17 +1750,472 @@ class RuntimeControlSidecar:
             }
         )
         identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+        branch, base_commit = self._initialize_attempt_git(identity, declared_tree_digest)
         return {
             "ok": True,
             "resume_handle": f"workspace-stage://stage_{identity}",
             "staged_tree_digest": staged_tree_digest,
             "manifest_tree_digest": declared_tree_digest,
             "entry_count": len(entries),
-            "git_enabled": False,
+            "git_enabled": True,
+            "git_branch": branch,
+            "git_base_commit": base_commit,
             "git_error": None,
             "restaged": False,
             "observations": [],
         }
+
+    def _initialize_attempt_git(self, identity: str, tree_digest: str) -> tuple[str, str]:
+        """Create one isolated SCM base only after the staged tree passed its digest gate."""
+
+        worktree = self.workspace / "worktree"
+        branch = f"rc/attempt/{identity}"
+        git_dir = worktree / ".git"
+        if git_dir.exists():
+            retained = self._git(worktree, ["rev-parse", "--verify", "HEAD"]).strip()
+            recorded = self._git(
+                worktree,
+                ["config", "--get", "rc.baseTreeDigest"],
+                allow_failure=True,
+            ).strip()
+            if not retained or recorded != tree_digest:
+                raise _RpcRejectedError(
+                    "IDENTITY_CONFLICT", "Attempt Git base differs from the staged tree"
+                )
+            return branch, retained
+        self._git(worktree, ["init", "--shared=group", "-b", branch])
+        self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
+        self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
+        self._git(worktree, ["config", "rc.baseTreeDigest", tree_digest])
+        self._git(worktree, ["add", "--all"])
+        self._git(
+            worktree,
+            ["commit", "--no-gpg-sign", "-m", "Attempt base"],
+            env={
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            },
+        )
+        commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
+        if os.geteuid() == 0:
+            for root, directories, files in os.walk(git_dir):
+                os.chown(root, _EXPERIMENT_UID, _EXPERIMENT_GID)
+                os.chmod(root, os.stat(root, follow_symlinks=False).st_mode | 0o2070)
+                for name in directories:
+                    path = Path(root) / name
+                    os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
+                    os.chmod(path, os.stat(path, follow_symlinks=False).st_mode | 0o2070)
+                for name in files:
+                    path = Path(root) / name
+                    os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
+                    os.chmod(path, os.stat(path, follow_symlinks=False).st_mode | 0o060)
+        return branch, commit
+
+    def _create_project_workspace_snapshot(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, object], Path | None]:
+        expected = {
+            "action",
+            "workspaceRef",
+            "snapshotRef",
+            "requestDigest",
+            "generation",
+            "maximumFiles",
+            "maximumBytes",
+        }
+        if set(request) != expected:
+            raise _RpcRejectedError("INVALID_REQUEST", "Project snapshot request is not closed")
+        workspace_ref = request.get("workspaceRef")
+        snapshot_ref = request.get("snapshotRef")
+        request_digest = request.get("requestDigest")
+        generation = request.get("generation")
+        maximum_files = request.get("maximumFiles")
+        maximum_bytes = request.get("maximumBytes")
+        if (
+            not isinstance(workspace_ref, str)
+            or not isinstance(snapshot_ref, str)
+            or not _is_hex_digest(request_digest)
+            or type(generation) is not int
+            or generation < 1
+            or type(maximum_files) is not int
+            or not 1 <= maximum_files <= _MAX_CAPTURE_TREE_FILES
+            or type(maximum_bytes) is not int
+            or not 1 <= maximum_bytes <= _MAX_CAPTURE_TREE_BYTES
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "Project snapshot identity is invalid")
+        target = self._project_snapshot_path(snapshot_ref)
+        receipt_path = self._project_snapshot_receipt_path(snapshot_ref)
+        with self._project_snapshot_lock:
+            if target.exists() and receipt_path.exists():
+                receipt = _read_json(receipt_path, "Project snapshot receipt")
+                if receipt.get("requestDigest") != request_digest:
+                    raise _RpcRejectedError(
+                        "IDENTITY_CONFLICT", "Project snapshot identity was reused"
+                    )
+                return {"ok": True, "snapshot": receipt["snapshot"]}, target
+            payload = {"max_files": maximum_files, "max_total_bytes": maximum_bytes}
+            encoded_payload = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            captured = self._capture_workspace_tree(
+                {
+                    "protocol": "cosmos.workspace/1",
+                    "action": "capture_tree",
+                    "operation_id": f"project-snapshot:{snapshot_ref}",
+                    "request_digest": str(request_digest),
+                    "frame_digest": hashlib.sha256(encoded_payload.encode()).hexdigest(),
+                    "payload": payload,
+                }
+            )
+            entries = list(captured["entries"])
+            tree_digest = str(captured["captured_tree_digest"])
+            commit = self._commit_project_tree(entries, snapshot_ref, "snapshot", None)
+            bundle = {
+                "schema": "cosmos.project-workspace-bundle/1",
+                "workspaceRef": workspace_ref,
+                "snapshotRef": snapshot_ref,
+                "treeDigest": tree_digest,
+                "entries": entries,
+            }
+            encoded = json.dumps(
+                bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode()
+            if len(encoded) > maximum_bytes:
+                raise _RpcRejectedError(
+                    "PAYLOAD_TOO_LARGE", "Project snapshot bundle exceeds its byte bound"
+                )
+            bundle_sha = hashlib.sha256(encoded).hexdigest()
+            _atomic_bytes(target, encoded)
+            snapshot = {
+                "snapshotRef": snapshot_ref,
+                "requestDigest": request_digest,
+                "workspaceRef": workspace_ref,
+                "generation": generation,
+                "state": "ready",
+                "treeDigest": tree_digest,
+                "bundleSha256": bundle_sha,
+                "bundleSizeBytes": len(encoded),
+                "entryCount": len(entries),
+                "baseCommit": commit,
+                "createdAt": _timestamp(self._live_now()),
+            }
+            _atomic_json(
+                receipt_path, {"requestDigest": request_digest, "snapshot": snapshot}
+            )
+            return {"ok": True, "snapshot": snapshot}, target
+
+    def _read_project_workspace_snapshot(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, object], Path | None]:
+        expected = {
+            "action",
+            "workspaceRef",
+            "snapshotRef",
+            "requestDigest",
+            "generation",
+            "authorizedMaxSizeBytes",
+        }
+        if set(request) != expected:
+            raise _RpcRejectedError("INVALID_REQUEST", "Project snapshot read is not closed")
+        snapshot_ref = request.get("snapshotRef")
+        if not isinstance(snapshot_ref, str):
+            raise _RpcRejectedError("INVALID_REQUEST", "Project snapshot ref is invalid")
+        target = self._project_snapshot_path(snapshot_ref)
+        receipt = _read_json(
+            self._project_snapshot_receipt_path(snapshot_ref), "Project snapshot receipt"
+        )
+        snapshot = receipt.get("snapshot")
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("workspaceRef") != request.get("workspaceRef")
+            or snapshot.get("requestDigest") != request.get("requestDigest")
+            or snapshot.get("generation") != request.get("generation")
+            or not target.is_file()
+        ):
+            raise _RpcRejectedError("STALE_BINDING", "Project snapshot binding differs")
+        maximum = request.get("authorizedMaxSizeBytes")
+        if type(maximum) is not int or target.stat().st_size > maximum:
+            raise _RpcRejectedError("PAYLOAD_TOO_LARGE", "Project snapshot exceeds read bound")
+        return {"ok": True, "snapshot": snapshot}, target
+
+    def _import_project_workspace_revision(
+        self, request: Mapping[str, Any], body: Path | None
+    ) -> dict[str, object]:
+        expected = {
+            "action",
+            "workspaceRef",
+            "importRef",
+            "requestDigest",
+            "generation",
+            "sourceRevisionRef",
+            "expectedTreeDigest",
+            "contentSha256",
+            "declaredSizeBytes",
+            "authorizedMaxSizeBytes",
+            "baseCommit",
+        }
+        if set(request) != expected or body is None:
+            raise _RpcRejectedError("INVALID_REQUEST", "Project import request is not closed")
+        import_ref = request.get("importRef")
+        request_digest = request.get("requestDigest")
+        expected_tree = request.get("expectedTreeDigest")
+        if (
+            not isinstance(import_ref, str)
+            or not _is_hex_digest(request_digest)
+            or not _is_hex_digest(expected_tree)
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "Project import identity is invalid")
+        receipt_path = self._project_import_receipt_path(import_ref)
+        with self._project_snapshot_lock:
+            if receipt_path.exists():
+                retained = _read_json(receipt_path, "Project import receipt")
+                if retained.get("requestDigest") != request_digest:
+                    raise _RpcRejectedError(
+                        "IDENTITY_CONFLICT", "Project import identity was reused"
+                    )
+                return {"ok": True, "receipt": retained["receipt"]}
+            declared = request.get("declaredSizeBytes")
+            maximum = request.get("authorizedMaxSizeBytes")
+            if (
+                type(declared) is not int
+                or type(maximum) is not int
+                or declared != body.stat().st_size
+                or declared > maximum
+            ):
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "Project import size differs from declaration"
+                )
+            if _hash_file(body)[1] != request.get("contentSha256"):
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "Project import content digest differs"
+                )
+            try:
+                bundle = json.loads(body.read_bytes())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise _RpcRejectedError(
+                    "MATERIALIZATION_FAILED", "Project import bundle is invalid"
+                ) from error
+            if (
+                not isinstance(bundle, dict)
+                or bundle.get("schema") != "cosmos.project-workspace-bundle/1"
+                or not isinstance(bundle.get("entries"), list)
+            ):
+                raise _RpcRejectedError(
+                    "MATERIALIZATION_FAILED", "Project import bundle is invalid"
+                )
+            entries = self._validate_project_bundle_entries(bundle["entries"])
+            tree_digest = _workspace_tree_digest(
+                [
+                    {key: item[key] for key in ("path", "size", "sha256", "mode")}
+                    for item in entries
+                ]
+            )
+            if tree_digest != expected_tree or bundle.get("treeDigest") != expected_tree:
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "Project import tree digest differs"
+                )
+            parent = request.get("baseCommit")
+            commit = self._commit_project_tree(
+                entries,
+                import_ref,
+                "retained",
+                parent if isinstance(parent, str) and parent else None,
+            )
+            retained_ref = f"checkout_{hashlib.sha256(import_ref.encode()).hexdigest()[:24]}"
+            retained_branch = (
+                f"rc/retained/{hashlib.sha256(import_ref.encode()).hexdigest()[:24]}"
+            )
+            destination = self.workspace / "retained" / retained_ref
+            partial = self.workspace / "retained" / f".{retained_ref}.partial"
+            if not destination.exists():
+                if partial.exists():
+                    shutil.rmtree(partial)
+                self._git(
+                    self.workspace / "worktree",
+                    ["worktree", "add", str(partial), retained_branch],
+                )
+                self._git(
+                    self.workspace / "worktree",
+                    ["worktree", "move", str(partial), str(destination)],
+                )
+            receipt = {
+                "importRef": import_ref,
+                "sourceRevisionRef": request.get("sourceRevisionRef"),
+                "retainedCheckoutRef": retained_ref,
+                "resultCommit": commit,
+                "materializedTreeDigest": tree_digest,
+            }
+            _atomic_json(
+                receipt_path, {"requestDigest": request_digest, "receipt": receipt}
+            )
+            return {"ok": True, "receipt": receipt}
+
+    def _validate_project_bundle_entries(
+        self, raw_entries: list[Any]
+    ) -> list[dict[str, object]]:
+        if len(raw_entries) > _MAX_CAPTURE_TREE_FILES:
+            raise _RpcRejectedError("PAYLOAD_TOO_LARGE", "Project bundle has too many files")
+        entries: list[dict[str, object]] = []
+        total = 0
+        for raw in raw_entries:
+            if not isinstance(raw, dict) or set(raw) != {
+                "path",
+                "size",
+                "sha256",
+                "mode",
+                "content_b64",
+            }:
+                raise _RpcRejectedError(
+                    "MATERIALIZATION_FAILED", "Project bundle entry is invalid"
+                )
+            descriptor = _workspace_tree_entries(
+                [{key: raw.get(key) for key in ("path", "size", "sha256", "mode")}]
+            )[0]
+            encoded = raw.get("content_b64")
+            if not isinstance(encoded, str):
+                raise _RpcRejectedError(
+                    "MATERIALIZATION_FAILED", "Project bundle bytes are invalid"
+                )
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except ValueError as error:
+                raise _RpcRejectedError(
+                    "MATERIALIZATION_FAILED", "Project bundle bytes are invalid"
+                ) from error
+            if (
+                len(content) != descriptor["size"]
+                or hashlib.sha256(content).hexdigest() != descriptor["sha256"]
+            ):
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "Project bundle entry digest differs"
+                )
+            total += len(content)
+            if total > _MAX_CAPTURE_TREE_BYTES:
+                raise _RpcRejectedError("PAYLOAD_TOO_LARGE", "Project bundle exceeds byte bound")
+            entries.append({**descriptor, "content_b64": encoded})
+        paths = [str(item["path"]) for item in entries]
+        if len(paths) != len(set(paths)):
+            raise _RpcRejectedError("MATERIALIZATION_FAILED", "Project bundle repeats a path")
+        return entries
+
+    def _commit_project_tree(
+        self,
+        entries: list[dict[str, object]],
+        identity: str,
+        kind: str,
+        requested_parent: str | None,
+    ) -> str:
+        worktree = self.workspace / "worktree"
+        if not (worktree / ".git").exists():
+            self._git(worktree, ["init", "--shared=group", "-b", "rc/project"])
+            self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
+            self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
+        index = self._project_snapshots / f".index-{hashlib.sha256(identity.encode()).hexdigest()}"
+        index.unlink(missing_ok=True)
+        environment = {"GIT_INDEX_FILE": str(index)}
+        try:
+            for item in entries:
+                content = base64.b64decode(str(item["content_b64"]), validate=True)
+                blob = self._git(
+                    worktree,
+                    ["hash-object", "-w", "--stdin"],
+                    input_bytes=content,
+                ).strip()
+                mode = "100755" if item["mode"] == "executable" else "100644"
+                self._git(
+                    worktree,
+                    [
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"{mode},{blob},{item['path']}",
+                    ],
+                    env=environment,
+                )
+            tree = self._git(worktree, ["write-tree"], env=environment).strip()
+            parent = requested_parent
+            if parent is not None:
+                verified = self._git(
+                    worktree,
+                    ["rev-parse", "--verify", f"{parent}^{{commit}}"],
+                    allow_failure=True,
+                ).strip()
+                if verified != parent:
+                    raise _RpcRejectedError("STALE_BINDING", "Project base commit is unavailable")
+            elif kind == "snapshot":
+                parent = self._git(
+                    worktree,
+                    ["rev-parse", "--verify", "refs/rc/project/snapshots^{commit}"],
+                    allow_failure=True,
+                ).strip() or None
+            command = ["commit-tree", tree, "-m", f"Project {kind} {identity}"]
+            if parent is not None:
+                command.extend(["-p", parent])
+            commit = self._git(
+                worktree,
+                command,
+                env={
+                    **environment,
+                    "GIT_AUTHOR_NAME": "ResearchCosmos Platform",
+                    "GIT_AUTHOR_EMAIL": "platform@researchcosmos.invalid",
+                    "GIT_COMMITTER_NAME": "ResearchCosmos Platform",
+                    "GIT_COMMITTER_EMAIL": "platform@researchcosmos.invalid",
+                    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                    "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+                },
+            ).strip()
+            ref = (
+                "refs/rc/project/snapshots"
+                if kind == "snapshot"
+                else f"refs/heads/rc/retained/{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
+            )
+            self._git(worktree, ["update-ref", ref, commit])
+            if kind == "snapshot":
+                self._git(worktree, ["update-ref", "refs/heads/rc/project", commit])
+                self._git(worktree, ["symbolic-ref", "HEAD", "refs/heads/rc/project"])
+                self._git(worktree, ["read-tree", commit])
+            return commit
+        finally:
+            index.unlink(missing_ok=True)
+
+    def _git(
+        self,
+        worktree: Path,
+        arguments: list[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        input_bytes: bytes | None = None,
+        allow_failure: bool = False,
+    ) -> str:
+        environment = os.environ.copy()
+        if env is not None:
+            environment.update(env)
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={worktree}", *arguments],
+            cwd=worktree,
+            env=environment,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0 and not allow_failure:
+            raise _RpcRejectedError("MATERIALIZATION_FAILED", "Git workspace operation failed")
+        return result.stdout.decode("utf-8", errors="strict")
+
+    def _project_snapshot_path(self, snapshot_ref: str) -> Path:
+        return self._project_snapshots / (
+            f"{hashlib.sha256(snapshot_ref.encode()).hexdigest()}.bundle"
+        )
+
+    def _project_snapshot_receipt_path(self, snapshot_ref: str) -> Path:
+        return self._project_snapshots / (
+            f"{hashlib.sha256(snapshot_ref.encode()).hexdigest()}.json"
+        )
+
+    def _project_import_receipt_path(self, import_ref: str) -> Path:
+        return self._project_import_receipts / (
+            f"{hashlib.sha256(import_ref.encode()).hexdigest()}.json"
+        )
 
     def _capture_workspace_tree(self, frame: Mapping[str, Any]) -> dict[str, object]:
         payload = _workspace_action_payload(frame)
@@ -2141,6 +2608,8 @@ class RuntimeControlSidecar:
                     }
                     pending_directories: list[tuple[str, int]] = []
                     for name in names:
+                        if not prefix and name in {".git", ".cosmos"}:
+                            continue
                         relative = f"{prefix}/{name}" if prefix else name
                         try:
                             validate_safe_relative_path(relative)
@@ -2534,29 +3003,20 @@ class RuntimeControlSidecar:
                     raise _RpcRejectedError(
                         "UNSAFE_PATH", "workspace path has a casefold collision"
                     )
-                if not collisions:
+                created_directory = not collisions
+                if created_directory:
                     if not create:
                         raise _RpcRejectedError("NOT_FOUND", "workspace parent does not exist")
                     os.mkdir(component, 0o2775, dir_fd=descriptor)
-                    os.chmod(
-                        component,
-                        0o2775,
-                        dir_fd=descriptor,
-                        follow_symlinks=False,
-                    )
-                    if os.geteuid() == 0:
-                        os.chown(
-                            component,
-                            _EXPERIMENT_UID,
-                            _EXPERIMENT_GID,
-                            dir_fd=descriptor,
-                            follow_symlinks=False,
-                        )
                 next_descriptor = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=descriptor,
                 )
+                if created_directory:
+                    os.fchmod(next_descriptor, 0o2775)
+                    if os.geteuid() == 0:
+                        os.fchown(next_descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
                 os.close(descriptor)
                 descriptor = next_descriptor
             target_name = parts[-1]
@@ -2712,7 +3172,7 @@ def _validate_ingress_body(request: Mapping[str, Any]) -> None:
     body_size = request.get("bodySize")
     if type(body_size) is not int or body_size < 0:
         raise _RpcRejectedError("INVALID_REQUEST", "RPC body size is invalid")
-    if request.get("action") == "stage":
+    if request.get("action") in {"stage", "importProjectWorkspaceRevision"}:
         declared_size, _ = _byte_contract(request)
         if body_size != declared_size:
             raise _RpcRejectedError(

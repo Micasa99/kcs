@@ -73,6 +73,21 @@ spec:
                 configMapKeyRef:
                   name: kcs-v2-native-runtime-config
                   key: dev-session-relay-image
+            - name: KCS_V2_PROJECT_WORKSPACE_CONTROL_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: project-workspace-control-image
+            - name: KCS_V2_PROJECT_WORKSPACE_VSIX_IMAGE_VOLUME
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: project-workspace-vsix-image-volume
+            - name: KCS_V2_PROJECT_WORKSPACE_VSIX_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: project-workspace-vsix-sha256
             - name: KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL
               valueFrom:
                 configMapKeyRef:

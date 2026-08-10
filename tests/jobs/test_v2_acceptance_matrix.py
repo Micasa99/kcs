@@ -455,6 +455,10 @@ def test_transfer_contract_freezes_relative_paths_direct_mode_and_recovery() -> 
         "nativeRunner": True,
         "runtimeRecipeDeliveryDefault": "assembled.imageVolume",
         "runtimeRecipeDeliveryModes": ["assembled", "prebuilt"],
+        "exactCapabilityActivation": True,
+        "liveWorkspaceSnapshots": True,
+        "devSessionRelay": "openvscode",
+        "durableProjectWorkspace": True,
     }
     snapshot = schemas["TransferSnapshot"]
     assert {
@@ -634,6 +638,9 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "inspect_transfer",
         "inspect_operation",
         "inspect_terminal",
+        "inspect_live_snapshot",
+        "inspect_dev_session",
+        "resolve_runtime_assembly",
         "reattach",
         "reconcile",
         "new_attempt",
@@ -684,6 +691,28 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "finalizeJob": "v2-mutator",
         "cancelJob": "v2-mutator",
         "getCanonicalOpenApi": "v2-reader",
+        "resolveRuntimeAssembly": "v2-reader",
+        "createLiveWorkspaceSnapshot": "v2-mutator",
+        "inspectLiveWorkspaceSnapshot": "v2-reader",
+        "releaseLiveWorkspaceSnapshot": "v2-mutator",
+        "readLiveWorkspaceContent": "v2-reader",
+        "getLiveWorkspaceDiff": "v2-reader",
+        "createDevSession": "v2-mutator",
+        "inspectDevSession": "v2-reader",
+        "renewDevSession": "v2-mutator",
+        "revokeDevSession": "v2-mutator",
+        "relayDevSession": "v2-reader",
+        "ensureProjectWorkspace": "v2-mutator",
+        "inspectProjectWorkspace": "v2-reader",
+        "createProjectDevSession": "v2-mutator",
+        "inspectProjectDevSession": "v2-reader",
+        "renewProjectDevSession": "v2-mutator",
+        "revokeProjectDevSession": "v2-mutator",
+        "relayProjectDevSession": "v2-reader",
+        "createProjectWorkspaceSnapshot": "v2-mutator",
+        "readProjectWorkspaceSnapshotContent": "v2-reader",
+        "registerProjectWorkspaceImport": "v2-mutator",
+        "putProjectWorkspaceImportContent": "v2-mutator",
     }
     all_mapped_codes: set[str] = set()
     observed_operations: set[str] = set()
@@ -731,7 +760,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "source": "exact-response-bytes",
         "encoding": "lowercase-hex",
     }
-    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.4.0"
+    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.6.0"
     assert discovery["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
     assert document["x-kcs-legacy-authorization"] == {
         "v2NamespaceAccess": "denied",

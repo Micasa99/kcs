@@ -1,4 +1,4 @@
-"""Canonical 2.5 native-runner and M2 wire models.
+"""Canonical 2.6 native-runner and M2 wire models.
 
 The native arm is intentionally validated from the packaged canonical OpenAPI
 document.  This keeps the implementation and the frozen contract on one source
@@ -32,8 +32,8 @@ def _canonical_document() -> dict[str, Any]:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError("KCS_V2_OPENAPI_PATH is not a valid contract") from error
-        if value.get("info", {}).get("version") != "2.5.0":
-            raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.5 contract")
+        if value.get("info", {}).get("version") != "2.6.0":
+            raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.6 contract")
         return value
     candidates = [
         Path(__file__).resolve().parents[3] / "openapi/generated/kcs-v2-jobs.openapi.json"
@@ -41,7 +41,7 @@ def _canonical_document() -> dict[str, Any]:
     for candidate in candidates:
         if candidate.is_file():
             value = json.loads(candidate.read_text(encoding="utf-8"))
-            if value.get("info", {}).get("version") == "2.5.0":
+            if value.get("info", {}).get("version") == "2.6.0":
                 return value
     payload = (
         importlib.resources.files("kcs.openapi")
@@ -49,8 +49,8 @@ def _canonical_document() -> dict[str, Any]:
         .read_text(encoding="utf-8")
     )
     value = json.loads(payload)
-    if value.get("info", {}).get("version") != "2.5.0":
-        raise RuntimeError("the served KCS package does not contain the active 2.5 contract")
+    if value.get("info", {}).get("version") != "2.6.0":
+        raise RuntimeError("the served KCS package does not contain the active 2.6 contract")
     return value
 
 

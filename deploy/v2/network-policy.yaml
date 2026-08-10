@@ -10,3 +10,23 @@ spec:
   policyTypes:
     - Ingress
   ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kcs-v2-project-workspace-ingress
+  namespace: researchcosmos-v2
+spec:
+  podSelector:
+    matchLabels:
+      researchcosmos.io/managed-by: v2-project-workspace
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kcs-v2-api
+      ports:
+        - protocol: TCP
+          port: 8080

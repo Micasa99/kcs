@@ -22,6 +22,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     KCS_CONTROL_STATE_DIR=/run/rc-control/control-state \
     KCS_NATIVE_FINALIZE_RECEIPT_PATH=/run/rc-control/finalize-receipt.json
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /wheels /tmp/wheels
 RUN python -m pip install --disable-pip-version-check --no-cache-dir --no-deps \
       /tmp/wheels/rfc8785-*.whl /tmp/wheels/kcs-*.whl \

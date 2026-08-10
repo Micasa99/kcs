@@ -13,6 +13,10 @@ _ROUTE_EXPORTS = {
         "kcs.server.routes.jobs",
         "install_dev_session_websocket",
     ),
+    "install_project_dev_session_websocket": (
+        "kcs.server.routes.jobs",
+        "install_project_dev_session_websocket",
+    ),
     "shell_proxy_router": ("kcs.server.routes.shell_proxy_routes", "router"),
     "shell_sessions_router": ("kcs.server.routes.shell_sessions", "router"),
     "system_router": ("kcs.server.routes.system", "router"),
@@ -38,4 +42,5 @@ __all__ = [
     "shell_sessions_router",
     "create_jobs_router",
     "install_dev_session_websocket",
+    "install_project_dev_session_websocket",
 ]

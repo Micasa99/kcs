@@ -449,4 +449,8 @@ def _stage_single_file(transport: LocalWorkspaceRpcTransport, content: bytes) ->
         },
     ).header
     assert reply.get("state") == "succeeded", reply
+    stage = reply["inlineResult"]
+    assert stage["git_enabled"] is True
+    assert stage["git_branch"].startswith("rc/attempt/")
+    assert len(stage["git_base_commit"]) == 40
     return tree_digest
