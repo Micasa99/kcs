@@ -21,19 +21,19 @@ checkout and never overwrites or merges the current Project checkout.
 
 ## Active contract and images
 
-- OpenAPI version: `2.6.1`, 58 operations.
+- OpenAPI version: `2.6.2`, 58 operations.
 - Canonical JSON SHA-256:
-  `5728f11b8fceab219deb86a37e85258da4bb66eedde7878e5c107bb39b083cd1`.
+  `d4a13a2c887bb1e43d02e0a4bc81571be09d8088cffac7879042f1fc16a59729`.
 - Source implementation commit:
-  `f24b58e61f4e4f9865edccead7db700b7faa0063`.
+  `9513660ce87c96b11a620d2704e812e071511af5`.
 - Active API image:
-  `10.255.250.1:5000/researchcosmos/kcs-api@sha256:3e3837774c30c648627ecfb6e508fbd808eef9f10684973dcc49df702d29b6d3`.
+  `10.255.250.1:5000/researchcosmos/kcs-api@sha256:8d1aab473f9cdb8ec0f21ccabda50d0c968d686734f769993ded35a5ebe3b15e`.
 - Workspace control image:
-  `10.255.250.1:5000/researchcosmos/kcs-control@sha256:93b5011ea68e43c66024e7e6edbf8661e3964c526ad8080621dedf23f14851ba`.
+  `10.255.250.1:5000/researchcosmos/kcs-control@sha256:9b1bf603ace7bb084d14be293526d0b48913c553ac5604f40bf9a0a5d5ec6b75`.
 - AICOSMOS Workspace extension ImageVolume:
-  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:8b7c9e00768acb898af07d47ca0a46e169b359c26a88b5a8546cb9c7b44188bd`;
+  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:2f026f86b8daf54a14c704243d0f37c262fdf7dd0790eac25ca615e06e50bd2f`;
   raw VSIX SHA-256
-  `e33935606003ddecdf6481f28cef65d9e166e6110e7805551f295651692fb6a8`.
+  `1a2d55e658c11e61a50c75d2ba42542cddcf5e81564679f9693457dace11c682`.
 
 The operator must copy these exact refs into the deployment configuration. There
 is no local, SSH, Hosted, empty-directory, or mutable-tag fallback.
@@ -69,6 +69,13 @@ After evidence collection, the canary namespace, both canary PVCs, and its
 temporary cluster binding were deleted and confirmed absent. Ephemeral canary
 credentials were removed from the evidence directory. The production
 `researchcosmos-v2` namespace was not changed.
+
+The active 2.6.2 closeout then exercised the Product-owned path with two
+independent source Attempts and one dependent synthesis node. The Project
+working copy contained the two uploaded files at their exact SHA-256 digests.
+The source Attempts ran in distinct Jobs, Pods, PVCs, and Git branches; both
+staged successfully, exited zero, produced sealed revisions, and imported into
+different retained checkouts without changing the Project working copy.
 
 ## Deliberate boundary
 
