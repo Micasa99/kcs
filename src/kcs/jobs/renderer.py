@@ -522,9 +522,10 @@ class V2JobRenderer:
             ),
             client.V1Volume(
                 name=CONTROL_VOLUME,
-                empty_dir=client.V1EmptyDirVolumeSource(
-                    size_limit=f"{control_volume_mib}Mi"
-                ),
+                # Runner evidence and control state grow with the real session.  A
+                # per-volume cap can evict an otherwise healthy Attempt before
+                # capture; Pod/container ephemeral-storage remains the authority.
+                empty_dir=client.V1EmptyDirVolumeSource(),
             ),
             client.V1Volume(
                 name=USER_HOME_VOLUME,
