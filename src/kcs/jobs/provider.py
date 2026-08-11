@@ -1700,6 +1700,13 @@ class V2JobProvider:
             report.indeterminate += self.reconcile_credentials()
             report.indeterminate += self.reconcile_terminals()
             report.indeterminate += self._dev_sessions.reconcile()
+            if self._project_workspaces is not None:
+                try:
+                    workspace_report = self._project_workspaces.reconcile()
+                    report.reconciled += workspace_report["hibernated"]
+                    report.deleted += workspace_report["orphans"]
+                except Exception:
+                    report.indeterminate += 1
             for record in self._store.list_create():
                 report.scanned += 1
                 job_ref = str(_field(record, "job_ref"))

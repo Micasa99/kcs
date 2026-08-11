@@ -37,6 +37,7 @@ from .errors import (
     KcsV2Error,
     MaterializationFailedError,
     PayloadTooLargeError,
+    QuotaExceededError,
     StaleBindingError,
 )
 from .settings import V2RuntimeSettings
@@ -50,6 +51,7 @@ SESSION_VOLUME = "project-session"
 CONTROL_SOCKET_VOLUME = "workspace-control"
 WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
 MAX_PROJECT_BUNDLE_BYTES = 128 * 1024 * 1024
+ACCESS_TOUCH_SECONDS = 300
 
 
 class _WireModel(BaseModel):
@@ -644,6 +646,8 @@ class ProjectWorkspaceService:
     def ensure(self, request: EnsureProjectWorkspaceRequest) -> ProjectWorkspaceMutation:
         ref = request.workspace_ref
         now = self._now()
+        if self._store.read_runtime("project-workspace", ref, ref) is None:
+            self._enforce_quota(request.spec)
         values = {
             "identityDigest": request.request_digest,
             "requestDigest": request.request_digest,
@@ -655,6 +659,7 @@ class ProjectWorkspaceService:
             "podName": "",
             "podUid": "",
             "createdAt": now.isoformat(),
+            "lastAccessAt": now.isoformat(),
             "observedAt": now.isoformat(),
         }
         record, created = self._store.reserve_runtime(
@@ -662,6 +667,7 @@ class ProjectWorkspaceService:
         )
         if record.values.get("identityDigest") != request.request_digest:
             raise IdentityDigestConflict()
+        self._touch(ref, force=True)
         if self._kube.read_persistent_volume_claim(project_pvc_name(ref)) is None:
             try:
                 self._kube.create_persistent_volume_claim(
@@ -765,6 +771,7 @@ class ProjectWorkspaceService:
     def create_dev_session(
         self, workspace_ref: str, request: ProjectDevSessionCreateRequest
     ) -> ProjectDevSessionMutation:
+        self._touch(workspace_ref, force=True)
         binding = self._binding(workspace_ref, request.spec.generation)
         workspace = self.inspect(workspace_ref)
         if (
@@ -828,6 +835,7 @@ class ProjectWorkspaceService:
         credential: str,
         request: ProjectDevSessionRenewRequest,
     ) -> ProjectDevSessionMutation:
+        self._touch(workspace_ref, force=True)
         record = self._access_session(workspace_ref, session_ref, credential)
         values = dict(record.values)
         if values.get("renewRef") == request.renew_ref:
@@ -884,6 +892,7 @@ class ProjectWorkspaceService:
     def relay_target(
         self, workspace_ref: str, session_ref: str, credential: str, path: str
     ) -> ProjectRelayTarget:
+        self._touch(workspace_ref)
         record = self._access_session(workspace_ref, session_ref, credential)
         values = dict(record.values)
         try:
@@ -909,6 +918,7 @@ class ProjectWorkspaceService:
     def create_snapshot(
         self, workspace_ref: str, request: CreateProjectSnapshotRequest
     ) -> tuple[ProjectTreeSnapshot, bool]:
+        self._touch(workspace_ref, force=True)
         binding = self._binding(workspace_ref, request.spec.expected_generation)
         retained = self._store.read_runtime("project-snapshot", workspace_ref, request.snapshot_ref)
         if retained is not None:
@@ -982,6 +992,7 @@ class ProjectWorkspaceService:
     def register_import(
         self, workspace_ref: str, request: RegisterProjectImportRequest
     ) -> tuple[ProjectImportSnapshot, bool]:
+        self._touch(workspace_ref, force=True)
         self._binding(workspace_ref, request.spec.expected_generation)
         now = self._now()
         values = {
@@ -1049,6 +1060,109 @@ class ProjectWorkspaceService:
         )
         return self._import_snapshot(
             self._store.update_runtime("project-import", workspace_ref, import_ref, values)
+        )
+
+    def reconcile(self) -> dict[str, int]:
+        """Hibernate idle IDE compute and remove ownerless managed resources.
+
+        Hibernation deliberately keeps the Project PVC and owner record.  A later
+        idempotent ``ensure`` recreates the CPU-only service against the same data.
+        """
+
+        now = self._now()
+        records = self._store.list_runtime("project-workspace", strict=True)
+        known_hashes = {_short_hash(record.job_ref, 16) for record in records}
+        hibernated = 0
+        orphans = 0
+        for record in records:
+            values = dict(record.values)
+            last_access = _parse_time(
+                values.get("lastAccessAt") or values.get("createdAt")
+            )
+            if (
+                (now - last_access).total_seconds()
+                < self._settings.project_workspace_idle_seconds
+                or self._has_active_session(record.job_ref, now)
+            ):
+                continue
+            if self._kube.delete_deployment(project_deployment_name(record.job_ref)):
+                hibernated += 1
+            secret = self._kube.read_secret(
+                project_session_secret_name(record.job_ref)
+            )
+            secret_uid = str(_field(_field(secret, "metadata", {}), "uid") or "")
+            if secret_uid:
+                self._kube.delete_secret(
+                    project_session_secret_name(record.job_ref), secret_uid
+                )
+            if not values.get("hibernatedAt"):
+                values.update(hibernatedAt=now.isoformat(), observedAt=now.isoformat())
+                self._store.update_runtime(
+                    "project-workspace", record.job_ref, record.identity, values
+                )
+
+        selector = f"researchcosmos.io/managed-by={MANAGED_BY}"
+        for deployment in self._kube.list_deployments(selector):
+            metadata = _field(deployment, "metadata", {})
+            labels = _field(metadata, "labels", {}) or {}
+            if labels.get("researchcosmos.io/project-workspace-hash") in known_hashes:
+                continue
+            name = str(_field(metadata, "name") or "")
+            if name and self._kube.delete_deployment(name):
+                orphans += 1
+        for pvc in self._kube.list_persistent_volume_claims(selector):
+            metadata = _field(pvc, "metadata", {})
+            labels = _field(metadata, "labels", {}) or {}
+            if labels.get("researchcosmos.io/project-workspace-hash") in known_hashes:
+                continue
+            name = str(_field(metadata, "name") or "")
+            if name and self._kube.delete_persistent_volume_claim(name):
+                orphans += 1
+        return {"hibernated": hibernated, "orphans": orphans}
+
+    def _enforce_quota(self, spec: ProjectWorkspaceSpec) -> None:
+        records = [
+            record
+            for record in self._store.list_runtime(
+                "project-workspace", strict=True
+            )
+            if record.values.get("tenantRef") == spec.tenant_ref
+        ]
+        allocated = sum(int(record.values.get("storageGiB", "0")) for record in records)
+        if (
+            len(records) >= self._settings.project_workspaces_per_tenant
+            or allocated + spec.storage_gib
+            > self._settings.project_workspace_gib_per_tenant
+        ):
+            raise QuotaExceededError(
+                "Project Workspace tenant quota is exhausted",
+                context={
+                    "workspaceCount": len(records),
+                    "allocatedGiB": allocated,
+                    "requestedGiB": spec.storage_gib,
+                },
+            )
+
+    def _has_active_session(self, workspace_ref: str, now: datetime) -> bool:
+        return any(
+            record.values.get("state") in {"opening", "ready"}
+            and _parse_time(record.values.get("expiresAt")) > now
+            for record in self._store.list_runtime(
+                "project-dev-session", workspace_ref, strict=True
+            )
+        )
+
+    def _touch(self, workspace_ref: str, *, force: bool = False) -> None:
+        record = self._record(workspace_ref)
+        values = dict(record.values)
+        now = self._now()
+        previous = _parse_time(values.get("lastAccessAt") or values.get("createdAt"))
+        if not force and (now - previous).total_seconds() < ACCESS_TOUCH_SECONDS:
+            return
+        values["lastAccessAt"] = now.isoformat()
+        values.pop("hibernatedAt", None)
+        self._store.update_runtime(
+            "project-workspace", workspace_ref, workspace_ref, values
         )
 
     def _rpc(

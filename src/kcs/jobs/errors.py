@@ -225,6 +225,13 @@ class CapacityLimitError(KcsV2Error):
     default_message = "The native runtime cannot be admitted with the available capacity"
 
 
+class QuotaExceededError(KcsV2Error):
+    code = "QUOTA_EXCEEDED"
+    status_code = 429
+    recovery_action = "none"
+    default_message = "The Project Workspace tenant quota is exhausted"
+
+
 class CredentialDestroyFailedError(KcsV2Error):
     code = "CREDENTIAL_DESTROY_FAILED"
     status_code = 500

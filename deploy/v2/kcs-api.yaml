@@ -88,6 +88,12 @@ spec:
                 configMapKeyRef:
                   name: kcs-v2-native-runtime-config
                   key: project-workspace-vsix-sha256
+            - name: KCS_V2_PROJECT_WORKSPACE_IDLE_SECONDS
+              value: "21600"
+            - name: KCS_V2_PROJECT_WORKSPACES_PER_TENANT
+              value: "20"
+            - name: KCS_V2_PROJECT_WORKSPACE_GIB_PER_TENANT
+              value: "200"
             - name: KCS_V2_MODEL_GATEWAY_OPENAI_BASE_URL
               valueFrom:
                 configMapKeyRef:

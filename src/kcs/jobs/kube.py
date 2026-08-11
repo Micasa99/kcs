@@ -96,6 +96,14 @@ class CoreV1Api(Protocol):
 
     def read_namespaced_persistent_volume_claim(self, *, name: str, namespace: str) -> Any: ...
 
+    def list_namespaced_persistent_volume_claim(
+        self, *, namespace: str, label_selector: str
+    ) -> Any: ...
+
+    def delete_namespaced_persistent_volume_claim(
+        self, *, name: str, namespace: str, body: Any
+    ) -> Any: ...
+
 
 class AppsV1Api(Protocol):
     """Deployment surface used only by durable Project Workspace services."""
@@ -103,6 +111,14 @@ class AppsV1Api(Protocol):
     def create_namespaced_deployment(self, *, namespace: str, body: Any) -> Any: ...
 
     def read_namespaced_deployment(self, *, name: str, namespace: str) -> Any: ...
+
+    def list_namespaced_deployment(
+        self, *, namespace: str, label_selector: str
+    ) -> Any: ...
+
+    def delete_namespaced_deployment(
+        self, *, name: str, namespace: str, body: Any
+    ) -> Any: ...
 
 
 class CustomObjectsApi(Protocol):
@@ -194,6 +210,23 @@ class V2KubeAdapter:
                 return None
             raise
 
+    def list_persistent_volume_claims(self, label_selector: str) -> list[Any]:
+        result = self._core.list_namespaced_persistent_volume_claim(
+            namespace=self.namespace, label_selector=label_selector
+        )
+        return list(_value(result, "items") or ())
+
+    def delete_persistent_volume_claim(self, name: str) -> bool:
+        try:
+            self._core.delete_namespaced_persistent_volume_claim(
+                name=name, namespace=self.namespace, body={}
+            )
+            return True
+        except Exception as exc:
+            if _status(exc) == 404:
+                return False
+            raise
+
     def create_deployment(self, body: Any) -> Any:
         if self._apps is None:
             raise DependencyUnavailableError("Kubernetes Apps API is not configured")
@@ -207,6 +240,27 @@ class V2KubeAdapter:
         except Exception as exc:
             if _status(exc) == 404:
                 return None
+            raise
+
+    def list_deployments(self, label_selector: str) -> list[Any]:
+        if self._apps is None:
+            raise DependencyUnavailableError("Kubernetes Apps API is not configured")
+        result = self._apps.list_namespaced_deployment(
+            namespace=self.namespace, label_selector=label_selector
+        )
+        return list(_value(result, "items") or ())
+
+    def delete_deployment(self, name: str) -> bool:
+        if self._apps is None:
+            raise DependencyUnavailableError("Kubernetes Apps API is not configured")
+        try:
+            self._apps.delete_namespaced_deployment(
+                name=name, namespace=self.namespace, body={}
+            )
+            return True
+        except Exception as exc:
+            if _status(exc) == 404:
+                return False
             raise
 
     def list_pods(self, label_selector: str) -> list[Any]:

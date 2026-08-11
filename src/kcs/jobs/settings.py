@@ -21,6 +21,9 @@ DEFAULT_EVENT_DB_PATH = Path("/var/lib/kcs-v2/events.sqlite3")
 DEFAULT_NATIVE_PROVISION_SECONDS = 900
 DEFAULT_NATIVE_CAPTURE_SECONDS = 900
 DEFAULT_NATIVE_FINALIZE_SECONDS = 300
+DEFAULT_PROJECT_WORKSPACE_IDLE_SECONDS = 6 * 60 * 60
+DEFAULT_PROJECT_WORKSPACES_PER_TENANT = 20
+DEFAULT_PROJECT_WORKSPACE_GIB_PER_TENANT = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,9 @@ class V2RuntimeSettings:
     project_workspace_control_image: str | None = None
     project_workspace_vsix_image_volume: str | None = None
     project_workspace_vsix_sha256: str | None = None
+    project_workspace_idle_seconds: int = DEFAULT_PROJECT_WORKSPACE_IDLE_SECONDS
+    project_workspaces_per_tenant: int = DEFAULT_PROJECT_WORKSPACES_PER_TENANT
+    project_workspace_gib_per_tenant: int = DEFAULT_PROJECT_WORKSPACE_GIB_PER_TENANT
     model_gateway_openai_base_urls: tuple[str, ...] = ()
     model_gateway_anthropic_base_urls: tuple[str, ...] = ()
     native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
@@ -176,6 +182,29 @@ class V2RuntimeSettings:
             environ.get("KCS_V2_NATIVE_FINALIZE_SECONDS", str(DEFAULT_NATIVE_FINALIZE_SECONDS)),
             "KCS_V2_NATIVE_FINALIZE_SECONDS",
         )
+        project_workspace_idle_seconds = _bounded_seconds(
+            environ.get(
+                "KCS_V2_PROJECT_WORKSPACE_IDLE_SECONDS",
+                str(DEFAULT_PROJECT_WORKSPACE_IDLE_SECONDS),
+            ),
+            "KCS_V2_PROJECT_WORKSPACE_IDLE_SECONDS",
+        )
+        project_workspaces_per_tenant = _bounded_integer(
+            environ.get(
+                "KCS_V2_PROJECT_WORKSPACES_PER_TENANT",
+                str(DEFAULT_PROJECT_WORKSPACES_PER_TENANT),
+            ),
+            "KCS_V2_PROJECT_WORKSPACES_PER_TENANT",
+            maximum=1000,
+        )
+        project_workspace_gib_per_tenant = _bounded_integer(
+            environ.get(
+                "KCS_V2_PROJECT_WORKSPACE_GIB_PER_TENANT",
+                str(DEFAULT_PROJECT_WORKSPACE_GIB_PER_TENANT),
+            ),
+            "KCS_V2_PROJECT_WORKSPACE_GIB_PER_TENANT",
+            maximum=102400,
+        )
 
         return cls(
             namespace=namespace,
@@ -198,6 +227,9 @@ class V2RuntimeSettings:
             native_provision_seconds=native_provision_seconds,
             native_capture_seconds=native_capture_seconds,
             native_finalize_seconds=native_finalize_seconds,
+            project_workspace_idle_seconds=project_workspace_idle_seconds,
+            project_workspaces_per_tenant=project_workspaces_per_tenant,
+            project_workspace_gib_per_tenant=project_workspace_gib_per_tenant,
         )
 
 
@@ -244,6 +276,16 @@ def _bounded_seconds(raw: str, name: str) -> int:
         raise ValueError(f"{name} must be an integer") from None
     if not 1 <= value <= 86400:
         raise ValueError(f"{name} must be between 1 and 86400")
+    return value
+
+
+def _bounded_integer(raw: str, name: str, *, maximum: int) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
     return value
 
 
