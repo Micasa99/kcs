@@ -14,11 +14,11 @@ data:
     {"version":1,"capabilities":[]}
   openvscode-image-volume: 10.255.250.1:5000/researchcosmos/rc-openvscode-server@sha256:f81187d7c9480c74cddbc3eec3955c239d492b4fbc1cb023b14c154f8b2d4e40
   dev-session-relay-image: 10.255.250.1:5000/researchcosmos/rc-dev-session-relay@sha256:7c684bc24bd04b2dd883b56c40d3df9674e01b1d292aaa4d3084ce3008ebaa04
-  project-workspace-control-image: 10.255.250.1:5000/researchcosmos/kcs-control@sha256:f6c49b621a7d8a10e369937aead5e040962b29057fe886163f9b01b2678ea524
+  project-workspace-control-image: 10.255.250.1:5000/researchcosmos/kcs-control@sha256:93b5011ea68e43c66024e7e6edbf8661e3964c526ad8080621dedf23f14851ba
   # Exact RC-published extension artifact. The Workspace init verifies the raw
   # VSIX SHA before installing it into the persistent IDE extensions directory.
-  project-workspace-vsix-image-volume: 10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:48f5daf6f3ec900ad14d014dcc14905d9868df24f27d58dde24242f9e805c292
-  project-workspace-vsix-sha256: 5ffad8795df18e9fd4c1ae70d4c5f66ec5ee07afce069e3579a17c56c0804ff7
+  project-workspace-vsix-image-volume: 10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:8b7c9e00768acb898af07d47ca0a46e169b359c26a88b5a8546cb9c7b44188bd
+  project-workspace-vsix-sha256: e33935606003ddecdf6481f28cef65d9e166e6110e7805551f295651692fb6a8
   # Comma-separated exact HTTPS allowlists support isolated Product environments
   # without granting arbitrary runner egress.
   openai-base-url: https://model-gateway.researchcosmos-v2.svc.cluster.local/v1

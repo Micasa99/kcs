@@ -1,7 +1,7 @@
 # Durable Project Workspace handoff
 
-Status: **KCS implementation complete; isolated remote canary passed; production
-unchanged**.
+Status: **KCS implementation complete; isolated remote canary passed; active
+deployment updated**.
 
 The only supported flow is:
 
@@ -25,15 +25,15 @@ checkout and never overwrites or merges the current Project checkout.
 - Canonical JSON SHA-256:
   `28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd`.
 - Source implementation commit:
-  `f5648385c71111a2aeeafdcbc5b7e3f06fa8d59c`.
-- Canary API image:
-  `10.255.250.1:5000/researchcosmos/kcs-api@sha256:8bfa5d673f08b2014b82e655603885ca27d8a34948dce0f18955e48b4ac57b34`.
+  `f24b58e61f4e4f9865edccead7db700b7faa0063`.
+- Active API image:
+  `10.255.250.1:5000/researchcosmos/kcs-api@sha256:3e3837774c30c648627ecfb6e508fbd808eef9f10684973dcc49df702d29b6d3`.
 - Workspace control image:
-  `10.255.250.1:5000/researchcosmos/kcs-control@sha256:f6c49b621a7d8a10e369937aead5e040962b29057fe886163f9b01b2678ea524`.
+  `10.255.250.1:5000/researchcosmos/kcs-control@sha256:93b5011ea68e43c66024e7e6edbf8661e3964c526ad8080621dedf23f14851ba`.
 - AICOSMOS Workspace extension ImageVolume:
-  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:48f5daf6f3ec900ad14d014dcc14905d9868df24f27d58dde24242f9e805c292`;
+  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:8b7c9e00768acb898af07d47ca0a46e169b359c26a88b5a8546cb9c7b44188bd`;
   raw VSIX SHA-256
-  `5ffad8795df18e9fd4c1ae70d4c5f66ec5ee07afce069e3579a17c56c0804ff7`.
+  `e33935606003ddecdf6481f28cef65d9e166e6110e7805551f295651692fb6a8`.
 
 The operator must copy these exact refs into the deployment configuration. There
 is no local, SSH, Hosted, empty-directory, or mutable-tag fallback.
