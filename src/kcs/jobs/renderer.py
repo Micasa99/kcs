@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from urllib.parse import urlsplit, urlunsplit
 
 from kubernetes import client  # type: ignore[import-untyped]
 
@@ -35,6 +36,19 @@ WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
 
 def _short_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def _product_base_from_gateway(openai_base_url: str) -> str:
+    """Recover the same-origin Product base from RC's frozen gateway URL."""
+
+    suffix = "/api/runtime/model-gateway/openai/v1"
+    parsed = urlsplit(openai_base_url.rstrip("/"))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if not path.endswith(suffix):
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, path[: -len(suffix)], "", ""))
 
 
 def job_ref_for_provider_request(provider_request_id: str) -> str:
@@ -315,6 +329,7 @@ class V2JobRenderer:
                 )
             )
         model_env = dict(native["modelEnv"])
+        product_base = _product_base_from_gateway(model_env.get("OPENAI_BASE_URL", ""))
         launcher_env = {
             **model_env,
             "RC_NATIVE_RUNNER_ENTRYPOINT_JSON": json.dumps(
@@ -375,6 +390,8 @@ class V2JobRenderer:
                         "KCS_NATIVE_LAUNCHER_SOCKET": str(recipe.root["launcherSocketPath"]),
                         "KCS_NATIVE_RUNNER_STATE_PATH": "/run/rc-control/runner-state.json",
                         "TMPDIR": "/run/rc-control",
+                        "AICOSMOS_ATTEMPT_REF": str(spec["subjectRef"]),
+                        "AICOSMOS_PRODUCT_BASE": product_base,
                     }
                 ),
                 resources=client.V1ResourceRequirements(
@@ -430,7 +447,6 @@ class V2JobRenderer:
                 active_deadline_seconds=hard_deadline,
             ),
         )
-
     def _native_volumes(
         self,
         job_ref: str,

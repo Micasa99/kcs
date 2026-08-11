@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from kcs.jobs.project_workspace import ProjectWorkspaceRenderer
 from kcs.jobs.settings import V2RuntimeSettings
 from kcs.jobs.transport import LocalWorkspaceRpcTransport
@@ -31,7 +33,7 @@ def test_project_workspace_is_persistent_cpu_only_and_installs_exact_extension()
     renderer = ProjectWorkspaceRenderer(settings)
 
     pvc = renderer.pvc("workspace-1", 40)
-    deployment = renderer.deployment("workspace-1")
+    deployment = renderer.deployment("workspace-1", "conv_project_1")
     pod = deployment.spec.template.spec
 
     assert pvc.spec.access_modes == ["ReadWriteOnce"]
@@ -59,16 +61,22 @@ def test_project_workspace_is_persistent_cpu_only_and_installs_exact_extension()
     assert "--install-extension" in bootstrap.args[0]
     openvscode = next(item for item in pod.containers if item.name == "openvscode")
     assert "/workspace/worktree" in openvscode.args[0]
+    control = next(item for item in pod.containers if item.name == "workspace-control")
+    assert {item.name: item.value for item in control.env}[
+        "AICOSMOS_CONVERSATION_REF"
+    ] == "conv_project_1"
 
 
 def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     worktree = workspace / "worktree"
     worktree.mkdir(parents=True)
     (workspace / "retained").mkdir()
     (worktree / "analysis.py").write_text("print('base')\n")
+    monkeypatch.setenv("AICOSMOS_CONVERSATION_REF", "conv_project_1")
     control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
     transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
 
@@ -93,6 +101,11 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     assert _git(worktree, "symbolic-ref", "--short", "HEAD") == "rc/project"
     assert _git(worktree, "status", "--porcelain") == ""
     assert _git(worktree, "rev-parse", "HEAD") == snapshot["baseCommit"]
+    private_context = worktree / ".kcs" / "aicosmos.json"
+    assert json.loads(private_context.read_text()) == {
+        "conversationRef": "conv_project_1"
+    }
+    assert all(entry["path"] != ".kcs/aicosmos.json" for entry in bundle["entries"])
 
     result = b"print('retained result')\n"
     entry = bundle["entries"][0]

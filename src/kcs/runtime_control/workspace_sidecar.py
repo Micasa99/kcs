@@ -208,6 +208,20 @@ class RuntimeControlSidecar:
         self._native_state_sequence = 0
         self._native_state_digest: str | None = None
         self.shutdown_requested = False
+        self._workspace_context = {
+            key: value
+            for key, value in (
+                ("conversationRef", os.environ.get("AICOSMOS_CONVERSATION_REF", "").strip()),
+                ("attemptRef", os.environ.get("AICOSMOS_ATTEMPT_REF", "").strip()),
+                ("productBase", os.environ.get("AICOSMOS_PRODUCT_BASE", "").strip()),
+            )
+            if value
+        }
+        worktree = self.workspace / "worktree"
+        if self._workspace_context and (
+            "conversationRef" in self._workspace_context or (worktree / ".git").exists()
+        ):
+            self._publish_workspace_context()
 
     def dispatch(self, frame: bytes, body: Path | None, response_path: Path) -> None:
         """Handle one framed request and write one framed response atomically."""
@@ -1751,6 +1765,7 @@ class RuntimeControlSidecar:
         )
         identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
         branch, base_commit = self._initialize_attempt_git(identity, declared_tree_digest)
+        self._publish_workspace_context()
         return {
             "ok": True,
             "resume_handle": f"workspace-stage://stage_{identity}",
@@ -1772,6 +1787,7 @@ class RuntimeControlSidecar:
         branch = f"rc/attempt/{identity}"
         git_dir = worktree / ".git"
         if git_dir.exists():
+            self._exclude_platform_context_from_git(worktree)
             retained = self._git(worktree, ["rev-parse", "--verify", "HEAD"]).strip()
             recorded = self._git(
                 worktree,
@@ -1784,6 +1800,7 @@ class RuntimeControlSidecar:
                 )
             return branch, retained
         self._git(worktree, ["init", "--shared=group", "-b", branch])
+        self._exclude_platform_context_from_git(worktree)
         self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
         self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
         self._git(worktree, ["config", "rc.baseTreeDigest", tree_digest])
@@ -2113,6 +2130,7 @@ class RuntimeControlSidecar:
             self._git(worktree, ["init", "--shared=group", "-b", "rc/project"])
             self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
             self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
+        self._exclude_platform_context_from_git(worktree)
         index = self._project_snapshots / f".index-{hashlib.sha256(identity.encode()).hexdigest()}"
         index.unlink(missing_ok=True)
         environment = {"GIT_INDEX_FILE": str(index)}
@@ -2205,6 +2223,14 @@ class RuntimeControlSidecar:
             raise _RpcRejectedError("MATERIALIZATION_FAILED", "Git workspace operation failed")
         return result.stdout.decode("utf-8", errors="strict")
 
+    @staticmethod
+    def _exclude_platform_context_from_git(worktree: Path) -> None:
+        exclude = worktree / ".git" / "info" / "exclude"
+        retained = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ".kcs/" not in retained.splitlines():
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text(retained.rstrip("\n") + "\n.kcs/\n", encoding="utf-8")
+
     def _project_snapshot_path(self, snapshot_ref: str) -> Path:
         return self._project_snapshots / (
             f"{hashlib.sha256(snapshot_ref.encode()).hexdigest()}.bundle"
@@ -2240,7 +2266,9 @@ class RuntimeControlSidecar:
                 relative_root = root_path.relative_to(worktree)
                 if relative_root == Path("."):
                     directories[:] = [
-                        name for name in directories if name not in {".git", ".cosmos"}
+                        name
+                        for name in directories
+                        if name not in {".git", ".cosmos", ".kcs"}
                     ]
                 for name in sorted(files):
                     path = root_path / name
@@ -2611,7 +2639,7 @@ class RuntimeControlSidecar:
                     }
                     pending_directories: list[tuple[str, int]] = []
                     for name in names:
-                        if not prefix and name in {".git", ".cosmos"}:
+                        if not prefix and name in {".git", ".cosmos", ".kcs"}:
                             continue
                         relative = f"{prefix}/{name}" if prefix else name
                         try:
@@ -2912,6 +2940,25 @@ class RuntimeControlSidecar:
             except FileNotFoundError:
                 pass
             os.close(parent_fd)
+
+    def _publish_workspace_context(self) -> None:
+        """Expose only non-sensitive Product subjects to the IDE extension.
+
+        The file is outside the research manifest: capture/live projections
+        explicitly exclude the top-level ``.kcs`` directory.  It is written
+        after Attempt Git initialization so it cannot enter the immutable base
+        commit, while Project workspaces can receive it at control startup.
+        """
+
+        if not self._workspace_context:
+            return
+        encoded = json.dumps(
+            self._workspace_context,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._write_workspace_file("worktree/.kcs/aicosmos.json", encoded, 0o640)
 
     def _workspace_file_mode(self, raw_path: str) -> str:
         parent_fd, target_name = self._open_parent(raw_path, create=False)

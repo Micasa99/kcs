@@ -13,7 +13,7 @@ from kcs.jobs.m2_contracts import CapabilityActivationPlan
 from kcs.jobs.native_contracts import NativeCreateJobRequest
 from kcs.jobs.provider import V2JobProvider
 from kcs.jobs.recipe_registry import NativeRecipeRegistry, runtime_recipe_digest
-from kcs.jobs.renderer import V2JobRenderer
+from kcs.jobs.renderer import V2JobRenderer, _product_base_from_gateway
 from kcs.jobs.runtime_assembly import NativeCapabilityRegistry, RuntimeAssemblyResolver
 from kcs.jobs.settings import V2RuntimeSettings
 from kcs.jobs.transport import LocalWorkspaceRpcTransport
@@ -286,6 +286,9 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
         "/opt/rc-skills/native-autonomous-research"
     ]
     assert json.loads(runner_env["RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON"]) == [TOOL_DISCOVERY]
+    control = next(item for item in pod.containers if item.name == "control")
+    control_env = {item.name: item.value for item in control.env}
+    assert control_env["AICOSMOS_ATTEMPT_REF"] == str(request.spec["subjectRef"])
     sidecars = {item.name: item for item in pod.init_containers}
     assert sidecars["openvscode"].restart_policy == "Always"
     assert "/workspace/worktree" not in sidecars["openvscode"].command
@@ -301,6 +304,12 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
     ]
     dev_credential = volumes["rc-dev-session-credential"]
     assert dev_credential.secret.default_mode == 0o400
+
+
+def test_product_base_is_derived_from_the_frozen_runtime_gateway() -> None:
+    assert _product_base_from_gateway(
+        "https://ai-cosmos.example/ai4sci/cosmos/api/runtime/model-gateway/openai/v1"
+    ) == "https://ai-cosmos.example/ai4sci/cosmos"
 
 
 def test_live_snapshot_rpc_is_immutable_bounded_and_releasable(tmp_path: Path) -> None:

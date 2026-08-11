@@ -323,7 +323,7 @@ class ProjectWorkspaceRenderer:
             ),
         )
 
-    def deployment(self, workspace_ref: str) -> client.V1Deployment:
+    def deployment(self, workspace_ref: str, conversation_ref: str) -> client.V1Deployment:
         control_image, openvscode, relay, extension_image, extension_sha256 = self._images()
         name = project_deployment_name(workspace_ref)
         labels = self._labels(workspace_ref)
@@ -454,6 +454,9 @@ class ProjectWorkspaceRenderer:
                             value="/workspace/.kcs/runtime-control",
                         ),
                         client.V1EnvVar(name="TMPDIR", value="/workspace/.kcs/tmp"),
+                        client.V1EnvVar(
+                            name="AICOSMOS_CONVERSATION_REF", value=conversation_ref
+                        ),
                     ],
                     resources=client.V1ResourceRequirements(
                         requests={"cpu": "100m", "memory": "128Mi"},
@@ -696,7 +699,9 @@ class ProjectWorkspaceService:
             )
         if self._kube.read_deployment(project_deployment_name(ref)) is None:
             try:
-                self._kube.create_deployment(self._renderer.deployment(ref))
+                self._kube.create_deployment(
+                    self._renderer.deployment(ref, request.spec.conversation_ref)
+                )
             except Exception as error:
                 if getattr(error, "status", None) != 409:
                     raise
