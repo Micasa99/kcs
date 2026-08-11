@@ -13,7 +13,7 @@ FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6d
 ARG SOURCE_REVISION
 ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN test -n "$SOURCE_REVISION"
-LABEL org.opencontainers.image.source="https://github.com/TitiSkywalker/kcs" \
+LABEL org.opencontainers.image.source="https://github.com/Micasa99/kcs" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.licenses="MIT"
 ENV PYTHONDONTWRITEBYTECODE=1 \
