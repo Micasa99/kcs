@@ -21,5 +21,5 @@ data:
   project-workspace-vsix-sha256: e33935606003ddecdf6481f28cef65d9e166e6110e7805551f295651692fb6a8
   # Comma-separated exact HTTPS allowlists support isolated Product environments
   # without granting arbitrary runner egress.
-  openai-base-url: https://model-gateway.researchcosmos-v2.svc.cluster.local/v1
-  anthropic-base-url: https://model-gateway.researchcosmos-v2.svc.cluster.local
+  openai-base-url: https://ai-cosmos.cn/ai4sci/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-test/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-stable/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/openai/v1
+  anthropic-base-url: https://ai-cosmos.cn/ai4sci/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-test/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-stable/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/anthropic
