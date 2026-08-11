@@ -1976,16 +1976,20 @@ class RuntimeControlSidecar:
             "declaredSizeBytes",
             "authorizedMaxSizeBytes",
             "baseCommit",
+            "target",
+            "expectedBaseTreeDigest",
         }
         if set(request) != expected or body is None:
             raise _RpcRejectedError("INVALID_REQUEST", "Project import request is not closed")
         import_ref = request.get("importRef")
         request_digest = request.get("requestDigest")
         expected_tree = request.get("expectedTreeDigest")
+        target_kind = request.get("target")
         if (
             not isinstance(import_ref, str)
             or not _is_hex_digest(request_digest)
             or not _is_hex_digest(expected_tree)
+            or target_kind not in {"retained", "working"}
         ):
             raise _RpcRejectedError("INVALID_REQUEST", "Project import identity is invalid")
         receipt_path = self._project_import_receipt_path(import_ref)
@@ -2037,13 +2041,61 @@ class RuntimeControlSidecar:
                 raise _RpcRejectedError(
                     "DIGEST_MISMATCH", "Project import tree digest differs"
                 )
+            if target_kind == "working":
+                expected_base = request.get("expectedBaseTreeDigest")
+                if not _is_hex_digest(expected_base):
+                    raise _RpcRejectedError(
+                        "INVALID_REQUEST", "Project working import has no exact base"
+                    )
+                capture_payload = {
+                    "max_files": _MAX_CAPTURE_TREE_FILES,
+                    "max_total_bytes": _MAX_CAPTURE_TREE_BYTES,
+                }
+                encoded_capture_payload = json.dumps(
+                    capture_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                current = self._capture_workspace_tree(
+                    {
+                        "protocol": "cosmos.workspace/1",
+                        "action": "capture_tree",
+                        "operation_id": f"project-working-base:{import_ref}",
+                        "request_digest": str(request_digest),
+                        "frame_digest": hashlib.sha256(
+                            encoded_capture_payload.encode()
+                        ).hexdigest(),
+                        "payload": capture_payload,
+                    }
+                )
+                if current["captured_tree_digest"] != expected_base:
+                    raise _RpcRejectedError(
+                        "STALE_BINDING", "Project working copy changed after its snapshot"
+                    )
+            elif request.get("expectedBaseTreeDigest") is not None:
+                raise _RpcRejectedError(
+                    "INVALID_REQUEST", "retained import cannot carry an exact working base"
+                )
             parent = request.get("baseCommit")
             commit = self._commit_project_tree(
                 entries,
                 import_ref,
-                "retained",
+                str(target_kind),
                 parent if isinstance(parent, str) and parent else None,
             )
+            if target_kind == "working":
+                receipt = {
+                    "importRef": import_ref,
+                    "sourceRevisionRef": request.get("sourceRevisionRef"),
+                    "retainedCheckoutRef": "project/worktree",
+                    "resultCommit": commit,
+                    "materializedTreeDigest": tree_digest,
+                }
+                _atomic_json(
+                    receipt_path, {"requestDigest": request_digest, "receipt": receipt}
+                )
+                return {"ok": True, "receipt": receipt}
             retained_ref = f"checkout_{hashlib.sha256(import_ref.encode()).hexdigest()[:24]}"
             retained_branch = (
                 f"rc/retained/{hashlib.sha256(import_ref.encode()).hexdigest()[:24]}"
@@ -2166,10 +2218,10 @@ class RuntimeControlSidecar:
                 ).strip()
                 if verified != parent:
                     raise _RpcRejectedError("STALE_BINDING", "Project base commit is unavailable")
-            elif kind == "snapshot":
+            elif kind in {"snapshot", "working"}:
                 parent = self._git(
                     worktree,
-                    ["rev-parse", "--verify", "refs/rc/project/snapshots^{commit}"],
+                    ["rev-parse", "--verify", "refs/heads/rc/project^{commit}"],
                     allow_failure=True,
                 ).strip() or None
             command = ["commit-tree", tree, "-m", f"Project {kind} {identity}"]
@@ -2188,16 +2240,20 @@ class RuntimeControlSidecar:
                     "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
                 },
             ).strip()
-            ref = (
-                "refs/rc/project/snapshots"
-                if kind == "snapshot"
-                else f"refs/heads/rc/retained/{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
-            )
-            self._git(worktree, ["update-ref", ref, commit])
             if kind == "snapshot":
+                ref = "refs/rc/project/snapshots"
+            elif kind == "working":
+                ref = "refs/heads/rc/project"
+            else:
+                ref = f"refs/heads/rc/retained/{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
+            self._git(worktree, ["update-ref", ref, commit])
+            if kind in {"snapshot", "working"}:
                 self._git(worktree, ["update-ref", "refs/heads/rc/project", commit])
                 self._git(worktree, ["symbolic-ref", "HEAD", "refs/heads/rc/project"])
-                self._git(worktree, ["read-tree", commit])
+                if kind == "working":
+                    self._git(worktree, ["reset", "--hard", commit])
+                else:
+                    self._git(worktree, ["read-tree", commit])
             return commit
         finally:
             index.unlink(missing_ok=True)
