@@ -13,6 +13,7 @@ RUN python -m pip install --index-url "$PIP_INDEX_URL" --timeout 120 --disable-p
 
 FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49
 ARG SOURCE_REVISION
+ARG APT_MIRROR=https://mirrors.aliyun.com/debian
 RUN test -n "$SOURCE_REVISION"
 LABEL org.opencontainers.image.source="https://github.com/TitiSkywalker/kcs" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
@@ -22,7 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     KCS_CONTROL_STATE_DIR=/run/rc-control/control-state \
     KCS_NATIVE_FINALIZE_RECEIPT_PATH=/run/rc-control/finalize-receipt.json
-RUN apt-get update \
+RUN sed -i "s|http://deb.debian.org/debian|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /wheels /tmp/wheels
