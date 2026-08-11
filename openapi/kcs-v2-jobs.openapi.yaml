@@ -2,7 +2,7 @@ openapi: 3.1.0
 x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
-  version: 2.6.1
+  version: 2.6.2
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -2551,7 +2551,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.6.1}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.6.2}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -2872,6 +2872,9 @@ components:
         declaredSizeBytes: {type: integer, minimum: 1, maximum: 134217728}
         baseCommit:
           oneOf: [{type: string, pattern: '^[0-9a-f]{40,64}$'}, {type: 'null'}]
+        target: {type: string, enum: [retained, working], default: retained}
+        expectedBaseTreeDigest:
+          oneOf: [{$ref: '#/components/schemas/Sha256'}, {type: 'null'}]
     RegisterProjectImportRequest:
       type: object
       additionalProperties: false

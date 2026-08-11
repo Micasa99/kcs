@@ -59,6 +59,7 @@ def test_project_workspace_is_persistent_cpu_only_and_installs_exact_extension()
     bootstrap = next(item for item in pod.init_containers if item.name == "ide-bootstrap")
     assert digest in {env.value for env in bootstrap.env}
     assert "--install-extension" in bootstrap.args[0]
+    assert "workspace extension already installed" in bootstrap.args[0]
     openvscode = next(item for item in pod.containers if item.name == "openvscode")
     assert "/workspace/worktree" in openvscode.args[0]
     control = next(item for item in pod.containers if item.name == "workspace-control")
@@ -117,6 +118,52 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     }
     assert all(entry["path"] != ".kcs/aicosmos.json" for entry in bundle["entries"])
 
+    upload = b"print('uploaded before fanout')\n"
+    working_bundle = json.loads(json.dumps(bundle))
+    working_bundle["entries"].append(
+        {
+            "path": "project/src/train.py",
+            "size": len(upload),
+            "sha256": hashlib.sha256(upload).hexdigest(),
+            "mode": "read_only",
+            "content_b64": base64.b64encode(upload).decode(),
+        }
+    )
+    working_bundle["entries"].sort(key=lambda item: item["path"])
+    working_bundle["treeDigest"] = _workspace_tree_digest(
+        [
+            {key: entry[key] for key in ("path", "size", "sha256", "mode")}
+            for entry in working_bundle["entries"]
+        ]
+    )
+    working_bytes = json.dumps(
+        working_bundle, sort_keys=True, separators=(",", ":")
+    ).encode()
+    working_payload = tmp_path / "project-base.bundle"
+    working_payload.write_bytes(working_bytes)
+    working = transport.rpc(
+        {},
+        {
+            "action": "importProjectWorkspaceRevision",
+            "workspaceRef": "workspace-1",
+            "importRef": "project-base-1",
+            "requestDigest": "c" * 64,
+            "generation": 1,
+            "sourceRevisionRef": "workspace_base_manifest:manifest-1",
+            "expectedTreeDigest": working_bundle["treeDigest"],
+            "contentSha256": hashlib.sha256(working_bytes).hexdigest(),
+            "declaredSizeBytes": len(working_bytes),
+            "authorizedMaxSizeBytes": 1024 * 1024,
+            "baseCommit": snapshot["baseCommit"],
+            "target": "working",
+            "expectedBaseTreeDigest": snapshot["treeDigest"],
+        },
+        working_payload,
+    ).header["receipt"]
+    assert working["retainedCheckoutRef"] == "project/worktree"
+    assert (worktree / "project" / "src" / "train.py").read_bytes() == upload
+    assert _git(worktree, "rev-parse", "HEAD") == working["resultCommit"]
+
     result = b"print('retained result')\n"
     entry = bundle["entries"][0]
     entry.update(
@@ -144,6 +191,8 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
             "declaredSizeBytes": len(encoded),
             "authorizedMaxSizeBytes": 1024 * 1024,
             "baseCommit": snapshot["baseCommit"],
+            "target": "retained",
+            "expectedBaseTreeDigest": None,
         },
         payload,
     ).header["receipt"]
@@ -153,7 +202,7 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     assert _git(retained, "symbolic-ref", "--short", "HEAD").startswith("rc/retained/")
     assert _git(retained, "rev-parse", "HEAD") == imported["resultCommit"]
     assert (worktree / "analysis.py").read_text() == "print('base')\n"
-    assert _git(worktree, "rev-parse", "HEAD") == snapshot["baseCommit"]
+    assert _git(worktree, "rev-parse", "HEAD") == working["resultCommit"]
 
 
 def _git(worktree: Path, *arguments: str) -> str:

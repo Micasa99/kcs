@@ -115,7 +115,8 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
-API_VERSION = "2.6.1"
+_DEV_RELAY_HTTP = requests.Session()
+API_VERSION = "2.6.2"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -763,7 +764,7 @@ def create_jobs_router(
         }
         forward_headers["X-RC-Dev-Session-Credential"] = credential
         try:
-            upstream = requests.get(
+            upstream = _DEV_RELAY_HTTP.get(
                 f"http://{target.host}:{target.port}{target.path}",
                 headers=forward_headers,
                 allow_redirects=False,
@@ -996,7 +997,7 @@ def create_jobs_router(
         }
         forward_headers["X-RC-Dev-Session-Credential"] = credential
         try:
-            upstream = requests.get(
+            upstream = _DEV_RELAY_HTTP.get(
                 f"http://{target.host}:{target.port}{target.path}",
                 headers=forward_headers,
                 allow_redirects=False,

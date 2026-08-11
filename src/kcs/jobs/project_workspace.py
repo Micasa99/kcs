@@ -232,6 +232,20 @@ class ProjectImportSpec(_WireModel):
         alias="declaredSizeBytes", ge=1, le=MAX_PROJECT_BUNDLE_BYTES
     )
     base_commit: str | None = Field(alias="baseCommit", default=None)
+    target: Literal["retained", "working"] = "retained"
+    expected_base_tree_digest: str | None = Field(
+        alias="expectedBaseTreeDigest",
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_target(self) -> ProjectImportSpec:
+        if self.target == "working" and self.expected_base_tree_digest is None:
+            raise ValueError("working import requires expectedBaseTreeDigest")
+        if self.target == "retained" and self.expected_base_tree_digest is not None:
+            raise ValueError("retained import cannot carry expectedBaseTreeDigest")
+        return self
 
 
 class RegisterProjectImportRequest(_WireModel):
@@ -421,9 +435,14 @@ class ProjectWorkspaceRenderer:
                     args=[
                         "actual=$(sha256sum /opt/rc-workspace-extension/aicosmos-workspace.vsix "
                         "| cut -d' ' -f1); test \"$actual\" = \"$AICOSMOS_WORKSPACE_VSIX_SHA256\"; "
-                        "umask 0002; /opt/rc-dev/openvscode/bin/openvscode-server "
+                        "marker=/workspace/.ide/home/.aicosmos-workspace-vsix.sha256; "
+                        "if test \"$(cat \"$marker\" 2>/dev/null || true)\" = \"$actual\"; "
+                        "then echo 'workspace extension already installed'; "
+                        "else umask 0002; /opt/rc-dev/openvscode/bin/openvscode-server "
                         "--install-extension /opt/rc-workspace-extension/aicosmos-workspace.vsix "
-                        "--force --extensions-dir /workspace/.ide/home/.openvscode-extensions"
+                        "--force --extensions-dir /workspace/.ide/home/.openvscode-extensions; "
+                        "printf '%s\\n' \"$actual\" > \"$marker.tmp\"; "
+                        "mv \"$marker.tmp\" \"$marker\"; fi"
                     ],
                     env=[
                         client.V1EnvVar(name="HOME", value="/workspace/.ide/home"),
@@ -1044,6 +1063,8 @@ class ProjectWorkspaceService:
             "contentSha256": request.spec.content_sha256,
             "declaredSizeBytes": str(request.spec.declared_size_bytes),
             "baseCommit": request.spec.base_commit or "",
+            "target": request.spec.target,
+            "expectedBaseTreeDigest": request.spec.expected_base_tree_digest or "",
             "state": "registered",
             "retainedCheckoutRef": "",
             "resultCommit": "",
@@ -1087,6 +1108,8 @@ class ProjectWorkspaceService:
                 "declaredSizeBytes": int(values["declaredSizeBytes"]),
                 "authorizedMaxSizeBytes": MAX_PROJECT_BUNDLE_BYTES,
                 "baseCommit": values.get("baseCommit") or None,
+                "target": values.get("target") or "retained",
+                "expectedBaseTreeDigest": values.get("expectedBaseTreeDigest") or None,
             },
             content,
         )

@@ -219,7 +219,7 @@ def _create_v2_app(
     app = FastAPI(
         title="kcs V2 Attempt Runtime API",
         description="Isolated physical attempt runtime for ResearchCosmos.",
-        version="2.6.1",
+        version="2.6.2",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
