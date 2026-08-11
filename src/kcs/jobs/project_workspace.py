@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from kubernetes import client  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .canonical import canonical_digest
 from .errors import (
@@ -111,8 +111,24 @@ class ProjectDevSessionSpec(_WireModel):
     tenant_ref: str = Field(alias="tenantRef")
     principal_ref: str = Field(alias="principalRef")
     conversation_ref: str = Field(alias="conversationRef")
+    product_base: str = Field(alias="productBase", min_length=1, max_length=2048)
     generation: int = Field(ge=1)
     ttl_seconds: int = Field(alias="ttlSeconds", ge=60, le=3600)
+
+    @field_validator("product_base")
+    @classmethod
+    def validate_product_base(cls, value: str) -> str:
+        parsed = urlsplit(value.rstrip("/"))
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("productBase must be an absolute HTTP(S) base URL")
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
 class ProjectDevSessionCreateRequest(_WireModel):
@@ -735,23 +751,34 @@ class ProjectWorkspaceService:
                 "project-workspace", workspace_ref, workspace_ref, values
             )
         ready: set[str] = set()
+        terminal_failure = False
         if pod is not None:
             for status in _field(_field(pod, "status", {}), "container_statuses", []) or []:
                 if bool(_field(status, "ready")):
                     ready.add(str(_field(status, "name")))
+                state_observation = _field(status, "state", {}) or {}
+                terminated = _field(state_observation, "terminated")
+                waiting = _field(state_observation, "waiting")
+                if terminated is not None and int(
+                    _field(terminated, "exit_code", _field(terminated, "exitCode", 0)) or 0
+                ) != 0:
+                    terminal_failure = True
+                waiting_reason = str(_field(waiting, "reason") or "")
+                if waiting_reason in {
+                    "CrashLoopBackOff",
+                    "CreateContainerConfigError",
+                    "ErrImagePull",
+                    "ImagePullBackOff",
+                    "InvalidImageName",
+                }:
+                    terminal_failure = True
         service = WorkspaceServiceObservation(
             controlReady="workspace-control" in ready,
             ideReady="openvscode" in ready,
             relayReady="relay" in ready,
         )
         all_ready = service.control_ready and service.ide_ready and service.relay_ready
-        state = (
-            "ready"
-            if all_ready
-            else "provisioning"
-            if pod is None or not ready
-            else "degraded"
-        )
+        state = "ready" if all_ready else "degraded" if terminal_failure else "provisioning"
         pvc = self._kube.read_persistent_volume_claim(project_pvc_name(workspace_ref))
         allocated = int(values["storageGiB"]) if pvc is not None else None
         return ProjectWorkspaceSnapshot(
@@ -785,6 +812,14 @@ class ProjectWorkspaceService:
             or request.spec.conversation_ref != workspace.conversation_ref
         ):
             raise StaleBindingError()
+        self._rpc(
+            binding,
+            {
+                "action": "configureWorkspaceContext",
+                "conversationRef": request.spec.conversation_ref,
+                "productBase": request.spec.product_base,
+            },
+        )
         now = self._now()
         expires = now + timedelta(seconds=request.spec.ttl_seconds)
         values = {

@@ -41,7 +41,7 @@ def _short_hash(value: str, length: int = 16) -> str:
 def _product_base_from_gateway(openai_base_url: str) -> str:
     """Recover the same-origin Product base from RC's frozen gateway URL."""
 
-    suffix = "/api/runtime/model-gateway/openai/v1"
+    suffix = "/model-gateway/openai/v1"
     parsed = urlsplit(openai_base_url.rstrip("/"))
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
@@ -49,6 +49,12 @@ def _product_base_from_gateway(openai_base_url: str) -> str:
     if not path.endswith(suffix):
         return ""
     return urlunsplit((parsed.scheme, parsed.netloc, path[: -len(suffix)], "", ""))
+
+
+def _native_control_volume_mib(ephemeral_storage_mib: int) -> int:
+    """Reserve a bounded share of the declared budget for raw runner evidence."""
+
+    return max(128, min(8192, ephemeral_storage_mib // 4))
 
 
 def job_ref_for_provider_request(provider_request_id: str) -> str:
@@ -367,6 +373,9 @@ class V2JobRenderer:
                     ),
                 }
             )
+        control_volume_mib = _native_control_volume_mib(
+            int(native["resources"]["ephemeralStorageMiB"])
+        )
         containers = [
             client.V1Container(
                 name="runner",
@@ -395,8 +404,16 @@ class V2JobRenderer:
                     }
                 ),
                 resources=client.V1ResourceRequirements(
-                    requests={"cpu": "250m", "memory": "256Mi", "ephemeral-storage": "256Mi"},
-                    limits={"cpu": "1000m", "memory": "1Gi", "ephemeral-storage": "1Gi"},
+                    requests={
+                        "cpu": "250m",
+                        "memory": "256Mi",
+                        "ephemeral-storage": f"{min(256, control_volume_mib)}Mi",
+                    },
+                    limits={
+                        "cpu": "1000m",
+                        "memory": "1Gi",
+                        "ephemeral-storage": f"{control_volume_mib}Mi",
+                    },
                 ),
                 security_context=self._native_control_security_context(),
                 volume_mounts=[
@@ -463,8 +480,13 @@ class V2JobRenderer:
                 "native ephemeralStorageMiB must leave room for control and logs"
             )
         private_volume_budget = (ephemeral_storage_mib * 3) // 4
-        fixed_private_budget = 192
+        control_volume_mib = _native_control_volume_mib(ephemeral_storage_mib)
+        fixed_private_budget = control_volume_mib + 128
         user_budget = private_volume_budget - fixed_private_budget
+        if user_budget < 128:
+            raise PolicyViolationError(
+                "native ephemeralStorageMiB leaves no writable HOME/TMP budget"
+            )
         user_home_mib = user_budget // 2
         user_tmp_mib = user_budget - user_home_mib
         volumes = [
@@ -500,7 +522,9 @@ class V2JobRenderer:
             ),
             client.V1Volume(
                 name=CONTROL_VOLUME,
-                empty_dir=client.V1EmptyDirVolumeSource(size_limit="64Mi"),
+                empty_dir=client.V1EmptyDirVolumeSource(
+                    size_limit=f"{control_volume_mib}Mi"
+                ),
             ),
             client.V1Volume(
                 name=USER_HOME_VOLUME,

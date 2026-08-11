@@ -33,7 +33,7 @@ def _m2_document() -> dict[str, Any]:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError("KCS 2.6 OpenAPI is unreadable") from error
-        if value.get("info", {}).get("version") == "2.6.0":
+        if value.get("info", {}).get("version") == "2.6.1":
             return value
     try:
         payload = (
@@ -44,7 +44,7 @@ def _m2_document() -> dict[str, Any]:
         value = json.loads(payload)
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError("KCS 2.6 OpenAPI is unavailable") from error
-    if value.get("info", {}).get("version") != "2.6.0":
+    if value.get("info", {}).get("version") != "2.6.1":
         raise RuntimeError("the served KCS package is not the frozen 2.6 contract")
     return value
 

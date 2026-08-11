@@ -32,7 +32,7 @@ def _canonical_document() -> dict[str, Any]:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError("KCS_V2_OPENAPI_PATH is not a valid contract") from error
-        if value.get("info", {}).get("version") != "2.6.0":
+        if value.get("info", {}).get("version") != "2.6.1":
             raise RuntimeError("KCS_V2_OPENAPI_PATH does not contain the active 2.6 contract")
         return value
     candidates = [
@@ -41,7 +41,7 @@ def _canonical_document() -> dict[str, Any]:
     for candidate in candidates:
         if candidate.is_file():
             value = json.loads(candidate.read_text(encoding="utf-8"))
-            if value.get("info", {}).get("version") == "2.6.0":
+            if value.get("info", {}).get("version") == "2.6.1":
                 return value
     payload = (
         importlib.resources.files("kcs.openapi")
@@ -49,7 +49,7 @@ def _canonical_document() -> dict[str, Any]:
         .read_text(encoding="utf-8")
     )
     value = json.loads(payload)
-    if value.get("info", {}).get("version") != "2.6.0":
+    if value.get("info", {}).get("version") != "2.6.1":
         raise RuntimeError("the served KCS package does not contain the active 2.6 contract")
     return value
 

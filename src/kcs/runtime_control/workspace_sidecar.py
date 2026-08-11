@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any, NoReturn
+from urllib.parse import urlsplit, urlunsplit
 
 import rfc8785
 
@@ -316,6 +317,8 @@ class RuntimeControlSidecar:
             return self._read_live_workspace_content(request)
         if action == "getLiveWorkspaceDiff":
             return self._get_live_workspace_diff(request), None
+        if action == "configureWorkspaceContext":
+            return self._configure_workspace_context(request), None
         if action == "createProjectWorkspaceSnapshot":
             return self._create_project_workspace_snapshot(request)
         if action == "readProjectWorkspaceSnapshot":
@@ -2959,6 +2962,40 @@ class RuntimeControlSidecar:
             ensure_ascii=False,
         ).encode("utf-8")
         self._write_workspace_file("worktree/.kcs/aicosmos.json", encoded, 0o640)
+
+    def _configure_workspace_context(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, object]:
+        if set(request) != {"action", "conversationRef", "productBase"}:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace context shape is invalid")
+        conversation_ref = request.get("conversationRef")
+        product_base = request.get("productBase")
+        if not isinstance(conversation_ref, str) or not conversation_ref:
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace conversation is invalid")
+        if not isinstance(product_base, str):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace Product base is invalid")
+        parsed = urlsplit(product_base.rstrip("/"))
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace Product base is invalid")
+        retained_conversation = self._workspace_context.get("conversationRef")
+        if retained_conversation and retained_conversation != conversation_ref:
+            raise _RpcRejectedError("STALE_BINDING", "workspace conversation binding changed")
+        normalized = urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
+        )
+        self._workspace_context.update(
+            conversationRef=conversation_ref,
+            productBase=normalized,
+        )
+        self._publish_workspace_context()
+        return {"ok": True, "configured": True}
 
     def _workspace_file_mode(self, raw_path: str) -> str:
         parent_fd, target_name = self._open_parent(raw_path, create=False)

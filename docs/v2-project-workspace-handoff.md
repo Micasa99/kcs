@@ -21,9 +21,9 @@ checkout and never overwrites or merges the current Project checkout.
 
 ## Active contract and images
 
-- OpenAPI version: `2.6.0`, 58 operations.
+- OpenAPI version: `2.6.1`, 58 operations.
 - Canonical JSON SHA-256:
-  `28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd`.
+  `5728f11b8fceab219deb86a37e85258da4bb66eedde7878e5c107bb39b083cd1`.
 - Source implementation commit:
   `f24b58e61f4e4f9865edccead7db700b7faa0063`.
 - Active API image:

@@ -2,7 +2,7 @@ openapi: 3.1.0
 x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
-  version: 2.6.0
+  version: 2.6.1
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -2551,7 +2551,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.6.0}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.6.1}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -2760,11 +2760,17 @@ components:
     ProjectDevSessionSpec:
       type: object
       additionalProperties: false
-      required: [tenantRef, principalRef, conversationRef, generation, ttlSeconds]
+      required: [tenantRef, principalRef, conversationRef, productBase, generation, ttlSeconds]
       properties:
         tenantRef: {$ref: '#/components/schemas/OpaqueRef'}
         principalRef: {$ref: '#/components/schemas/OpaqueRef'}
         conversationRef: {$ref: '#/components/schemas/OpaqueRef'}
+        productBase:
+          type: string
+          format: uri
+          pattern: '^https?://'
+          minLength: 1
+          maxLength: 2048
         generation: {type: integer, minimum: 1}
         ttlSeconds: {type: integer, minimum: 60, maximum: 3600}
     ProjectDevSessionCreateRequest:

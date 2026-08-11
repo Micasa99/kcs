@@ -370,7 +370,7 @@ EXPECTED_ROOT_LIMITS = {
     "projectWorkspaceMaximumFiles": 4096,
 }
 CANONICAL_X_KCS_POLICY_SHA256 = "1f3bd1f1b4bb1c126e04ca000c9a98175924cdf787a13e3de87a3649ad59f07f"
-CANONICAL_OPENAPI_SHA256 = "28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd"
+CANONICAL_OPENAPI_SHA256 = "5728f11b8fceab219deb86a37e85258da4bb66eedde7878e5c107bb39b083cd1"
 LOWER_HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 REQUIRED_SCENARIOS = {
@@ -964,7 +964,7 @@ def _validate_response_header_policy(
             }
         )
     if operation_id == "getCanonicalOpenApi" and status == "200":
-        expected.update({"ETag": None, "X-KCS-API-Version": "2.6.0"})
+        expected.update({"ETag": None, "X-KCS-API-Version": "2.6.1"})
     for name, expected_const in expected.items():
         if name not in required or name not in declared:
             raise ValueError(f"{label}: required response header {name} is not declared")
@@ -3128,8 +3128,8 @@ def _validate_examples(source: Path, document: dict[str, Any]) -> int:
 def generate_artifacts(source: Path, output_dir: Path) -> OpenAPIArtifactSet:
     """Parse, fully validate, and write deterministic artifacts for one source."""
     document = _load_yaml(source)
-    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.6.0":
-        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.6.0")
+    if document.get("openapi") != "3.1.0" or document.get("info", {}).get("version") != "2.6.1":
+        raise ValueError("source must declare OpenAPI 3.1.0 and API version 2.6.1")
     schemas = document.get("components", {}).get("schemas", {})
     if not schemas:
         raise ValueError("source must define component schemas")

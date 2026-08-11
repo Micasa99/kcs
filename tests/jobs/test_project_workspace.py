@@ -62,9 +62,8 @@ def test_project_workspace_is_persistent_cpu_only_and_installs_exact_extension()
     openvscode = next(item for item in pod.containers if item.name == "openvscode")
     assert "/workspace/worktree" in openvscode.args[0]
     control = next(item for item in pod.containers if item.name == "workspace-control")
-    assert {item.name: item.value for item in control.env}[
-        "AICOSMOS_CONVERSATION_REF"
-    ] == "conv_project_1"
+    control_env = {item.name: item.value for item in control.env}
+    assert control_env["AICOSMOS_CONVERSATION_REF"] == "conv_project_1"
 
 
 def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
@@ -79,6 +78,16 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     monkeypatch.setenv("AICOSMOS_CONVERSATION_REF", "conv_project_1")
     control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
     transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
+    configured = transport.rpc(
+        {},
+        {
+            "action": "configureWorkspaceContext",
+            "conversationRef": "conv_project_1",
+            "productBase": "https://ai-cosmos.example/ai4sci/cosmos/",
+        },
+    )
+    assert configured.header["ok"] is True
+    assert configured.header["configured"] is True
 
     created = transport.rpc(
         {},
@@ -103,7 +112,8 @@ def test_snapshot_and_sealed_import_keep_project_and_attempt_git_separate(
     assert _git(worktree, "rev-parse", "HEAD") == snapshot["baseCommit"]
     private_context = worktree / ".kcs" / "aicosmos.json"
     assert json.loads(private_context.read_text()) == {
-        "conversationRef": "conv_project_1"
+        "conversationRef": "conv_project_1",
+        "productBase": "https://ai-cosmos.example/ai4sci/cosmos",
     }
     assert all(entry["path"] != ".kcs/aicosmos.json" for entry in bundle["entries"])
 

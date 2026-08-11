@@ -308,7 +308,7 @@ def test_renderer_mounts_exact_capabilities_and_nonblocking_dev_sidecars(
 
 def test_product_base_is_derived_from_the_frozen_runtime_gateway() -> None:
     assert _product_base_from_gateway(
-        "https://ai-cosmos.example/ai4sci/cosmos/api/runtime/model-gateway/openai/v1"
+        "https://ai-cosmos.example/ai4sci/cosmos/model-gateway/openai/v1"
     ) == "https://ai-cosmos.example/ai4sci/cosmos"
 
 

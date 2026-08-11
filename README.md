@@ -155,7 +155,7 @@ IDE service; every Attempt still receives an isolated checkout, produces its
 existing sealed `WorkspaceRevision`, and imports that revision as a new retained
 Project checkout. Project and Attempt never share a mutable `.git` directory or
 PVC. The active contract SHA-256 is
-`28f34463af110af835b13a68f256f8b7bae3825098e0759ba09498f3857338dd`.
+`5728f11b8fceab219deb86a37e85258da4bb66eedde7878e5c107bb39b083cd1`.
 See `docs/v2-project-workspace-handoff.md`.
 
 `scripts/run_v2_attempt_journey.py` is the Task 10 standalone Journey. One invocation
