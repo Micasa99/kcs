@@ -17,8 +17,8 @@ data:
   project-workspace-control-image: 10.255.250.1:5000/researchcosmos/kcs-control@sha256:9b1bf603ace7bb084d14be293526d0b48913c553ac5604f40bf9a0a5d5ec6b75
   # Exact RC-published extension artifact. The Workspace init verifies the raw
   # VSIX SHA before installing it into the persistent IDE extensions directory.
-  project-workspace-vsix-image-volume: 10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:e7818c24ee8c29e5ad44180da6fa9877f9bda3bf342ad4ba2ac0138779a8a422
-  project-workspace-vsix-sha256: 5c22dff4a5d801d1bec43a9d0c002346602c9a03c1004dd3dc77fb994d192e9f
+  project-workspace-vsix-image-volume: 10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:ed205c07d62361fbcf14e41092ab51215d61bc471805b6fc66a26f678fd05428
+  project-workspace-vsix-sha256: 4dbb8a0477c3f659b73ab95696be7eee6533a7bffa944496a48fa7113913b2bd
   # Comma-separated exact HTTPS allowlists support isolated Product environments
   # without granting arbitrary runner egress.
   openai-base-url: https://ai-cosmos.cn/ai4sci/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-test/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-stable/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/openai/v1
