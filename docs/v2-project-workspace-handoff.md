@@ -31,9 +31,9 @@ checkout and never overwrites or merges the current Project checkout.
 - Workspace control image:
   `10.255.250.1:5000/researchcosmos/kcs-control@sha256:9b1bf603ace7bb084d14be293526d0b48913c553ac5604f40bf9a0a5d5ec6b75`.
 - AICOSMOS Workspace extension ImageVolume:
-  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:56139edb5d73f253ac9e938fd5ecf28eb850ff727cfa8dfa5f7bca96e78618a7`;
+  `10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:61ac1529a96319aaa6d1f9fedf248d6d3cbbcfbcb105c0c6d6df5013feb7155b`;
   raw VSIX SHA-256
-  `e93e38816db10afe547be8d612619e26e187bb55a3b51aa3021e097f94a5fabf`.
+  `e3ce146eab3e859604807e6dc02d75f77a3df256ea4d233d15e11c805664567e`.
 
 The operator must copy these exact refs into the deployment configuration. There
 is no local, SSH, Hosted, empty-directory, or mutable-tag fallback.
