@@ -428,7 +428,7 @@ class ProjectWorkspaceRenderer:
                     args=[
                         "actual=$(sha256sum /opt/rc-workspace-extension/aicosmos-workspace.vsix "
                         "| cut -d' ' -f1); test \"$actual\" = \"$AICOSMOS_WORKSPACE_VSIX_SHA256\"; "
-                        "marker=/workspace/.ide/installed-vsix.sha256; "
+                        "marker=/workspace/.ide/home/.installed-vsix.sha256; "
                         "if test \"$(cat \"$marker\" 2>/dev/null || true)\" = \"$actual\"; then "
                         "echo 'workspace extension already installed'; exit 0; fi; "
                         "umask 0002; /opt/rc-dev/openvscode/bin/openvscode-server "
