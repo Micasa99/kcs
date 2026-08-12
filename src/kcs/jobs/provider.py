@@ -540,7 +540,6 @@ class V2JobProvider:
             openvscode_image_ref=openvscode_image_ref,
             binding_resolver=self._native_live_binding,
             clock=self._clock,
-            sleeper=self._sleeper,
         )
         self._native_metrics_lock = threading.Lock()
         self._native_recipe_forbidden_total = 0
@@ -2014,6 +2013,8 @@ class V2JobProvider:
                 )
                 return CreateResult(snapshot=missing, created=False)
             if rendered_job is None:
+                if isinstance(request, NativeCreateJobRequest):
+                    self._dev_sessions.ensure_relay_credential(job_ref)
                 rendered_job = self._renderer.render(
                     request,
                     native_recipe=native_recipe,
@@ -3466,6 +3467,8 @@ class V2JobProvider:
 
         if _is_native_record(record):
             self._dev_sessions.revoke_for_job(job_ref, "job_delete")
+            if not self._dev_sessions.delete_relay_credential(job_ref):
+                raise CredentialDestroyFailedError()
             self._native.revoke_all(job_ref)
             self._prove_native_secret_absent(job_ref, str(_field(record, "job_uid")))
         else:

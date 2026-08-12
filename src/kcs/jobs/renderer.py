@@ -73,8 +73,13 @@ def runner_credential_secret_name(job_ref: str) -> str:
 
 
 def dev_session_secret_name(job_ref: str) -> str:
-    """Return the fixed optional Secret slot watched by the M2 relay sidecars."""
+    """Return the stable internal credential mounted by the relay sidecar."""
     return f"kcs-v2-dev-session-{_short_hash(job_ref, 24)}"
+
+
+def dev_session_browser_secret_name(job_ref: str) -> str:
+    """Return the KCS-only browser-session Secret slot."""
+    return f"kcs-v2-dev-browser-{_short_hash(job_ref, 24)}"
 
 
 class V2JobRenderer:
@@ -568,7 +573,7 @@ class V2JobRenderer:
                         name=DEV_SESSION_CREDENTIAL_VOLUME,
                         secret=client.V1SecretVolumeSource(
                             secret_name=dev_session_secret_name(job_ref),
-                            optional=True,
+                            optional=False,
                             default_mode=0o400,
                         ),
                     ),
@@ -684,8 +689,6 @@ class V2JobRenderer:
                         "LISTEN_ADDR": ":8080",
                         "UPSTREAM_URL": "http://127.0.0.1:3000",
                         "DEV_SESSION_CREDENTIAL_FILE": "/run/dev-session/credential",
-                        "DEV_SESSION_EXPIRES_AT_FILE": "/run/dev-session/expires-at",
-                        "DEV_SESSION_REVOKED_FILE": "/run/dev-session/revoked",
                     }
                 ),
                 ports=[client.V1ContainerPort(name="dev-relay", container_port=8080)],

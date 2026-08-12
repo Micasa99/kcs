@@ -115,6 +115,8 @@ from kcs.jobs.provider import (
 )
 from kcs.jobs.workspace_runtime import VerifiedContent
 
+_DEV_RELAY_HTTP = requests.Session()
+
 API_VERSION = "2.6.1"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
@@ -761,9 +763,9 @@ def create_jobs_router(
             if name.casefold()
             in {"accept", "accept-encoding", "accept-language", "range", "if-none-match", "if-modified-since", "user-agent"}
         }
-        forward_headers["X-RC-Dev-Session-Credential"] = credential
+        forward_headers["X-RC-Dev-Session-Credential"] = target.credential
         try:
-            upstream = requests.get(
+            upstream = _DEV_RELAY_HTTP.get(
                 f"http://{target.host}:{target.port}{target.path}",
                 headers=forward_headers,
                 allow_redirects=False,
@@ -994,9 +996,9 @@ def create_jobs_router(
                 "user-agent",
             }
         }
-        forward_headers["X-RC-Dev-Session-Credential"] = credential
+        forward_headers["X-RC-Dev-Session-Credential"] = target.credential
         try:
-            upstream = requests.get(
+            upstream = _DEV_RELAY_HTTP.get(
                 f"http://{target.host}:{target.port}{target.path}",
                 headers=forward_headers,
                 allow_redirects=False,
@@ -2035,7 +2037,9 @@ def install_dev_session_websocket(
         try:
             async with websocket_connect(
                 f"ws://{target.host}:{target.port}{target.path}",
-                additional_headers={"X-RC-Dev-Session-Credential": credential},
+                additional_headers={
+                    "X-RC-Dev-Session-Credential": target.credential
+                },
                 subprotocols=subprotocols or None,
                 open_timeout=3,
                 close_timeout=3,
@@ -2145,7 +2149,9 @@ def install_project_dev_session_websocket(
         try:
             async with websocket_connect(
                 f"ws://{target.host}:{target.port}{target.path}",
-                additional_headers={"X-RC-Dev-Session-Credential": credential},
+                additional_headers={
+                    "X-RC-Dev-Session-Credential": target.credential
+                },
                 subprotocols=subprotocols or None,
                 open_timeout=3,
                 close_timeout=3,

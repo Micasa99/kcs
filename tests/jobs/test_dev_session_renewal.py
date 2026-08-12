@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.dev_session import DevSessionService
@@ -11,7 +10,7 @@ from kcs.jobs.native_contracts import DevSessionRenewRequest, NativeJobBindingSn
 from kcs.jobs.store import RuntimeRecord
 
 
-def test_renew_commits_rotated_credential_only_after_relay_accepts_it(monkeypatch) -> None:
+def test_renew_rotates_browser_credential_without_waiting_for_pod_projection() -> None:
     now = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
     old_credential = "old-" + "a" * 40
     values = {
@@ -88,35 +87,12 @@ def test_renew_commits_rotated_credential_only_after_relay_accepts_it(monkeypatc
             "latestRunnerGeneration": {"generation": 1},
         }
     )
-    statuses = iter((401, 200))
-
-    class Connection:
-        def __init__(self, host: str, port: int, timeout: int):
-            assert (host, port, timeout) == ("127.0.0.1", 19090, 3)
-
-        def request(self, method: str, path: str, headers):
-            assert (method, path) == ("GET", "/")
-            assert headers["X-RC-Dev-Session-Credential"] != old_credential
-
-        def getresponse(self):
-            # The old credential remains authoritative while kubelet catches up.
-            assert store.current.values["credentialSha256"] == values["credentialSha256"]
-            assert store.current.values["pendingRenewRef"] == "renew-1"
-            return SimpleNamespace(status=next(statuses), read=lambda _limit: b"")
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr("kcs.jobs.dev_session.http.client.HTTPConnection", Connection)
-    ticks = iter((0.0, 0.0))
     service = DevSessionService(
         store,
         kube,
         openvscode_image_ref=f"registry.example/openvscode@sha256:{'3' * 64}",
         binding_resolver=lambda _job_ref: binding,
         clock=lambda: now,
-        sleeper=lambda _seconds: None,
-        monotonic=lambda: next(ticks),
     )
     spec = {"ttlSeconds": 300}
     request = DevSessionRenewRequest.model_validate(
@@ -137,5 +113,5 @@ def test_renew_commits_rotated_credential_only_after_relay_accepts_it(monkeypatc
         result.credential.encode()
     ).hexdigest()
     assert store.current.values["renewRef"] == "renew-1"
-    assert "pendingRenewRef" not in store.current.values
     assert result.snapshot.root["state"] == "ready"
+    assert kube.secret["metadata"]["name"].startswith("kcs-v2-dev-browser-")

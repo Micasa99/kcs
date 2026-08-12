@@ -59,6 +59,13 @@ def test_project_workspace_is_persistent_cpu_only_and_installs_exact_extension()
     bootstrap = next(item for item in pod.init_containers if item.name == "ide-bootstrap")
     assert digest in {env.value for env in bootstrap.env}
     assert "--install-extension" in bootstrap.args[0]
+    assert "installed-vsix.sha256" in bootstrap.args[0]
+    relay = next(item for item in pod.containers if item.name == "relay")
+    assert {env.name for env in relay.env} == {
+        "LISTEN_ADDR",
+        "UPSTREAM_URL",
+        "DEV_SESSION_CREDENTIAL_FILE",
+    }
     openvscode = next(item for item in pod.containers if item.name == "openvscode")
     assert "/workspace/worktree" in openvscode.args[0]
     control = next(item for item in pod.containers if item.name == "workspace-control")

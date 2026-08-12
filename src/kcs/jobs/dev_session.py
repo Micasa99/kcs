@@ -5,9 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import http.client
 import secrets
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -31,7 +29,7 @@ from .native_contracts import (
     DevSessionSnapshot,
     NativeJobBindingSnapshot,
 )
-from .renderer import dev_session_secret_name
+from .renderer import dev_session_browser_secret_name, dev_session_secret_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +44,11 @@ class DevSessionRelayTarget:
     host: str
     port: int
     path: str
+    credential: str
 
 
 class DevSessionService:
-    """Own non-secret session records and one optional projected credential slot."""
+    """Own browser sessions and one stable Pod-internal relay credential."""
 
     def __init__(
         self,
@@ -59,24 +58,26 @@ class DevSessionService:
         openvscode_image_ref: str | None,
         binding_resolver: Callable[[str], NativeJobBindingSnapshot],
         clock: Callable[[], datetime] | None = None,
-        sleeper: Callable[[float], None] | None = None,
-        monotonic: Callable[[], float] | None = None,
-        projection_wait_seconds: float = 90.0,
-        projection_poll_seconds: float = 1.0,
     ) -> None:
-        if projection_wait_seconds <= 0:
-            raise ValueError("dev-session projection wait must be positive")
-        if projection_poll_seconds <= 0:
-            raise ValueError("dev-session projection poll must be positive")
         self._store = store
         self._kube = kube
         self._image_ref = openvscode_image_ref
         self._binding_resolver = binding_resolver
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._sleeper = sleeper or time.sleep
-        self._monotonic = monotonic or time.monotonic
-        self._projection_wait_seconds = projection_wait_seconds
-        self._projection_poll_seconds = projection_poll_seconds
+
+    def ensure_relay_credential(self, job_ref: str) -> str:
+        """Create the credential mounted before the Attempt Pod starts."""
+
+        self._require_enabled()
+        retained = self._relay_credential(job_ref)
+        if retained is not None:
+            return retained
+        credential = secrets.token_urlsafe(32)
+        self._kube.upsert_secret(
+            dev_session_secret_name(job_ref),
+            self._relay_secret(job_ref, credential),
+        )
+        return credential
 
     def create(
         self,
@@ -130,7 +131,7 @@ class DevSessionService:
             raise DevSessionIdentityConflictError()
         if not created:
             self._raise_terminal(retained)
-            credential = self._secret_credential(job_ref)
+            credential = self._browser_credential(job_ref)
             if credential is None:
                 raise DevSessionRelayDownError()
             return DevSessionMutation(self._snapshot(record), credential, False)
@@ -139,7 +140,7 @@ class DevSessionService:
         values["credentialSha256"] = hashlib.sha256(credential.encode()).hexdigest()
         try:
             self._kube.upsert_secret(
-                dev_session_secret_name(job_ref),
+                dev_session_browser_secret_name(job_ref),
                 self._secret_body(
                     job_ref,
                     binding,
@@ -179,22 +180,11 @@ class DevSessionService:
         values = dict(record.values)
         renew_ref = str(request.root["renewRef"])
         renew_digest = str(request.root["requestDigest"])
-        pending_ref = values.get("pendingRenewRef")
-        if pending_ref:
-            if pending_ref != renew_ref or values.get("pendingRenewDigest") != renew_digest:
-                raise DevSessionIdentityConflictError()
-            rotated = self._pending_credential(job_ref, values)
-            return self._complete_renewal(
-                record,
-                values,
-                dev_session_ref=dev_session_ref,
-                rotated=rotated,
-            )
         retained_ref = values.get("renewRef")
         if retained_ref == renew_ref:
             if values.get("renewDigest") != renew_digest:
                 raise DevSessionIdentityConflictError()
-            raw = self._secret_credential(job_ref)
+            raw = self._browser_credential(job_ref)
             if raw is None:
                 raise DevSessionRelayDownError()
             return DevSessionMutation(self._snapshot(record), raw, False)
@@ -205,104 +195,28 @@ class DevSessionService:
         expires = now + timedelta(seconds=int(request.root["spec"]["ttlSeconds"]))
         rotated = secrets.token_urlsafe(32)
         rotated_digest = hashlib.sha256(rotated.encode()).hexdigest()
-        binding = self._native_binding(job_ref)
         self._kube.upsert_secret(
-            dev_session_secret_name(job_ref),
-            self._secret_body(job_ref, binding, dev_session_ref, rotated, expires),
+            dev_session_browser_secret_name(job_ref),
+            self._secret_body(
+                job_ref,
+                self._native_binding(job_ref),
+                dev_session_ref,
+                rotated,
+                expires,
+            ),
         )
-        # Keep the old credential authoritative until the relay proves that
-        # kubelet projected the new bytes.  The pending identity makes an
-        # unknown-outcome retry recoverable without storing secret bytes.
         values.update(
-            pendingRenewRef=renew_ref,
-            pendingRenewDigest=renew_digest,
-            pendingCredentialSha256=rotated_digest,
-            pendingExpiresAt=expires.isoformat(),
+            renewRef=renew_ref,
+            renewDigest=renew_digest,
+            credentialSha256=rotated_digest,
+            expiresAt=expires.isoformat(),
             observedAt=now.isoformat(),
-            state="opening",
+            state="ready",
         )
         record = self._store.update_runtime(
             "dev-session", job_ref, dev_session_ref, values
         )
-        return self._complete_renewal(
-            record,
-            values,
-            dev_session_ref=dev_session_ref,
-            rotated=rotated,
-        )
-
-    def _complete_renewal(
-        self,
-        record: Any,
-        values: dict[str, str],
-        *,
-        dev_session_ref: str,
-        rotated: str,
-    ) -> DevSessionMutation:
-        if not self._wait_for_projected_credential(
-            record.job_ref, values["podUid"], rotated
-        ):
-            raise DevSessionRelayDownError(
-                "The rotated dev-session credential was not projected before the deadline"
-            )
-        values.update(
-            renewRef=values["pendingRenewRef"],
-            renewDigest=values["pendingRenewDigest"],
-            credentialSha256=values["pendingCredentialSha256"],
-            expiresAt=values["pendingExpiresAt"],
-            observedAt=self._now().isoformat(),
-            state="ready",
-        )
-        for name in (
-            "pendingRenewRef",
-            "pendingRenewDigest",
-            "pendingCredentialSha256",
-            "pendingExpiresAt",
-        ):
-            values.pop(name, None)
-        committed = self._store.update_runtime(
-            "dev-session", record.job_ref, dev_session_ref, values
-        )
-        return DevSessionMutation(self._snapshot(committed), rotated, True)
-
-    def _pending_credential(self, job_ref: str, values: Mapping[str, str]) -> str:
-        raw = self._secret_credential(job_ref)
-        if raw is None:
-            raise DevSessionRelayDownError()
-        expected = values.get("pendingCredentialSha256", "")
-        actual = hashlib.sha256(raw.encode()).hexdigest()
-        if not expected or not hmac.compare_digest(expected, actual):
-            raise DevSessionRelayDownError(
-                "The pending dev-session credential does not match its projection"
-            )
-        return raw
-
-    def _wait_for_projected_credential(
-        self, job_ref: str, pod_uid: str, credential: str
-    ) -> bool:
-        deadline = self._monotonic() + self._projection_wait_seconds
-        while True:
-            try:
-                host, port = self._kube.pod_relay_endpoint(job_ref, pod_uid)
-                connection = http.client.HTTPConnection(host, port, timeout=3)
-                try:
-                    connection.request(
-                        "GET",
-                        "/",
-                        headers={"X-RC-Dev-Session-Credential": credential},
-                    )
-                    response = connection.getresponse()
-                    response.read(4096)
-                    if 200 <= response.status < 400:
-                        return True
-                finally:
-                    connection.close()
-            except (OSError, http.client.HTTPException):
-                pass
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                return False
-            self._sleeper(min(self._projection_poll_seconds, remaining))
+        return DevSessionMutation(self._snapshot(record), rotated, True)
 
     def revoke(
         self, job_ref: str, dev_session_ref: str, credential: str
@@ -326,6 +240,14 @@ class DevSessionService:
                 changed += 1
         return changed
 
+    def delete_relay_credential(self, job_ref: str) -> bool:
+        name = dev_session_secret_name(job_ref)
+        secret = self._kube.read_secret(name)
+        if secret is None:
+            return True
+        uid = str(_field(_field(secret, "metadata", {}), "uid") or "")
+        return bool(uid) and self._kube.delete_secret(name, uid) is True
+
     def relay_target(
         self, job_ref: str, dev_session_ref: str, credential: str, path: str
     ) -> DevSessionRelayTarget:
@@ -335,12 +257,17 @@ class DevSessionService:
             host, port = self._kube.pod_relay_endpoint(job_ref, values["podUid"])
         except Exception as error:
             raise DevSessionRelayDownError() from error
-        return DevSessionRelayTarget(host=host, port=port, path=path)
+        relay_credential = self._relay_credential(job_ref)
+        if relay_credential is None:
+            raise DevSessionRelayDownError()
+        return DevSessionRelayTarget(
+            host=host, port=port, path=path, credential=relay_credential
+        )
 
     def observe_relay_ready(
         self, job_ref: str, dev_session_ref: str, credential: str
     ) -> DevSessionSnapshot:
-        """Publish ``ready`` only after the projected credential worked end to end."""
+        """Publish ``ready`` only after the internal relay worked end to end."""
 
         record = self._access(job_ref, dev_session_ref, credential)
         values = dict(record.values)
@@ -405,10 +332,8 @@ class DevSessionService:
                 if not (ide_ready and relay_ready):
                     state = "opening"
                 elif state != "ready":
-                    # Container readiness does not prove that kubelet has projected
-                    # the newly created or rotated credential.  The relay route
-                    # promotes this record only after an authenticated request
-                    # reaches loopback OpenVSCode.
+                    # Container readiness does not prove the relay reaches
+                    # loopback OpenVSCode.  The first authenticated request does.
                     state = "opening"
             except Exception:
                 state = "lost"
@@ -457,7 +382,7 @@ class DevSessionService:
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": dev_session_secret_name(job_ref),
+                "name": dev_session_browser_secret_name(job_ref),
                 "labels": {"researchcosmos.io/managed-by": "v2-attempt-runtime"},
                 "ownerReferences": [
                     {
@@ -486,7 +411,32 @@ class DevSessionService:
             },
         }
 
-    def _secret_credential(self, job_ref: str) -> str | None:
+    def _browser_credential(self, job_ref: str) -> str | None:
+        secret = self._kube.read_secret(dev_session_browser_secret_name(job_ref))
+        data = _mapping(_field(secret, "data", {})) if secret is not None else {}
+        raw = data.get("credential")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return base64.b64decode(raw, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _relay_secret(self, job_ref: str, credential: str) -> dict[str, object]:
+        return {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": dev_session_secret_name(job_ref),
+                "labels": {"researchcosmos.io/managed-by": "v2-attempt-runtime"},
+            },
+            "type": "Opaque",
+            "data": {
+                "credential": base64.b64encode(credential.encode()).decode("ascii")
+            },
+        }
+
+    def _relay_credential(self, job_ref: str) -> str | None:
         secret = self._kube.read_secret(dev_session_secret_name(job_ref))
         data = _mapping(_field(secret, "data", {})) if secret is not None else {}
         raw = data.get("credential")
@@ -508,17 +458,6 @@ class DevSessionService:
             observedAt=now.isoformat(),
             revokeReason=reason,
         )
-        secret_name = dev_session_secret_name(record.job_ref)
-        if self._kube.read_secret(secret_name) is not None:
-            self._kube.upsert_secret(
-                secret_name,
-                {
-                    "apiVersion": "v1",
-                    "kind": "Secret",
-                    "metadata": {"name": secret_name},
-                    "data": {"revoked": ""},
-                },
-            )
         return self._store.update_runtime(
             "dev-session", record.job_ref, record.identity, values
         )

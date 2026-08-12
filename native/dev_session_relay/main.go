@@ -14,7 +14,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -25,14 +24,11 @@ type config struct {
 	listenAddr     string
 	upstream       *url.URL
 	credentialFile string
-	expiresFile    string
-	revokedFile    string
 }
 
 type gate struct {
 	config config
 	proxy  *httputil.ReverseProxy
-	now    func() time.Time
 }
 
 func main() {
@@ -71,11 +67,9 @@ func configFromEnvironment() (config, error) {
 		listenAddr:     requiredEnv("LISTEN_ADDR"),
 		upstream:       upstream,
 		credentialFile: requiredEnv("DEV_SESSION_CREDENTIAL_FILE"),
-		expiresFile:    requiredEnv("DEV_SESSION_EXPIRES_AT_FILE"),
-		revokedFile:    requiredEnv("DEV_SESSION_REVOKED_FILE"),
 	}
-	if cfg.listenAddr == "" || cfg.credentialFile == "" || cfg.expiresFile == "" || cfg.revokedFile == "" {
-		return config{}, errors.New("relay file and listen settings are required")
+	if cfg.listenAddr == "" || cfg.credentialFile == "" {
+		return config{}, errors.New("relay listen and credential settings are required")
 	}
 	return cfg, nil
 }
@@ -100,7 +94,7 @@ func newGate(cfg config) http.Handler {
 		log.Printf("loopback relay unavailable method=%s", request.Method)
 		writeError(writer, http.StatusServiceUnavailable, "RELAY_DOWN")
 	}
-	return &gate{config: cfg, proxy: proxy, now: time.Now}
+	return &gate{config: cfg, proxy: proxy}
 }
 
 func (g *gate) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -112,23 +106,6 @@ func (g *gate) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	supplied := request.Header.Get(credentialHeader)
 	if len(supplied) != len(credential) || subtle.ConstantTimeCompare([]byte(supplied), []byte(credential)) != 1 {
 		writeError(writer, http.StatusUnauthorized, "INVALID_CREDENTIAL")
-		return
-	}
-	if _, err := os.Stat(g.config.revokedFile); err == nil {
-		writeError(writer, http.StatusGone, "SESSION_REVOKED")
-		return
-	} else if !errors.Is(err, os.ErrNotExist) {
-		writeError(writer, http.StatusServiceUnavailable, "SESSION_STATE_UNAVAILABLE")
-		return
-	}
-	rawExpiry, err := readBounded(g.config.expiresFile, 64)
-	if err != nil {
-		writeError(writer, http.StatusServiceUnavailable, "SESSION_STATE_UNAVAILABLE")
-		return
-	}
-	expiry, err := strconv.ParseInt(rawExpiry, 10, 64)
-	if err != nil || !g.now().Before(time.Unix(expiry, 0)) {
-		writeError(writer, http.StatusGone, "SESSION_EXPIRED")
 		return
 	}
 	g.proxy.ServeHTTP(writer, request)

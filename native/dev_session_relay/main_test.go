@@ -7,12 +7,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
-	"time"
 )
 
-func TestGateCredentialExpiryAndHTTPProxy(t *testing.T) {
+func TestGateCredentialAndHTTPProxy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get(credentialHeader) != "" || request.Header.Get("Authorization") != "" {
 			t.Fatal("relay leaked a platform credential to OpenVSCode")
@@ -23,13 +21,10 @@ func TestGateCredentialExpiryAndHTTPProxy(t *testing.T) {
 	defer upstream.Close()
 	root := t.TempDir()
 	credentialFile := filepath.Join(root, "credential")
-	expiresFile := filepath.Join(root, "expires-at")
-	revokedFile := filepath.Join(root, "revoked")
 	mustWrite(t, credentialFile, "canary-credential")
-	mustWrite(t, expiresFile, strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
 	parsed, _ := url.Parse(upstream.URL)
 	handler := newGate(config{
-		upstream: parsed, credentialFile: credentialFile, expiresFile: expiresFile, revokedFile: revokedFile,
+		upstream: parsed, credentialFile: credentialFile,
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "http://relay/style.css", nil)
@@ -45,12 +40,6 @@ func TestGateCredentialExpiryAndHTTPProxy(t *testing.T) {
 		t.Fatalf("unexpected body %q", body)
 	}
 
-	mustWrite(t, revokedFile, "")
-	revoked := httptest.NewRecorder()
-	handler.ServeHTTP(revoked, request)
-	if revoked.Code != http.StatusGone {
-		t.Fatalf("revoked status=%d body=%s", revoked.Code, revoked.Body.String())
-	}
 }
 
 func mustWrite(t *testing.T, path string, value string) {

@@ -287,6 +287,7 @@ class ProjectRelayTarget:
     host: str
     port: int
     path: str
+    credential: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +313,13 @@ def project_pvc_name(workspace_ref: str) -> str:
 
 
 def project_session_secret_name(workspace_ref: str) -> str:
+    """Stable internal credential mounted by the Project relay."""
     return f"kcs-v2-project-session-{_short_hash(workspace_ref)}"
+
+
+def project_browser_secret_name(workspace_ref: str) -> str:
+    """KCS-only browser-session credential slot."""
+    return f"kcs-v2-project-browser-{_short_hash(workspace_ref)}"
 
 
 class ProjectWorkspaceRenderer:
@@ -421,9 +428,14 @@ class ProjectWorkspaceRenderer:
                     args=[
                         "actual=$(sha256sum /opt/rc-workspace-extension/aicosmos-workspace.vsix "
                         "| cut -d' ' -f1); test \"$actual\" = \"$AICOSMOS_WORKSPACE_VSIX_SHA256\"; "
+                        "marker=/workspace/.ide/installed-vsix.sha256; "
+                        "if test \"$(cat \"$marker\" 2>/dev/null || true)\" = \"$actual\"; then "
+                        "echo 'workspace extension already installed'; exit 0; fi; "
                         "umask 0002; /opt/rc-dev/openvscode/bin/openvscode-server "
                         "--install-extension /opt/rc-workspace-extension/aicosmos-workspace.vsix "
-                        "--force --extensions-dir /workspace/.ide/home/.openvscode-extensions"
+                        "--force --extensions-dir /workspace/.ide/home/.openvscode-extensions; "
+                        "printf '%s\\n' \"$actual\" > \"$marker.tmp\"; "
+                        "mv \"$marker.tmp\" \"$marker\""
                     ],
                     env=[
                         client.V1EnvVar(name="HOME", value="/workspace/.ide/home"),
@@ -544,14 +556,6 @@ class ProjectWorkspaceRenderer:
                         client.V1EnvVar(
                             name="DEV_SESSION_CREDENTIAL_FILE",
                             value="/run/dev-session/credential",
-                        ),
-                        client.V1EnvVar(
-                            name="DEV_SESSION_EXPIRES_AT_FILE",
-                            value="/run/dev-session/expires-at",
-                        ),
-                        client.V1EnvVar(
-                            name="DEV_SESSION_REVOKED_FILE",
-                            value="/run/dev-session/revoked",
                         ),
                     ],
                     ports=[client.V1ContainerPort(name="relay", container_port=8080)],
@@ -695,23 +699,10 @@ class ProjectWorkspaceService:
             except Exception as error:
                 if getattr(error, "status", None) != 409:
                     raise
-        session_secret_name = project_session_secret_name(ref)
-        if self._kube.read_secret(session_secret_name) is None:
+        relay_secret_name = project_session_secret_name(ref)
+        if self._relay_credential(ref) is None:
             self._kube.upsert_secret(
-                session_secret_name,
-                {
-                    "apiVersion": "v1",
-                    "kind": "Secret",
-                    "metadata": {
-                        "name": session_secret_name,
-                        "labels": {
-                            "researchcosmos.io/managed-by": MANAGED_BY,
-                            "researchcosmos.io/project-workspace-hash": _short_hash(ref, 16),
-                        },
-                    },
-                    "type": "Opaque",
-                    "data": {"revoked": ""},
-                },
+                relay_secret_name, self._relay_secret(ref, secrets.token_urlsafe(32))
             )
         if self._kube.read_deployment(project_deployment_name(ref)) is None:
             try:
@@ -855,7 +846,7 @@ class ProjectWorkspaceService:
         credential = secrets.token_urlsafe(32)
         values["credentialSha256"] = hashlib.sha256(credential.encode()).hexdigest()
         self._kube.upsert_secret(
-            project_session_secret_name(workspace_ref),
+            project_browser_secret_name(workspace_ref),
             self._session_secret(workspace_ref, credential, expires),
         )
         record = self._store.update_runtime(
@@ -888,7 +879,7 @@ class ProjectWorkspaceService:
         rotated = secrets.token_urlsafe(32)
         expires = self._now() + timedelta(seconds=request.spec.ttl_seconds)
         self._kube.upsert_secret(
-            project_session_secret_name(workspace_ref),
+            project_browser_secret_name(workspace_ref),
             self._session_secret(workspace_ref, rotated, expires),
         )
         values.update(
@@ -913,16 +904,6 @@ class ProjectWorkspaceService:
         values.update(
             state="revoked", revokedAt=now.isoformat(), observedAt=now.isoformat()
         )
-        name = project_session_secret_name(workspace_ref)
-        self._kube.upsert_secret(
-            name,
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": name},
-                "data": {"revoked": ""},
-            },
-        )
         return self._session_snapshot(
             self._store.update_runtime(
                 "project-dev-session", workspace_ref, session_ref, values
@@ -941,7 +922,12 @@ class ProjectWorkspaceService:
             )
         except Exception as error:
             raise DevSessionRelayDownError() from error
-        return ProjectRelayTarget(host=host, port=port, path=path)
+        relay_credential = self._relay_credential(workspace_ref)
+        if relay_credential is None:
+            raise DevSessionRelayDownError()
+        return ProjectRelayTarget(
+            host=host, port=port, path=path, credential=relay_credential
+        )
 
     def observe_relay_ready(
         self, workspace_ref: str, session_ref: str, credential: str
@@ -1134,6 +1120,16 @@ class ProjectWorkspaceService:
             if secret_uid:
                 self._kube.delete_secret(
                     project_session_secret_name(record.job_ref), secret_uid
+                )
+            browser_secret = self._kube.read_secret(
+                project_browser_secret_name(record.job_ref)
+            )
+            browser_uid = str(
+                _field(_field(browser_secret, "metadata", {}), "uid") or ""
+            )
+            if browser_uid:
+                self._kube.delete_secret(
+                    project_browser_secret_name(record.job_ref), browser_uid
                 )
             if not values.get("hibernatedAt"):
                 values.update(hibernatedAt=now.isoformat(), observedAt=now.isoformat())
@@ -1357,7 +1353,7 @@ class ProjectWorkspaceService:
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": project_session_secret_name(workspace_ref),
+                "name": project_browser_secret_name(workspace_ref),
                 "labels": {
                     "researchcosmos.io/managed-by": MANAGED_BY,
                     "researchcosmos.io/project-workspace-hash": _short_hash(workspace_ref, 16),
@@ -1369,16 +1365,42 @@ class ProjectWorkspaceService:
                 "expires-at": base64.b64encode(
                     str(int(expires.timestamp())).encode("ascii")
                 ).decode("ascii"),
-                # The fixed Secret slot is patched in place so the long-lived
-                # Workspace Pod observes credential rotation without restart.
-                # Explicit null removes the revoke marker left by the previous
-                # session; omitting it would preserve that map key and every
-                # subsequent session would remain permanently revoked.
-                "revoked": None,
             },
         }
 
     def _secret_credential(self, workspace_ref: str) -> str | None:
+        secret = self._kube.read_secret(project_browser_secret_name(workspace_ref))
+        data = _field(secret, "data", {}) if secret is not None else {}
+        raw = data.get("credential") if isinstance(data, Mapping) else None
+        if not isinstance(raw, str):
+            return None
+        try:
+            return base64.b64decode(raw, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _relay_secret(
+        self, workspace_ref: str, credential: str
+    ) -> dict[str, object]:
+        return {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": project_session_secret_name(workspace_ref),
+                "labels": {
+                    "researchcosmos.io/managed-by": MANAGED_BY,
+                    "researchcosmos.io/project-workspace-hash": _short_hash(
+                        workspace_ref, 16
+                    ),
+                },
+            },
+            "type": "Opaque",
+            "data": {
+                "credential": base64.b64encode(credential.encode()).decode("ascii")
+            },
+        }
+
+    def _relay_credential(self, workspace_ref: str) -> str | None:
         secret = self._kube.read_secret(project_session_secret_name(workspace_ref))
         data = _field(secret, "data", {}) if secret is not None else {}
         raw = data.get("credential") if isinstance(data, Mapping) else None
