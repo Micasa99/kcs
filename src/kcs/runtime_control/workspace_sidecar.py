@@ -1218,7 +1218,17 @@ class RuntimeControlSidecar:
                             "UNSAFE_PATH", "workspace target is not a regular file"
                         )
                 os.replace(partial, target_name, dst_dir_fd=parent_fd)
-            self._hand_off_staged_file(parent_fd, target_name)
+            read_only = str(request["path"]).split("/", 1)[0] in {
+                "inputs",
+                "sources",
+            }
+            self._hand_off_staged_file(
+                parent_fd,
+                target_name,
+                read_only=read_only,
+            )
+            if read_only:
+                self._freeze_readonly_directories(str(request["path"]))
             os.fsync(parent_fd)
             self._stage_installs += 1
             result = {**intent, "ok": True, "state": "completed"}
@@ -1230,17 +1240,48 @@ class RuntimeControlSidecar:
             os.close(parent_fd)
 
     @staticmethod
-    def _hand_off_staged_file(parent_fd: int, target_name: str) -> None:
+    def _hand_off_staged_file(
+        parent_fd: int,
+        target_name: str,
+        *,
+        read_only: bool,
+    ) -> None:
         descriptor = os.open(
             target_name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
         try:
-            os.fchmod(descriptor, 0o660)
-            if os.geteuid() == 0:
+            os.fchmod(descriptor, 0o440 if read_only else 0o660)
+            if os.geteuid() == 0 and read_only:
+                os.fchown(descriptor, 0, _EXPERIMENT_GID)
+            elif os.geteuid() == 0:
                 os.fchown(descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
             os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if read_only:
+            os.fchmod(parent_fd, 0o550)
+            if os.geteuid() == 0:
+                os.fchown(parent_fd, 0, _EXPERIMENT_GID)
+
+    def _freeze_readonly_directories(self, raw_path: str) -> None:
+        descriptor = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in PurePosixPath(raw_path).parts[:-1]:
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+                os.fchmod(descriptor, 0o550)
+                if os.geteuid() == 0:
+                    os.fchown(descriptor, 0, _EXPERIMENT_GID)
+                os.fsync(descriptor)
         finally:
             os.close(descriptor)
 

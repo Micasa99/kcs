@@ -343,6 +343,7 @@ class V2JobRenderer:
         product_base = _product_base_from_gateway(model_env.get("OPENAI_BASE_URL", ""))
         launcher_env = {
             **model_env,
+            "COSMOS_INPUTS_DIR": "/workspace/inputs",
             "RC_NATIVE_RUNNER_ENTRYPOINT_JSON": json.dumps(
                 recipe.root["runnerEntrypoint"], separators=(",", ":")
             ),
