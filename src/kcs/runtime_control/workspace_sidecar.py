@@ -1156,7 +1156,13 @@ class RuntimeControlSidecar:
                 )
 
         self._validate_transfer_path(request, allow_stage_existing=True)
-        parent_fd, target_name = self._open_parent(str(request["path"]), create=True)
+        raw_path = str(request["path"])
+        read_only = raw_path.split("/", 1)[0] in {"inputs", "sources"}
+        parent_fd, target_name = self._open_parent(
+            raw_path,
+            create=True,
+            read_only=read_only,
+        )
         partial = self._partials / hashlib.sha256(transfer_ref.encode()).hexdigest()
         try:
             intent: dict[str, Any]
@@ -1218,10 +1224,6 @@ class RuntimeControlSidecar:
                             "UNSAFE_PATH", "workspace target is not a regular file"
                         )
                 os.replace(partial, target_name, dst_dir_fd=parent_fd)
-            read_only = str(request["path"]).split("/", 1)[0] in {
-                "inputs",
-                "sources",
-            }
             self._hand_off_staged_file(
                 parent_fd,
                 target_name,
@@ -3170,7 +3172,13 @@ class RuntimeControlSidecar:
             if unicodedata.normalize("NFC", child.name).casefold() == folded
         ]
 
-    def _open_parent(self, raw_path: str, *, create: bool) -> tuple[int, str]:
+    def _open_parent(
+        self,
+        raw_path: str,
+        *,
+        create: bool,
+        read_only: bool = False,
+    ) -> tuple[int, str]:
         """Walk parents by descriptor so a concurrent symlink swap cannot escape."""
         parts = PurePosixPath(raw_path).parts
         descriptor = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY)
@@ -3198,9 +3206,13 @@ class RuntimeControlSidecar:
                     dir_fd=descriptor,
                 )
                 if created_directory:
-                    os.fchmod(next_descriptor, 0o2775)
+                    os.fchmod(next_descriptor, 0o550 if read_only else 0o2775)
                     if os.geteuid() == 0:
-                        os.fchown(next_descriptor, _EXPERIMENT_UID, _EXPERIMENT_GID)
+                        os.fchown(
+                            next_descriptor,
+                            0 if read_only else _EXPERIMENT_UID,
+                            _EXPERIMENT_GID,
+                        )
                 os.close(descriptor)
                 descriptor = next_descriptor
             target_name = parts[-1]

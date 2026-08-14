@@ -14,7 +14,7 @@ data:
     {"version":1,"capabilities":[]}
   openvscode-image-volume: 10.255.250.1:5000/researchcosmos/rc-openvscode-server@sha256:f81187d7c9480c74cddbc3eec3955c239d492b4fbc1cb023b14c154f8b2d4e40
   dev-session-relay-image: 10.255.250.1:5000/researchcosmos/rc-dev-session-relay@sha256:8cd5a313a602fb8666c4aef3a1aa8a79fbb821065e3699f0e9e189306917d672
-  project-workspace-control-image: 10.255.250.1:5000/researchcosmos/kcs-control@sha256:afcf149a3c0457f641c1e279c05dde5e8d9a22598e559eb54cf53ee39e7dc680
+  project-workspace-control-image: 10.255.250.1:5000/researchcosmos/kcs-control@sha256:7c753123938c67a85c74d6f86b4bb478c7e41ec8d21c12bd27ff0548f34006b3
   # Exact RC-published extension artifact. The Workspace init verifies the raw
   # VSIX SHA before installing it into the persistent IDE extensions directory.
   project-workspace-vsix-image-volume: 10.255.250.1:5000/researchcosmos/aicosmos-workspace-vsix@sha256:88d6e79dccf29c8f8d48e44119f423b88f0764d0df74c4c528ae136c838ff0fb
