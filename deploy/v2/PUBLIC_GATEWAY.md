@@ -75,3 +75,10 @@ location /api/v2/ {
 still constrained by its smaller `authorizedMaxSizeBytes` and SHA-256 at KCS.
 Do not replace this with a smaller undocumented proxy limit or enable request
 buffering onto the control node's system disk.
+
+The API streams each request into one bounded `TMPDIR` spool file before the
+provider verifies and stages it.  The `kcs-v2-api` Pod therefore reserves a
+120 GiB `emptyDir`/ephemeral-storage limit: enough for one contract-maximum
+transfer plus service overhead.  Do not lower that Pod limit below the public
+100 GiB ceiling; doing so evicts the API Pod mid-transfer and also interrupts
+DevSession relay traffic.
