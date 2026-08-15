@@ -3786,7 +3786,30 @@ class V2JobProvider:
                 # COMPLETED precedes HTTP BackgroundTask cleanup; it is not holder-death proof.
                 return False
             if kind in {"transfer-stage", "transfer-reconcile"}:
-                return snapshot.state is TransferState.COMPLETED
+                if snapshot.state is TransferState.COMPLETED:
+                    return True
+                if (
+                    kind == "transfer-reconcile"
+                    and self._startup_reconcile
+                    and snapshot.state is TransferState.REGISTERED
+                    and snapshot.actual_size_bytes is None
+                    and snapshot.actual_sha256 is None
+                    and not snapshot.verified
+                    and not snapshot.content_available
+                    and snapshot.snapshot_ref is None
+                ):
+                    owner = self.inspect(job_ref)
+                    cleanup_state = (
+                        str(owner.root["cleanup"]["state"])
+                        if isinstance(owner, NativeJobBindingSnapshot)
+                        else owner.cleanup.state.value
+                    )
+                    return (
+                        owner.binding_state
+                        in {JobBindingState.SUCCEEDED, JobBindingState.FAILED}
+                        and cleanup_state == CleanupState.COMPLETE.value
+                    )
+                return False
             return False
         if kind in {"workspace-invoke", "operation-reconcile"}:
             record = self._store.read_runtime("operation", job_ref, ref)
