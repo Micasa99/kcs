@@ -94,6 +94,7 @@ from kcs.jobs.native_contracts import (
     RunnerStopSnapshot,
 )
 from kcs.jobs.native_runtime import RunnerCredentialGrantMetadata
+from kcs.jobs.policy import PolicyViolationError
 from kcs.jobs.project_workspace import (
     CreateProjectSnapshotRequest,
     EnsureProjectWorkspaceRequest,
@@ -227,6 +228,8 @@ class _V2Route(APIRoute):
                 response = _error_response(_validation_error(error), request)
             except KcsV2Error as error:
                 response = _error_response(error, request)
+            except PolicyViolationError:
+                response = _error_response(InvalidRequestError(), request)
             except Exception:
                 log.exception(
                     "unhandled KCS V2 route failure requestId=%s method=%s path=%s",
