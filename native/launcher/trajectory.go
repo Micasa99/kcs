@@ -21,6 +21,8 @@ type trajectoryRecorder struct {
 	mu        sync.Mutex
 	observed  protocolTerminal
 	closeOnce sync.Once
+
+	piStopReason string
 }
 
 type lineTee struct {
@@ -203,6 +205,17 @@ func (recorder *trajectoryRecorder) observeLine(line []byte) {
 		return
 	}
 	stopReason := firstString(event, "stop_reason", "stopReason", "reason")
+	piAssistantStopReason := ""
+	piAssistantMessageEnd := false
+	if recorder.adapter.RunnerRef == "runner-pi" && kind == "message_end" {
+		if message, ok := event["message"].(map[string]any); ok && firstString(message, "role") == "assistant" {
+			piAssistantMessageEnd = true
+			piAssistantStopReason = firstString(message, "stop_reason", "stopReason", "reason")
+			if stopReason == "" {
+				stopReason = piAssistantStopReason
+			}
+		}
+	}
 	if stopReason == "" {
 		stopReason = template.StopReason
 	}
@@ -216,6 +229,14 @@ func (recorder *trajectoryRecorder) observeLine(line []byte) {
 		}
 	}
 	recorder.mu.Lock()
+	if piAssistantMessageEnd {
+		// Pi may retry after an assistant error.  Keeping only the latest
+		// assistant terminal lets a later successful message clear that error.
+		recorder.piStopReason = piAssistantStopReason
+	}
+	if recorder.adapter.RunnerRef == "runner-pi" && kind == "agent_end" && stopReason == "" {
+		stopReason = recorder.piStopReason
+	}
 	recorder.observed = protocolTerminal{
 		Observed:   true,
 		EventKind:  stringPointer(kind),
