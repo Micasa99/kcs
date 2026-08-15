@@ -207,7 +207,7 @@ func (recorder *trajectoryRecorder) observeLine(line []byte) {
 	stopReason := firstString(event, "stop_reason", "stopReason", "reason")
 	piAssistantStopReason := ""
 	piAssistantMessageEnd := false
-	if recorder.adapter.RunnerRef == "runner-pi" && kind == "message_end" {
+	if recorder.adapter.RunnerRef == "native-lane/pi-runner@1" && kind == "message_end" {
 		if message, ok := event["message"].(map[string]any); ok && firstString(message, "role") == "assistant" {
 			piAssistantMessageEnd = true
 			piAssistantStopReason = firstString(message, "stop_reason", "stopReason", "reason")
@@ -234,7 +234,7 @@ func (recorder *trajectoryRecorder) observeLine(line []byte) {
 		// assistant terminal lets a later successful message clear that error.
 		recorder.piStopReason = piAssistantStopReason
 	}
-	if recorder.adapter.RunnerRef == "runner-pi" && kind == "agent_end" && stopReason == "" {
+	if recorder.adapter.RunnerRef == "native-lane/pi-runner@1" && kind == "agent_end" && stopReason == "" {
 		stopReason = recorder.piStopReason
 	}
 	recorder.observed = protocolTerminal{
