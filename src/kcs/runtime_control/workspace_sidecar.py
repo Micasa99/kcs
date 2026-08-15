@@ -1768,29 +1768,33 @@ class RuntimeControlSidecar:
         observed: list[dict[str, object]] = []
         for item in entries:
             relative = str(item["path"])
-            content = (
-                self._read_workspace_file(f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{relative}")
-                if bulk_transfer
-                else inline[relative]
-            )
-            if (
-                len(content) != item["size"]
-                or hashlib.sha256(content).hexdigest() != item["sha256"]
-            ):
-                raise _RpcRejectedError(
-                    "DIGEST_MISMATCH",
-                    f"workspace base entry {relative!r} failed integrity",
+            target = f"worktree/{relative}"
+            if bulk_transfer:
+                actual_size, actual_digest = self._copy_workspace_file(
+                    f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{relative}",
+                    target,
+                    expected_size=int(item["size"]),
+                    expected_digest=str(item["sha256"]),
+                    mode=_ENTRY_MODE_BITS[str(item["mode"])],
                 )
-            self._write_workspace_file(
-                f"worktree/{relative}", content, _ENTRY_MODE_BITS[str(item["mode"])]
-            )
-            actual = self._read_workspace_file(f"worktree/{relative}")
+            else:
+                content = inline[relative]
+                actual_size = len(content)
+                actual_digest = hashlib.sha256(content).hexdigest()
+                if actual_size != item["size"] or actual_digest != item["sha256"]:
+                    raise _RpcRejectedError(
+                        "DIGEST_MISMATCH",
+                        f"workspace base entry {relative!r} failed integrity",
+                    )
+                self._write_workspace_file(
+                    target, content, _ENTRY_MODE_BITS[str(item["mode"])]
+                )
             mode = self._workspace_file_mode(f"worktree/{relative}")
             observed.append(
                 {
                     "path": relative,
-                    "size": len(actual),
-                    "sha256": hashlib.sha256(actual).hexdigest(),
+                    "size": actual_size,
+                    "sha256": actual_digest,
                     "mode": mode,
                 }
             )
@@ -3010,6 +3014,91 @@ class RuntimeControlSidecar:
             return bytes(chunks)
         finally:
             os.close(descriptor)
+
+    def _copy_workspace_file(
+        self,
+        source_path: str,
+        target_path: str,
+        *,
+        expected_size: int,
+        expected_digest: str,
+        mode: int,
+    ) -> tuple[int, str]:
+        """Copy one exact staged file without materializing it in memory."""
+
+        source_parent_fd, source_name = self._open_parent(source_path, create=False)
+        try:
+            source_fd = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_parent_fd,
+            )
+        finally:
+            os.close(source_parent_fd)
+        try:
+            target_parent_fd, target_name = self._open_parent(target_path, create=True)
+        except Exception:
+            os.close(source_fd)
+            raise
+        temporary_name = f".{target_name}.{os.getpid()}.{time.time_ns()}.partial"
+        target_fd = -1
+        try:
+            source_stat = os.fstat(source_fd)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise _RpcRejectedError("UNSAFE_PATH", "workspace entry is not a regular file")
+            if source_stat.st_size != expected_size:
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "workspace base entry size differs"
+                )
+            target_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+                dir_fd=target_parent_fd,
+            )
+            copied_size = 0
+            copied_digest = hashlib.sha256()
+            while chunk := os.read(source_fd, _COPY_CHUNK):
+                copied_size += len(chunk)
+                if copied_size > expected_size:
+                    raise _RpcRejectedError(
+                        "DIGEST_MISMATCH", "workspace base entry exceeded its contract"
+                    )
+                copied_digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target_fd, view)
+                    if written <= 0:
+                        raise OSError("workspace base copy made no progress")
+                    view = view[written:]
+            observed_digest = copied_digest.hexdigest()
+            if copied_size != expected_size or observed_digest != expected_digest:
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "workspace base entry failed integrity"
+                )
+            os.fchmod(target_fd, mode)
+            if os.geteuid() == 0:
+                os.fchown(target_fd, _EXPERIMENT_UID, _EXPERIMENT_GID)
+            os.fsync(target_fd)
+            os.close(target_fd)
+            target_fd = -1
+            os.replace(
+                temporary_name,
+                target_name,
+                src_dir_fd=target_parent_fd,
+                dst_dir_fd=target_parent_fd,
+            )
+            os.fsync(target_parent_fd)
+            return copied_size, observed_digest
+        finally:
+            os.close(source_fd)
+            if target_fd >= 0:
+                os.close(target_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=target_parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(target_parent_fd)
 
     def _write_workspace_file(self, raw_path: str, content: bytes, mode: int) -> None:
         parent_fd, target_name = self._open_parent(raw_path, create=True)
