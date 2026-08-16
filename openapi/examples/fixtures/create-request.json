@@ -1,9 +1,10 @@
 {
   "providerRequestId": "provider-request-synthetic-001",
-  "specDigest": "361da627d15ba9e6d5ee764feb3db87625b41022275148752dc71daf115ff385",
+  "specDigest": "cc46754bc72f39ff9dbe20cea79f471676ce0d0211d5cb6d5bc8c0378b983f8f",
   "spec": {
     "subjectRef": "attempt-synthetic-001",
     "runtimePlanDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "networkClass": "restricted",
     "agent": {
       "image": "registry.example.invalid/kcs-agent@sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "command": ["/opt/kcs/agent-supervisor"],

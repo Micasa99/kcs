@@ -156,7 +156,7 @@ def test_contract_freezes_version_routes_security_and_media_types() -> None:
     openapi = _load_openapi()
 
     assert openapi["openapi"] == "3.1.0"
-    assert openapi["info"]["version"] == "2.6.2"
+    assert openapi["info"]["version"] == "2.7.0"
     assert openapi["x-kcs-contract-status"] == "active"
     assert set(openapi["paths"]) == EXPECTED_PATHS
     assert {

@@ -27,12 +27,11 @@ not silently authorize native workloads.
 
 ## 2. Configure Model Gateway and egress
 
-Set the two HTTPS base URLs in `kcs-v2-native-runtime-config`; KCS accepts only exact
-configured values from a native Job. Render
-`deploy/v2/native-network-policy.example.yaml` with the actual operator-owned Gateway
-VIP/CIDR and apply it only after verifying DNS and TCP 443 from an isolated canary.
-The native Pod receives no ingress and no general Internet egress. Do not add
-provider keys to KCS:
+Set the two HTTPS base URLs and canonical operator-owned platform CIDRs in
+`kcs-v2-native-runtime-config`; KCS accepts only exact configured values from a native
+Job. KCS creates and observes the Attempt NetworkPolicy before it creates the Job.
+The native Pod receives only KCS API ingress for its control relay, DNS egress, and
+TCP 443 egress to those CIDRs. Do not add provider keys to KCS:
 ResearchCosmos grants an Attempt-scoped gateway token through
 `grantRunnerCredential`.
 

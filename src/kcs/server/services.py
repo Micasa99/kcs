@@ -76,6 +76,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             batch_api,
             core_api,
             apps_api=apps_api,
+            networking_api=client.NetworkingV1Api(api_client=client.ApiClient()),
             metrics_api=client.CustomObjectsApi(api_client=client.ApiClient()),
             # kubernetes.stream.stream temporarily replaces its ApiClient's
             # request transport with a websocket transport.  A fresh client

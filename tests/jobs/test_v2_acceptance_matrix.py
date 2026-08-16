@@ -174,6 +174,7 @@ def test_create_freezes_exact_identity_digest_and_physical_spec() -> None:
     assert set(spec["required"]) == {
         "subjectRef",
         "runtimePlanDigest",
+        "networkClass",
         "agent",
         "workspace",
         "sharedWorkspace",
@@ -760,7 +761,7 @@ def test_errors_security_runtime_env_and_schema_discovery_are_machine_readable()
         "source": "exact-response-bytes",
         "encoding": "lowercase-hex",
     }
-    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.6.2"
+    assert discovery["headers"]["X-KCS-API-Version"]["schema"]["const"] == "2.7.0"
     assert discovery["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
     assert document["x-kcs-legacy-authorization"] == {
         "v2NamespaceAccess": "denied",

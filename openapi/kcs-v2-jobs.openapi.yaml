@@ -2,7 +2,7 @@ openapi: 3.1.0
 x-kcs-contract-status: active
 info:
   title: KCS V2 Attempt API
-  version: 2.6.2
+  version: 2.7.0
   description: >-
     Canonical provider-runtime wire contract. KCS owns Kubernetes workload reality
     only, accepts opaque owner references, and never infers research success.
@@ -2551,7 +2551,7 @@ paths:
             encoding: lowercase-hex
           headers:
             ETag: {schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
-            X-KCS-API-Version: {schema: {type: string, const: 2.6.2}}
+            X-KCS-API-Version: {schema: {type: string, const: 2.7.0}}
             Cache-Control: {schema: {type: string, const: no-store}}
           content:
             application/json:
@@ -3180,14 +3180,16 @@ components:
         kind: {type: string, const: ephemeral}
         mountPath: {type: string, const: /workspace}
         sizeLimitGiB: {type: integer, minimum: 1, maximum: 100, default: 20}
+    NetworkClass: {type: string, enum: [none, restricted]}
     JobSpec:
       type: object
       additionalProperties: false
       x-kcs-default-semantics: omission-is-distinct
-      required: [subjectRef, runtimePlanDigest, agent, workspace, sharedWorkspace, nodeSelector, activeDeadlineSeconds]
+      required: [subjectRef, runtimePlanDigest, networkClass, agent, workspace, sharedWorkspace, nodeSelector, activeDeadlineSeconds]
       properties:
         subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
         runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
+        networkClass: {$ref: '#/components/schemas/NetworkClass'}
         agent: {$ref: '#/components/schemas/AgentSpec'}
         workspace: {$ref: '#/components/schemas/WorkspaceSpec'}
         sharedWorkspace: {$ref: '#/components/schemas/SharedWorkspaceSpec'}
@@ -3254,10 +3256,11 @@ components:
       type: object
       additionalProperties: false
       x-kcs-placement-owner: kcs
-      required: [subjectRef, runtimePlanDigest, sharedWorkspace, native]
+      required: [subjectRef, runtimePlanDigest, networkClass, sharedWorkspace, native]
       properties:
         subjectRef: {$ref: '#/components/schemas/OpaqueRef'}
         runtimePlanDigest: {$ref: '#/components/schemas/Sha256'}
+        networkClass: {$ref: '#/components/schemas/NetworkClass'}
         sharedWorkspace: {$ref: '#/components/schemas/SharedWorkspaceSpec'}
         native: {$ref: '#/components/schemas/NativeRuntimeSpec'}
     CreateJobSpec:
@@ -4114,6 +4117,17 @@ components:
         expiresAt: {$ref: '#/components/schemas/Timestamp'}
         revokedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+    NetworkPolicyObservation:
+      type: object
+      additionalProperties: false
+      required: [requestedClass, policyRef, policyUid, resourceVersion, specDigest, observedAt]
+      properties:
+        requestedClass: {$ref: '#/components/schemas/NetworkClass'}
+        policyRef: {$ref: '#/components/schemas/OpaqueRef'}
+        policyUid: {$ref: '#/components/schemas/KubernetesUid'}
+        resourceVersion: {type: string, minLength: 1}
+        specDigest: {$ref: '#/components/schemas/Sha256'}
+        observedAt: {$ref: '#/components/schemas/Timestamp'}
     JobBindingSnapshot:
       type: object
       additionalProperties: false
@@ -4146,7 +4160,7 @@ components:
             properties:
               deleteAction:
                 properties: {state: {not: {const: not_requested}}}
-      required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
+      required: [jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, networkPolicy, agent, workspace, latestAgentGeneration, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
       properties:
         jobRef: {$ref: '#/components/schemas/OpaqueRef'}
         providerHandle: {$ref: '#/components/schemas/OpaqueRef'}
@@ -4168,6 +4182,8 @@ components:
         startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+        networkPolicy:
+          oneOf: [{$ref: '#/components/schemas/NetworkPolicyObservation'}, {type: 'null'}]
         agent:
           oneOf: [{$ref: '#/components/schemas/AgentRoleSnapshot'}, {type: 'null'}]
         workspace:
@@ -4320,7 +4336,7 @@ components:
     NativeJobBindingSnapshot:
       type: object
       additionalProperties: false
-      required: [runtimeLane, jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, runner, control, latestRunnerGeneration, recipeActivation, deadline, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, runnerStopAction, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
+      required: [runtimeLane, jobRef, providerHandle, providerRequestId, subjectRef, runtimePlanDigest, specDigest, jobUid, podUid, resourceVersion, nodeName, bindingState, bindingReason, observedPodCount, podIncarnations, createdAt, updatedAt, startedAt, finishedAt, observedAt, networkPolicy, runner, control, latestRunnerGeneration, recipeActivation, deadline, activeOperationRefs, terminalOperationRefs, credentialObservations, transferObservations, runnerStopAction, finalizeAction, cancelAction, deleteAction, outputLossPossible, cleanup, gpuRelease]
       properties:
         runtimeLane: {type: string, const: native}
         jobRef: {$ref: '#/components/schemas/OpaqueRef'}
@@ -4343,6 +4359,8 @@ components:
         startedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         finishedAt: {$ref: '#/components/schemas/NullableTimestamp'}
         observedAt: {$ref: '#/components/schemas/Timestamp'}
+        networkPolicy:
+          oneOf: [{$ref: '#/components/schemas/NetworkPolicyObservation'}, {type: 'null'}]
         runner:
           oneOf: [{$ref: '#/components/schemas/RunnerRoleSnapshot'}, {type: 'null'}]
         control:

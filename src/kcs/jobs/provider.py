@@ -53,6 +53,7 @@ from .contracts import (
     JobBindingState,
     JobTombstone,
     LogContainer,
+    NetworkPolicyObservation,
     NodeTelemetryList,
     NvidiaDeviceTelemetry,
     NvidiaTelemetrySnapshot,
@@ -174,6 +175,8 @@ from .recipe_registry import runtime_recipe_digest
 from .renderer import (
     activation_volume_name,
     credential_secret_name,
+    network_policy_ref,
+    network_policy_spec_digest,
     runner_credential_secret_name,
 )
 from .runtime_assembly import RuntimeAssemblyResolver, capability_activation_receipt
@@ -227,6 +230,10 @@ class V2JobRendererProtocol(Protocol):
         activation_plan: CapabilityActivationPlan | None = None,
     ) -> object: ...
 
+    def render_network_policy(
+        self, request: CreateJobRequest | NativeCreateJobRequest
+    ) -> object: ...
+
     def resolve_recipe(
         self, runner_ref: str, environment_profile_ref: str
     ) -> ResolvedRuntimeRecipe: ...
@@ -248,6 +255,12 @@ class V2KubeAdapterProtocol(Protocol):
     """Namespace-bound Kubernetes operations used by this provider."""
 
     def create_job(self, job: object) -> object: ...
+
+    def create_network_policy(self, policy: object) -> object: ...
+
+    def read_network_policy(self, name: str) -> object | None: ...
+
+    def delete_network_policy(self, name: str, policy_uid: str) -> None: ...
 
     def read_job(self, job_ref: str) -> object | None: ...
 
@@ -2012,6 +2025,8 @@ class V2JobProvider:
                     else self._missing_job_snapshot(record)
                 )
                 return CreateResult(snapshot=missing, created=False)
+            expected_policy = self._renderer.render_network_policy(request)
+            self._create_or_reconcile_network_policy(expected_policy, record)
             if rendered_job is None:
                 if isinstance(request, NativeCreateJobRequest):
                     self._dev_sessions.ensure_relay_credential(job_ref)
@@ -2050,6 +2065,10 @@ class V2JobProvider:
             if _is_native_record(record):
                 return self._native_missing_job_snapshot(record)
             return self._missing_job_snapshot(record)
+
+        _, policy_reason = self._network_policy_observation(record, self._now())
+        if policy_reason is not None and not deleting:
+            record = self._mark_indeterminate(record, policy_reason)
 
         actual_job_uid = _required_text(job, "metadata", "uid")
         retained_job_uid = _field(record, "job_uid", None)
@@ -3551,6 +3570,20 @@ class V2JobProvider:
             credential_observations=credential_observations,
             transfer_observations=transfer_observations,
         )
+        self._delete_network_policy(record)
+        record = self._mark_deleted(
+            record,
+            delete_ref=delete_ref,
+            request_digest=request_digest,
+            final_state=final_state,
+            deleted_at=observed_at,
+            expires_at=observed_at + self._tombstone_ttl,
+            cleanup_state=CleanupState.PENDING,
+            cleanup_phase=_later_delete_phase(record, "network_policy_absent"),
+            gpu_release_state=CleanupState.COMPLETE if gpu_requested else CleanupState.NOT_REQUIRED,
+            credential_observations=credential_observations,
+            transfer_observations=transfer_observations,
+        )
         self._store.delete_runtime_records(job_ref)
         if self._store.has_runtime_records(job_ref):
             raise DependencyTimeoutError("Kubernetes owner runtime records remain after deletion")
@@ -4874,6 +4907,102 @@ class V2JobProvider:
             raise DependencyUnavailableError("Kubernetes did not return the created Job")
         return job
 
+    def _create_or_reconcile_network_policy(
+        self, expected: object, record: object
+    ) -> object:
+        policy_ref = network_policy_ref(str(_field(record, "job_ref")))
+        create_error: Exception | None = None
+        try:
+            self._kube.create_network_policy(expected)
+        except Exception as error:
+            create_error = error
+        policy = self._read_network_policy(policy_ref)
+        if policy is None:
+            if create_error is not None:
+                raise DependencyUnavailableError from create_error
+            raise DependencyUnavailableError("Kubernetes did not return the NetworkPolicy")
+        _required_text(policy, "metadata", "uid")
+        _required_text(policy, "metadata", "resource_version")
+        reason = self._network_policy_drift(expected, policy)
+        if reason is not None:
+            self._mark_indeterminate(record, reason)
+            raise DependencyUnavailableError(reason)
+        return policy
+
+    def _network_policy_observation(
+        self, record: object, observed_at: datetime
+    ) -> tuple[NetworkPolicyObservation | None, str | None]:
+        spec = _field(record, "spec_payload", {})
+        requested_class = _field(spec, "networkClass", None)
+        if requested_class is None:
+            return None, None
+        request_payload = {
+            "providerRequestId": str(_field(record, "provider_request_id")),
+            "specDigest": str(_field(record, "spec_digest")),
+            "spec": dict(spec),
+        }
+        try:
+            request: CreateJobRequest | NativeCreateJobRequest = (
+                NativeCreateJobRequest.model_validate(request_payload)
+                if _is_native_record(record)
+                else CreateJobRequest.model_validate(request_payload)
+            )
+            expected = self._renderer.render_network_policy(request)
+        except (TypeError, ValueError) as error:
+            raise DependencyUnavailableError(
+                "retained network policy request is invalid"
+            ) from error
+        policy_ref = network_policy_ref(str(_field(record, "job_ref")))
+        policy = self._read_network_policy(policy_ref)
+        if policy is None:
+            return None, "the retained NetworkPolicy is no longer observable"
+        reason = self._network_policy_drift(expected, policy)
+        if reason is not None:
+            return None, reason
+        return (
+            NetworkPolicyObservation(
+                requested_class=str(requested_class),
+                policy_ref=policy_ref,
+                policy_uid=UUID(_required_text(policy, "metadata", "uid")),
+                resource_version=_required_text(policy, "metadata", "resource_version"),
+                spec_digest=network_policy_spec_digest(policy),
+                observed_at=observed_at,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _network_policy_drift(expected: object, actual: object) -> str | None:
+        expected_name = _required_text(expected, "metadata", "name")
+        if _required_text(actual, "metadata", "name") != expected_name:
+            return "NetworkPolicy identity changed"
+        if _required_text(actual, "metadata", "namespace") != _required_text(
+            expected, "metadata", "namespace"
+        ):
+            return "NetworkPolicy namespace changed"
+        for field_name in ("labels", "annotations"):
+            expected_values = _path(expected, "metadata", field_name)
+            actual_values = _path(actual, "metadata", field_name)
+            if not isinstance(expected_values, Mapping) or not isinstance(
+                actual_values, Mapping
+            ):
+                return f"NetworkPolicy {field_name} are not observable"
+            if any(actual_values.get(key) != value for key, value in expected_values.items()):
+                return f"NetworkPolicy {field_name} changed"
+        if not hmac.compare_digest(
+            network_policy_spec_digest(expected), network_policy_spec_digest(actual)
+        ):
+            return "NetworkPolicy spec changed"
+        return None
+
+    def _read_network_policy(self, policy_ref: str) -> object | None:
+        try:
+            return self._kube.read_network_policy(policy_ref)
+        except Exception as error:
+            if _api_status(error) == 404:
+                return None
+            raise DependencyUnavailableError from error
+
     def _read_job(self, job_ref: str) -> object | None:
         try:
             return self._kube.read_job(job_ref)
@@ -4974,6 +5103,9 @@ class V2JobProvider:
         replacement_reason: str | None,
     ) -> NativeJobBindingSnapshot:
         observed_at = self._now()
+        network_policy, policy_reason = self._network_policy_observation(record, observed_at)
+        if replacement_reason is None:
+            replacement_reason = policy_reason
         pod = _current_pod(pods)[0] if replacement_reason is None else None
         spec_payload = _field(record, "spec_payload", {})
         native_spec = _field(spec_payload, "native", {})
@@ -5145,6 +5277,11 @@ class V2JobProvider:
             ),
             "finishedAt": _job_finished_at(job).isoformat() if _job_finished_at(job) else None,
             "observedAt": observed_at.isoformat(),
+            "networkPolicy": (
+                network_policy.model_dump(mode="json", by_alias=True)
+                if network_policy is not None
+                else None
+            ),
             "runner": runner,
             "control": control,
             "latestRunnerGeneration": latest.root if latest else None,
@@ -5555,6 +5692,29 @@ class V2JobProvider:
             if _api_status(error) != 404:
                 raise DependencyUnavailableError from error
 
+    def _delete_network_policy(self, record: object) -> None:
+        spec = _field(record, "spec_payload", {})
+        if _field(spec, "networkClass", None) is None:
+            return
+        policy_ref = network_policy_ref(str(_field(record, "job_ref")))
+        policy = self._read_network_policy(policy_ref)
+        if policy is None:
+            return
+        observation, reason = self._network_policy_observation(record, self._now())
+        if reason is not None or observation is None:
+            raise DependencyUnavailableError(reason or "NetworkPolicy identity is unavailable")
+        try:
+            self._kube.delete_network_policy(policy_ref, str(observation.policy_uid))
+        except Exception as error:
+            if _api_status(error) != 404:
+                raise DependencyUnavailableError from error
+        for attempt in range(self._delete_poll_attempts):
+            if self._read_network_policy(policy_ref) is None:
+                return
+            if attempt + 1 < self._delete_poll_attempts:
+                self._sleeper(self._delete_poll_interval_seconds)
+        raise DependencyTimeoutError("Kubernetes has not confirmed NetworkPolicy deletion")
+
     def _wait_for_job_absence(self, job_ref: str) -> bool:
         for attempt in range(self._delete_poll_attempts):
             if self._read_job(job_ref) is None:
@@ -5572,6 +5732,9 @@ class V2JobProvider:
         replacement_reason: str | None,
     ) -> JobBindingSnapshot:
         observed_at = self._now()
+        network_policy, policy_reason = self._network_policy_observation(record, observed_at)
+        if replacement_reason is None:
+            replacement_reason = policy_reason
         pod = _current_pod(pods)[0] if replacement_reason is None else None
         binding_state, binding_reason = _binding_state(job, pod, replacement_reason)
         workload_terminal = binding_state in {
@@ -5703,6 +5866,7 @@ class V2JobProvider:
             started_at=started_at,
             finished_at=finished_at,
             observed_at=observed_at,
+            network_policy=network_policy,
             agent=agent,
             workspace=workspace,
             latest_agent_generation=latest,
@@ -5743,6 +5907,7 @@ class V2JobProvider:
 
     def _missing_job_snapshot(self, record: object) -> JobBindingSnapshot:
         observed_at = self._now()
+        network_policy, _ = self._network_policy_observation(record, observed_at)
         spec_payload = _field(record, "spec_payload", {})
         created_at = _as_datetime(_field(record, "created_at"), observed_at)
         cancellations = self._runtime_records("cancel", str(_field(record, "job_ref")))
@@ -5769,6 +5934,7 @@ class V2JobProvider:
             started_at=None,
             finished_at=None,
             observed_at=observed_at,
+            network_policy=network_policy,
             agent=None,
             workspace=None,
             latest_agent_generation=None,
@@ -6574,8 +6740,9 @@ def _later_delete_phase(record: object, desired: str) -> str:
         "credentials_destroyed": 2,
         "job_delete_requested": 3,
         "workload_absent": 4,
-        "owner_records_deleted": 5,
-        "complete": 6,
+        "network_policy_absent": 5,
+        "owner_records_deleted": 6,
+        "complete": 7,
     }
     retained = _field(record, "cleanup_phase", None)
     if retained not in order or desired not in order:
@@ -6590,8 +6757,9 @@ def _delete_phase_reached(record: object, desired: str) -> bool:
         "credentials_destroyed": 2,
         "job_delete_requested": 3,
         "workload_absent": 4,
-        "owner_records_deleted": 5,
-        "complete": 6,
+        "network_policy_absent": 5,
+        "owner_records_deleted": 6,
+        "complete": 7,
     }
     retained = _field(record, "cleanup_phase", None)
     if retained not in order or desired not in order:

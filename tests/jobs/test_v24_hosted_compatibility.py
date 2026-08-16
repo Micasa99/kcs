@@ -191,8 +191,8 @@ def test_v26_active_contract_preserves_the_v24_hosted_decode_arm() -> None:
     current = yaml.safe_load(SOURCE.read_text())
     served = json.loads(SERVED_PACKAGE.read_text())
     current_operations = _operations(current)
-    assert served["info"]["version"] == "2.6.2"
-    assert current["info"]["version"] == "2.6.2"
+    assert served["info"]["version"] == "2.7.0"
+    assert current["info"]["version"] == "2.7.0"
     assert current["x-kcs-contract-status"] == "active"
     assert len(_operations(served)) == 58
     assert len(current_operations) == 58

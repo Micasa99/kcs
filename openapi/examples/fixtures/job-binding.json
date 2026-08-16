@@ -4,7 +4,7 @@
   "providerRequestId": "provider-request-synthetic-001",
   "subjectRef": "attempt-synthetic-001",
   "runtimePlanDigest": "1111111111111111111111111111111111111111111111111111111111111111",
-  "specDigest": "361da627d15ba9e6d5ee764feb3db87625b41022275148752dc71daf115ff385",
+  "specDigest": "cc46754bc72f39ff9dbe20cea79f471676ce0d0211d5cb6d5bc8c0378b983f8f",
   "jobUid": "11111111-1111-4111-8111-111111111111",
   "podUid": "22222222-2222-4222-8222-222222222222",
   "resourceVersion": "101",
@@ -29,6 +29,14 @@
   "startedAt": "2026-08-01T00:00:30Z",
   "finishedAt": null,
   "observedAt": "2026-08-01T00:01:00Z",
+  "networkPolicy": {
+    "requestedClass": "restricted",
+    "policyRef": "kcs-v2-network-111111111111111111111111",
+    "policyUid": "33333333-3333-4333-8333-333333333333",
+    "resourceVersion": "100",
+    "specDigest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "observedAt": "2026-08-01T00:01:00Z"
+  },
   "agent": {
     "containerId": "containerd://agent-synthetic",
     "imageId": "sha256:2222222222222222222222222222222222222222222222222222222222222222",

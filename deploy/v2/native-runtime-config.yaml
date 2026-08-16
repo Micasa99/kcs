@@ -23,3 +23,6 @@ data:
   # without granting arbitrary runner egress.
   openai-base-url: https://ai-cosmos.cn/ai4sci/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-test/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-stable/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/openai/v1
   anthropic-base-url: https://ai-cosmos.cn/ai4sci/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-test/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-stable/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/anthropic
+  # Required before the API can start outside tests. Operators publish only
+  # canonical non-default CIDRs for the platform/model-gateway HTTPS edge.
+  platform-egress-cidrs: 124.70.64.81/32

@@ -4,6 +4,7 @@
   "spec": {
     "subjectRef": "subject-native-001",
     "runtimePlanDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "networkClass": "restricted",
     "sharedWorkspace": {
       "kind": "ephemeral",
       "mountPath": "/workspace",

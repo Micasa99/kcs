@@ -124,6 +124,11 @@ class SharedWorkspaceSpec(ContractModel):
     size_limit_gib: Annotated[StrictInt, Field(ge=1, le=100)]
 
 
+class NetworkClass(StrEnum):
+    NONE = "none"
+    RESTRICTED = "restricted"
+
+
 class NodeSelector(ContractModel):
     pool: Literal["gpu"] = Field(alias="researchcosmos.io/pool")
 
@@ -134,6 +139,7 @@ class NodeSelector(ContractModel):
 class JobSpec(ContractModel):
     subject_ref: OpaqueRef
     runtime_plan_digest: Sha256
+    network_class: NetworkClass
     agent: AgentSpec
     workspace: WorkspaceSpec
     shared_workspace: SharedWorkspaceSpec
@@ -902,6 +908,15 @@ class TerminalSessionSnapshot(ContractModel):
     agent_paused: StrictBool
 
 
+class NetworkPolicyObservation(ContractModel):
+    requested_class: NetworkClass
+    policy_ref: OpaqueRef
+    policy_uid: KubernetesUid
+    resource_version: Annotated[StrictStr, Field(min_length=1)]
+    spec_digest: Sha256
+    observed_at: Timestamp
+
+
 class JobBindingSnapshot(ContractModel):
     job_ref: OpaqueRef
     provider_handle: OpaqueRef
@@ -922,6 +937,7 @@ class JobBindingSnapshot(ContractModel):
     started_at: Timestamp | None
     finished_at: Timestamp | None
     observed_at: Timestamp
+    network_policy: NetworkPolicyObservation | None
     agent: AgentRoleSnapshot | None
     workspace: WorkspaceRoleSnapshot | None
     latest_agent_generation: GenerationSnapshot | None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ class V2RuntimeSettings:
     project_workspace_gib_per_tenant: int = DEFAULT_PROJECT_WORKSPACE_GIB_PER_TENANT
     model_gateway_openai_base_urls: tuple[str, ...] = ()
     model_gateway_anthropic_base_urls: tuple[str, ...] = ()
+    platform_egress_cidrs: tuple[str, ...] = ()
     native_provision_seconds: int = DEFAULT_NATIVE_PROVISION_SECONDS
     native_capture_seconds: int = DEFAULT_NATIVE_CAPTURE_SECONDS
     native_finalize_seconds: int = DEFAULT_NATIVE_FINALIZE_SECONDS
@@ -170,6 +172,11 @@ class V2RuntimeSettings:
             environ.get("KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL"),
             "KCS_V2_MODEL_GATEWAY_ANTHROPIC_BASE_URL",
         )
+        platform_egress_cidrs = _platform_egress_cidrs(
+            environ.get("KCS_V2_PLATFORM_EGRESS_CIDRS")
+        )
+        if environ.get("KCS_ENV") != "test" and not platform_egress_cidrs:
+            raise ValueError("KCS_V2_PLATFORM_EGRESS_CIDRS is required outside tests")
         native_provision_seconds = _bounded_seconds(
             environ.get("KCS_V2_NATIVE_PROVISION_SECONDS", str(DEFAULT_NATIVE_PROVISION_SECONDS)),
             "KCS_V2_NATIVE_PROVISION_SECONDS",
@@ -224,6 +231,7 @@ class V2RuntimeSettings:
             project_workspace_vsix_sha256=project_workspace_vsix_sha256,
             model_gateway_openai_base_urls=openai_bases,
             model_gateway_anthropic_base_urls=anthropic_bases,
+            platform_egress_cidrs=platform_egress_cidrs,
             native_provision_seconds=native_provision_seconds,
             native_capture_seconds=native_capture_seconds,
             native_finalize_seconds=native_finalize_seconds,
@@ -231,6 +239,31 @@ class V2RuntimeSettings:
             project_workspaces_per_tenant=project_workspaces_per_tenant,
             project_workspace_gib_per_tenant=project_workspace_gib_per_tenant,
         )
+
+
+def _platform_egress_cidrs(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    values = tuple(value.strip() for value in raw.split(",") if value.strip())
+    if not values or len(values) > 16:
+        raise ValueError("KCS_V2_PLATFORM_EGRESS_CIDRS must contain 1 to 16 CIDRs")
+    parsed: list[str] = []
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            raise ValueError(
+                "KCS_V2_PLATFORM_EGRESS_CIDRS must contain canonical CIDRs"
+            ) from None
+        canonical = str(network)
+        if canonical != value or network.prefixlen == 0:
+            raise ValueError(
+                "KCS_V2_PLATFORM_EGRESS_CIDRS must contain canonical non-default CIDRs"
+            )
+        parsed.append(canonical)
+    if len(set(parsed)) != len(parsed):
+        raise ValueError("KCS_V2_PLATFORM_EGRESS_CIDRS must not contain duplicates")
+    return tuple(parsed)
 
 
 def _optional_https_urls(raw: str | None, name: str) -> tuple[str, ...]:

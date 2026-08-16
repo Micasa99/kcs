@@ -8,7 +8,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from kubernetes import client  # type: ignore[import-untyped]
 
-from .contracts import CreateJobRequest
+from .canonical import canonical_digest
+from .contracts import CreateJobRequest, NetworkClass
 from .m2_contracts import CapabilityActivationPlan
 from .native_contracts import NativeCreateJobRequest, ResolvedRuntimeRecipe
 from .policy import PolicyViolationError
@@ -62,6 +63,17 @@ def job_ref_for_provider_request(provider_request_id: str) -> str:
     return f"kcs-v2-{_short_hash(provider_request_id, 24)}"
 
 
+def network_policy_ref(job_ref: str) -> str:
+    return f"kcs-v2-network-{_short_hash(job_ref, 24)}"
+
+
+def network_policy_spec_digest(policy: object) -> str:
+    payload = client.ApiClient().sanitize_for_serialization(policy)
+    if not isinstance(payload, dict) or not isinstance(payload.get("spec"), dict):
+        raise ValueError("NetworkPolicy has no serializable spec")
+    return canonical_digest(payload["spec"])
+
+
 def credential_secret_name(job_ref: str) -> str:
     """Return the predeclared deterministic Secret slot for one Job."""
     return f"kcs-v2-credential-{_short_hash(job_ref, 24)}"
@@ -101,6 +113,92 @@ class V2JobRenderer:
     ) -> ResolvedRuntimeRecipe:
         return self._recipes.resolve(runner_ref, environment_profile_ref)
 
+    def render_network_policy(
+        self, request: CreateJobRequest | NativeCreateJobRequest
+    ) -> dict[str, object]:
+        job_ref = self.job_ref(request)
+        requested_class = (
+            str(request.spec["networkClass"])
+            if isinstance(request, NativeCreateJobRequest)
+            else request.spec.network_class.value
+        )
+        if requested_class not in {NetworkClass.NONE.value, NetworkClass.RESTRICTED.value}:
+            raise PolicyViolationError("networkClass must be none or restricted")
+        selector = {
+            "researchcosmos.io/managed-by": MANAGED_BY,
+            "researchcosmos.io/provider-request-hash": _short_hash(
+                request.provider_request_id
+            ),
+        }
+        ingress = []
+        if isinstance(request, NativeCreateJobRequest):
+            ingress = [
+                {
+                    "from": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {"app.kubernetes.io/name": "kcs-v2-api"}
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": 8080}],
+                }
+            ]
+        egress: list[dict[str, object]] = [
+            {
+                "to": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {"kubernetes.io/metadata.name": "kube-system"}
+                        },
+                        "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                    }
+                ],
+                "ports": [
+                    {"protocol": "UDP", "port": 53},
+                    {"protocol": "TCP", "port": 53},
+                ],
+            }
+        ]
+        if self._settings.platform_egress_cidrs:
+            egress.append(
+                {
+                    "to": [
+                        {"ipBlock": {"cidr": cidr}}
+                        for cidr in self._settings.platform_egress_cidrs
+                    ],
+                    "ports": [{"protocol": "TCP", "port": 443}],
+                }
+            )
+        spec: dict[str, object] = {
+            "podSelector": {"matchLabels": selector},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": ingress,
+            "egress": egress,
+        }
+        policy_ref = network_policy_ref(job_ref)
+        annotations = {
+            "researchcosmos.io/provider-request-id": request.provider_request_id,
+            "researchcosmos.io/job-ref": job_ref,
+            "researchcosmos.io/job-spec-digest": request.spec_digest,
+            "researchcosmos.io/requested-network-class": requested_class,
+        }
+        policy = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": policy_ref,
+                "namespace": self._settings.namespace,
+                "labels": selector,
+                "annotations": annotations,
+            },
+            "spec": spec,
+        }
+        annotations["researchcosmos.io/network-policy-spec-digest"] = (
+            network_policy_spec_digest(policy)
+        )
+        return policy
+
     def render(
         self,
         request: CreateJobRequest | NativeCreateJobRequest,
@@ -132,6 +230,7 @@ class V2JobRenderer:
             "researchcosmos.io/subject-ref": spec.subject_ref,
             "researchcosmos.io/runtime-plan-digest": spec.runtime_plan_digest,
             "researchcosmos.io/spec-digest": request.spec_digest,
+            "researchcosmos.io/requested-network-class": spec.network_class.value,
         }
         workspace_mount = client.V1VolumeMount(
             name=WORKSPACE_VOLUME,
@@ -277,6 +376,7 @@ class V2JobRenderer:
             "researchcosmos.io/subject-ref": str(spec["subjectRef"]),
             "researchcosmos.io/runtime-plan-digest": str(spec["runtimePlanDigest"]),
             "researchcosmos.io/spec-digest": request.spec_digest,
+            "researchcosmos.io/requested-network-class": str(spec["networkClass"]),
             "researchcosmos.io/assembly-digest": str(native["assemblyDigest"]),
             "researchcosmos.io/recipe-ref": str(recipe.root["recipeRef"]),
             "researchcosmos.io/recipe-digest": str(recipe.root["recipeDigest"]),

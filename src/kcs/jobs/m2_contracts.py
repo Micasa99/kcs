@@ -1,4 +1,4 @@
-"""Typed models for the active, additive KCS 2.6 M2 surfaces.
+"""Typed models for the active, additive KCS 2.7 M2 surfaces.
 
 The generated and packaged canonical document is the single schema authority.
 Production deployment remains a separate operator checkpoint.
@@ -32,8 +32,8 @@ def _m2_document() -> dict[str, Any]:
         try:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError("KCS 2.6 OpenAPI is unreadable") from error
-        if value.get("info", {}).get("version") == "2.6.2":
+            raise RuntimeError("KCS 2.7 OpenAPI is unreadable") from error
+        if value.get("info", {}).get("version") == "2.7.0":
             return value
     try:
         payload = (
@@ -43,9 +43,9 @@ def _m2_document() -> dict[str, Any]:
         )
         value = json.loads(payload)
     except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("KCS 2.6 OpenAPI is unavailable") from error
-    if value.get("info", {}).get("version") != "2.6.2":
-        raise RuntimeError("the served KCS package is not the frozen 2.6 contract")
+        raise RuntimeError("KCS 2.7 OpenAPI is unavailable") from error
+    if value.get("info", {}).get("version") != "2.7.0":
+        raise RuntimeError("the served KCS package is not the frozen 2.7 contract")
     return value
 
 
@@ -53,7 +53,7 @@ def _m2_document() -> dict[str, Any]:
 def _validator(component: str) -> Draft202012Validator:
     document = _m2_document()
     if component not in document.get("components", {}).get("schemas", {}):
-        raise RuntimeError(f"KCS 2.6 OpenAPI has no {component} component")
+        raise RuntimeError(f"KCS 2.7 OpenAPI has no {component} component")
     return Draft202012Validator(
         {
             "$schema": "https://json-schema.org/draft/2020-12/schema",

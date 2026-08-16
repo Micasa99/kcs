@@ -38,8 +38,9 @@ _DELETE_PHASE_ORDER = {
     "credentials_destroyed": 2,
     "job_delete_requested": 3,
     "workload_absent": 4,
-    "owner_records_deleted": 5,
-    "complete": 6,
+    "network_policy_absent": 5,
+    "owner_records_deleted": 6,
+    "complete": 7,
 }
 
 

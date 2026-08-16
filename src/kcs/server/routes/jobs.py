@@ -118,7 +118,7 @@ from kcs.jobs.workspace_runtime import VerifiedContent
 
 _DEV_RELAY_HTTP = requests.Session()
 
-API_VERSION = "2.6.2"
+API_VERSION = "2.7.0"
 _OPAQUE_REF_PATTERN = r"^[^\x00-\x1f\x7f]+$"
 _OPAQUE_TOKEN_PATTERN = r"^[A-Za-z0-9_-]+$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"

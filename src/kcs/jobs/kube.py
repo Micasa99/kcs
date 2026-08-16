@@ -121,6 +121,16 @@ class AppsV1Api(Protocol):
     ) -> Any: ...
 
 
+class NetworkingV1Api(Protocol):
+    def create_namespaced_network_policy(self, *, namespace: str, body: Any) -> Any: ...
+
+    def read_namespaced_network_policy(self, *, name: str, namespace: str) -> Any: ...
+
+    def delete_namespaced_network_policy(
+        self, *, name: str, namespace: str, body: Any
+    ) -> Any: ...
+
+
 class CustomObjectsApi(Protocol):
     """The metrics.k8s.io read used for one bound Pod observation."""
 
@@ -175,6 +185,7 @@ class V2KubeAdapter:
         core_api: CoreV1Api,
         *,
         apps_api: AppsV1Api | None = None,
+        networking_api: NetworkingV1Api | None = None,
         metrics_api: CustomObjectsApi | None = None,
         exec_core_api_factory: Callable[[], CoreV1Api] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -185,6 +196,7 @@ class V2KubeAdapter:
         self._batch = batch_api
         self._core = core_api
         self._apps = apps_api
+        self._networking = networking_api
         self._metrics = metrics_api
         self._exec_core_api_factory = exec_core_api_factory or (lambda: self._core)
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -194,6 +206,43 @@ class V2KubeAdapter:
     def create_job(self, body: Any) -> Any:
         """Create a rendered Job in the adapter namespace."""
         return self._batch.create_namespaced_job(namespace=self.namespace, body=body)
+
+    def create_network_policy(self, body: Any) -> Any:
+        if self._networking is None:
+            raise DependencyUnavailableError("Kubernetes Networking API is not configured")
+        return self._networking.create_namespaced_network_policy(
+            namespace=self.namespace, body=body
+        )
+
+    def read_network_policy(self, name: str) -> Any | None:
+        if self._networking is None:
+            raise DependencyUnavailableError("Kubernetes Networking API is not configured")
+        try:
+            return self._networking.read_namespaced_network_policy(
+                name=name, namespace=self.namespace
+            )
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise
+
+    def delete_network_policy(self, name: str, policy_uid: str) -> None:
+        if self._networking is None:
+            raise DependencyUnavailableError("Kubernetes Networking API is not configured")
+        try:
+            self._networking.delete_namespaced_network_policy(
+                name=name,
+                namespace=self.namespace,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": policy_uid},
+                },
+            )
+        except Exception as exc:
+            if _status(exc) == 404:
+                return
+            raise
 
     def create_persistent_volume_claim(self, body: Any) -> Any:
         return self._core.create_namespaced_persistent_volume_claim(

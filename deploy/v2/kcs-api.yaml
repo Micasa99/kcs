@@ -104,6 +104,11 @@ spec:
                 configMapKeyRef:
                   name: kcs-v2-native-runtime-config
                   key: anthropic-base-url
+            - name: KCS_V2_PLATFORM_EGRESS_CIDRS
+              valueFrom:
+                configMapKeyRef:
+                  name: kcs-v2-native-runtime-config
+                  key: platform-egress-cidrs
             - name: KCS_V2_NATIVE_PROVISION_SECONDS
               value: "900"
             - name: KCS_V2_NATIVE_CAPTURE_SECONDS
