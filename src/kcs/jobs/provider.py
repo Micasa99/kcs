@@ -3285,14 +3285,39 @@ class V2JobProvider:
         if not hmac.compare_digest(canonical_digest(request.spec), request.request_digest):
             raise DigestMismatchError()
         root = snapshot.root
-        if root["podUid"] is None or root["bindingState"] == "indeterminate":
+        cancel_action = root["cancelAction"]
+        same_cancel_action = (
+            isinstance(cancel_action, Mapping)
+            and isinstance(cancel_action.get("actionRef"), str)
+            and isinstance(cancel_action.get("requestDigest"), str)
+            and hmac.compare_digest(cancel_action["actionRef"], request.cancel_ref)
+            and hmac.compare_digest(cancel_action["requestDigest"], request.request_digest)
+        )
+        prestart_evidence = (
+            root["podUid"] is None
+            and root["observedPodCount"] == 0
+            and root["latestRunnerGeneration"] is None
+            and not root["credentialObservations"]
+        )
+        prestart = prestart_evidence and (
+            root["bindingState"] in {"provisioning", "bound"}
+            or (
+                root["bindingState"] in {"canceling", "canceled", "indeterminate"}
+                and same_cancel_action
+            )
+        )
+        if (
+            (root["podUid"] is None and not prestart)
+            or (root["bindingState"] == "indeterminate" and not prestart)
+        ):
             raise ReplacementPodError()
         self._assert_not_finalizing(job_ref)
         request_spec = request.spec.model_dump_json(by_alias=True)
+        pod_uid = "" if prestart else str(root["podUid"])
         close = self._lifecycle.begin_close(
             job_ref,
             str(root["jobUid"]),
-            str(root["podUid"]),
+            pod_uid,
             "native-cancel",
             request.cancel_ref,
             request.request_digest,
@@ -3302,7 +3327,7 @@ class V2JobProvider:
             "identityDigest": request.request_digest,
             "cancelRef": request.cancel_ref,
             "jobUid": str(root["jobUid"]),
-            "podUid": str(root["podUid"]),
+            "podUid": pod_uid,
             "requestSpec": request_spec,
             # Native cancellation keeps control alive for capture.  Until all
             # pre-authorized collects have terminal truth, possible output
@@ -3330,6 +3355,15 @@ class V2JobProvider:
             "podUid": root["podUid"],
         }
         try:
+            if prestart:
+                # The retained Job never observed a Pod, runner generation, or
+                # credential.  Its exact Job UID remains the lifecycle identity;
+                # an empty pod UID records that no incarnation was ever bound.
+                record = self._set_cancel_phase(
+                    record, "succeeded", output_loss_possible=False
+                )
+                close.phase("succeeded", closed=True)
+                phase = "succeeded"
             if phase == "accepted":
                 self._dev_sessions.revoke_for_job(job_ref, "native_cancel")
                 self._native.revoke_all(job_ref)
