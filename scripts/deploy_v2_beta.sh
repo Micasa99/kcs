@@ -85,6 +85,7 @@ escape_sed() {
 api_image_escaped=$(printf '%s' "$KCS_BETA_API_IMAGE" | escape_sed)
 sed "s|__KCS_BETA_API_IMAGE__|$api_image_escaped|" \
   "$ROOT/deploy/v2/overlays/beta/api.yaml" >"$STAGE/api.yaml"
+install -m 0600 "$ROOT/deploy/v2/overlays/beta/namespace.yaml" "$STAGE/namespace.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/bootstrap.yaml" "$STAGE/bootstrap.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/cluster.yaml" "$STAGE/cluster.yaml"
 
@@ -169,7 +170,7 @@ kubectl -n "$NAMESPACE" create secret generic kcs-v2-beta-backend-ca \
   --dry-run=client -o yaml >"$STAGE/backend-ca.yaml"
 
 rendered=(
-  "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml" "$STAGE/api-tls.yaml"
+  "$STAGE/namespace.yaml" "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml" "$STAGE/api-tls.yaml"
   "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml" "$STAGE/api.yaml"
   "$STAGE/cluster.yaml"
 )
@@ -261,6 +262,7 @@ apply_phase() {
 # ClusterRole/Binding/PriorityClass are deliberately excluded from --apply: an
 # administrator reviews and applies cluster.yaml separately before this script
 # receives a Beta namespace-scoped deploy credential.
+apply_phase "$STAGE/namespace.yaml"
 apply_phase "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml"
 apply_phase "$STAGE/api-tls.yaml" "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml"
 apply_phase "$STAGE/api.yaml"
