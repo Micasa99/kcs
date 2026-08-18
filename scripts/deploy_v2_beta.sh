@@ -87,6 +87,7 @@ api_image_escaped=$(printf '%s' "$KCS_BETA_API_IMAGE" | escape_sed)
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/namespace.yaml" "$STAGE/namespace.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/bootstrap.yaml" "$STAGE/bootstrap.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/cluster.yaml" "$STAGE/cluster.yaml"
+install -m 0600 "$ROOT/deploy/v2/overlays/beta/model-gateway-middleware.yaml" "$STAGE/model-gateway-middleware.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/model-gateway.yaml" "$STAGE/model-gateway.yaml"
 
 runtime_files=(
@@ -174,7 +175,7 @@ kubectl -n "$NAMESPACE" create secret generic kcs-v2-beta-backend-ca \
 rendered=(
   "$STAGE/namespace.yaml" "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml" "$STAGE/api-tls.yaml"
   "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml" "$STAGE/api.yaml"
-  "$STAGE/model-gateway.yaml" "$STAGE/cluster.yaml"
+  "$STAGE/model-gateway-middleware.yaml" "$STAGE/model-gateway.yaml" "$STAGE/cluster.yaml"
 )
 file_args() {
   FILE_ARGS=()
@@ -275,6 +276,7 @@ apply_phase() {
 apply_phase "$STAGE/namespace.yaml"
 apply_phase "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml"
 apply_phase "$STAGE/api-tls.yaml" "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml"
+apply_phase "$STAGE/model-gateway-middleware.yaml"
 apply_phase "$STAGE/model-gateway.yaml"
 apply_phase "$STAGE/api.yaml"
 kubectl -n "$NAMESPACE" rollout restart deployment/kcs-v2-beta-api
