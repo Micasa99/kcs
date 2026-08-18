@@ -5200,6 +5200,21 @@ class V2JobProvider:
                 "native runtime disappeared after runner start acknowledgment: "
                 f"{post_ack_runtime_loss}"
             )
+        cancel_action = action_snapshot(cancel_records, "cancelRef")
+        cancel_output_loss_possible = False
+        if cancel_records:
+            cancel_state, cancel_output_loss_possible, resume_from = read_phase(
+                cancel_records[-1]
+            )
+            if cancel_state == "succeeded":
+                binding_state = JobBindingState.CANCELED
+                binding_reason = "provider cancellation completed"
+            elif cancel_state == "indeterminate" and resume_from is None:
+                binding_state = JobBindingState.INDETERMINATE
+                binding_reason = "provider cancellation is indeterminate"
+            else:
+                binding_state = JobBindingState.CANCELING
+                binding_reason = "provider cancellation is in progress"
         created_at = _as_datetime(_field(record, "created_at", None), observed_at)
         hard_seconds = int(
             _optional_path_text(
@@ -5246,9 +5261,22 @@ class V2JobProvider:
         ]
         cleanup = {
             "state": "complete"
-            if binding_state in {JobBindingState.SUCCEEDED, JobBindingState.FAILED}
-            else "pending",
-            "reason": None,
+            if binding_state
+            in {
+                JobBindingState.SUCCEEDED,
+                JobBindingState.FAILED,
+                JobBindingState.CANCELED,
+            }
+            else (
+                "indeterminate"
+                if cancel_records and binding_state is JobBindingState.INDETERMINATE
+                else "pending"
+            ),
+            "reason": (
+                binding_reason
+                if cancel_records and binding_state is JobBindingState.INDETERMINATE
+                else None
+            ),
             "observedAt": observed_at.isoformat(),
         }
         accelerator = _field(_field(native_spec, "resources", {}), "accelerator", {})
@@ -5317,14 +5345,13 @@ class V2JobProvider:
             "finalizeAction": action_snapshot(finalize_records, "finalizeRef").model_dump(
                 mode="json", by_alias=True
             ),
-            "cancelAction": action_snapshot(cancel_records, "cancelRef").model_dump(
-                mode="json", by_alias=True
-            ),
+            "cancelAction": cancel_action.model_dump(mode="json", by_alias=True),
             "deleteAction": _not_requested_action().model_dump(mode="json", by_alias=True),
             "outputLossPossible": post_ack_delivery_loss is not None
             or post_ack_runtime_loss is not None
             or replacement_reason is not None
-            or deadline_payload["hardDeadlineTriggeredAt"] is not None,
+            or deadline_payload["hardDeadlineTriggeredAt"] is not None
+            or cancel_output_loss_possible,
             "cleanup": cleanup,
             "gpuRelease": {
                 "state": "complete"
