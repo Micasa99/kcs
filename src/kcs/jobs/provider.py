@@ -3491,10 +3491,11 @@ class V2JobProvider:
         expires_at = deleted_at + self._tombstone_ttl
         close: LifecycleClose | None = None
         if not ownerless_recovery:
+            pod_uid = _field(record, "pod_uid", None)
             close = self._lifecycle.begin_close(
                 job_ref,
                 str(_field(record, "job_uid")),
-                str(_field(record, "pod_uid")),
+                "" if pod_uid is None else str(pod_uid),
                 "delete",
                 delete_ref,
                 request_digest,
