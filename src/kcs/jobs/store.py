@@ -173,9 +173,11 @@ class V2JobStore:
         kube: V2KubeAdapter,
         *,
         clock: Callable[[], datetime] | None = None,
+        resource_prefix: str = "kcs-v2",
     ) -> None:
         self._kube = kube
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._resource_prefix = resource_prefix
         self._scan_errors = 0
 
     def reserve_create(
@@ -208,7 +210,9 @@ class V2JobStore:
             native_recipe_snapshot_json=stored_recipe,
         )
         try:
-            created = self._kube.create_config_map(_config_map_body(record))
+            created = self._kube.create_config_map(
+                _config_map_body(record, resource_prefix=self._resource_prefix)
+            )
         except Exception as exc:
             if _status(exc) != 409:
                 raise
@@ -225,7 +229,9 @@ class V2JobStore:
         return CreateReservation(record=_record_from_config_map(created), created=True)
 
     def read_create(self, provider_request_id: str) -> CreateRecord | None:
-        config_map = self._kube.read_config_map(_record_name(provider_request_id))
+        config_map = self._kube.read_config_map(
+            _record_name(provider_request_id, self._resource_prefix)
+        )
         if config_map is None:
             return None
         record = _record_from_config_map(config_map)
@@ -496,7 +502,9 @@ class V2JobStore:
             owner_job_ref=owner_job_ref,
         )
         try:
-            created = self._kube.create_config_map(_runtime_config_map_body(record))
+            created = self._kube.create_config_map(
+                _runtime_config_map_body(record, resource_prefix=self._resource_prefix)
+            )
         except Exception as exc:
             if _status(exc) != 409:
                 raise
@@ -529,7 +537,9 @@ class V2JobStore:
             return existing, False
         record = CatalogRecord(kind, identity, digest, encoded)
         try:
-            created = self._kube.create_config_map(_catalog_config_map_body(record))
+            created = self._kube.create_config_map(
+                _catalog_config_map_body(record, resource_prefix=self._resource_prefix)
+            )
         except Exception as exc:
             if _status(exc) != 409:
                 raise
@@ -544,7 +554,9 @@ class V2JobStore:
         return _catalog_record_from_config_map(created), True
 
     def read_catalog(self, kind: str, identity: str) -> CatalogRecord | None:
-        value = self._kube.read_config_map(_catalog_record_name(kind, identity))
+        value = self._kube.read_config_map(
+            _catalog_record_name(kind, identity, self._resource_prefix)
+        )
         if value is None:
             return None
         record = _catalog_record_from_config_map(value)
@@ -553,8 +565,10 @@ class V2JobStore:
         return record
 
     def read_runtime(self, kind: str, job_ref: str, identity: str) -> RuntimeRecord | None:
-        config_map = self._kube.read_config_map(_runtime_record_name(kind, job_ref, identity))
-        if config_map is None:
+        config_map = self._kube.read_config_map(
+            _runtime_record_name(kind, job_ref, identity, self._resource_prefix)
+        )
+        if config_map is None and self._resource_prefix == "kcs-v2":
             config_map = self._kube.read_config_map(_legacy_runtime_record_name(kind, identity))
         if config_map is None:
             return None
@@ -629,7 +643,9 @@ class V2JobStore:
                 resource_version=current.resource_version,
                 storage_name=current.storage_name,
             )
-            storage_name = current.storage_name or _runtime_record_name(kind, job_ref, identity)
+            storage_name = current.storage_name or _runtime_record_name(
+                kind, job_ref, identity, self._resource_prefix
+            )
             try:
                 written = self._kube.replace_config_map(
                     storage_name,
@@ -637,6 +653,7 @@ class V2JobStore:
                         desired,
                         resource_version=current.resource_version,
                         storage_name=storage_name,
+                        resource_prefix=self._resource_prefix,
                     ),
                 )
             except Exception as exc:
@@ -661,7 +678,9 @@ class V2JobStore:
             raise JobNotFoundError()
         if current.resource_version != expected_resource_version:
             return None
-        storage_name = current.storage_name or _runtime_record_name(kind, job_ref, identity)
+        storage_name = current.storage_name or _runtime_record_name(
+            kind, job_ref, identity, self._resource_prefix
+        )
         desired = RuntimeRecord(
             kind=kind,
             identity=identity,
@@ -678,6 +697,7 @@ class V2JobStore:
                     desired,
                     resource_version=expected_resource_version,
                     storage_name=storage_name,
+                    resource_prefix=self._resource_prefix,
                 ),
             )
         except Exception as exc:
@@ -703,7 +723,9 @@ class V2JobStore:
                 and record.gpu_release_state in {"complete", "not_required"}
                 and record.expires_at is not None
                 and _parse_timestamp(record.expires_at) <= boundary
-                and self._kube.delete_config_map(_record_name(record.provider_request_id))
+                and self._kube.delete_config_map(
+                    _record_name(record.provider_request_id, self._resource_prefix)
+                )
             ):
                 deleted += 1
         return deleted
@@ -713,7 +735,7 @@ class V2JobStore:
         provider_request_id: str,
         mutate: Callable[[CreateRecord], CreateRecord],
     ) -> CreateRecord:
-        name = _record_name(provider_request_id)
+        name = _record_name(provider_request_id, self._resource_prefix)
         for _ in range(_UPDATE_ATTEMPTS):
             config_map = self._kube.read_config_map(name)
             if config_map is None:
@@ -727,7 +749,11 @@ class V2JobStore:
             try:
                 written = self._kube.replace_config_map(
                     name,
-                    _config_map_body(desired, resource_version=current.resource_version),
+                    _config_map_body(
+                        desired,
+                        resource_version=current.resource_version,
+                        resource_prefix=self._resource_prefix,
+                    ),
                 )
             except Exception as exc:
                 if _status(exc) == 409:
@@ -776,16 +802,18 @@ def _normalize_snapshot(value: Mapping[str, Any] | None) -> str | None:
     return compact
 
 
-def _record_name(provider_request_id: str) -> str:
-    return f"kcs-v2-create-{_short_hash(provider_request_id, 32)}"
+def _record_name(provider_request_id: str, resource_prefix: str = "kcs-v2") -> str:
+    return f"{resource_prefix}-create-{_short_hash(provider_request_id, 32)}"
 
 
-def _runtime_record_name(kind: str, job_ref: str, identity: str) -> str:
-    return f"kcs-v2-{kind}-{_short_hash(f'{job_ref}:{identity}', 32)}"
+def _runtime_record_name(
+    kind: str, job_ref: str, identity: str, resource_prefix: str = "kcs-v2"
+) -> str:
+    return f"{resource_prefix}-{kind}-{_short_hash(f'{job_ref}:{identity}', 32)}"
 
 
-def _catalog_record_name(kind: str, identity: str) -> str:
-    return f"kcs-v2-catalog-{kind}-{_short_hash(identity, 32)}"
+def _catalog_record_name(kind: str, identity: str, resource_prefix: str = "kcs-v2") -> str:
+    return f"{resource_prefix}-catalog-{kind}-{_short_hash(identity, 32)}"
 
 
 def _legacy_runtime_record_name(kind: str, identity: str) -> str:
@@ -800,9 +828,10 @@ def _config_map_body(
     record: CreateRecord,
     *,
     resource_version: str | None = None,
+    resource_prefix: str = "kcs-v2",
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
-        "name": _record_name(record.provider_request_id),
+        "name": _record_name(record.provider_request_id, resource_prefix),
         "labels": {
             MANAGED_BY_LABEL: MANAGED_BY_VALUE,
             RECORD_KIND_LABEL: RECORD_KIND_VALUE,
@@ -902,11 +931,14 @@ def _runtime_config_map_body(
     *,
     resource_version: str | None = None,
     storage_name: str | None = None,
+    resource_prefix: str = "kcs-v2",
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "name": storage_name
         or record.storage_name
-        or _runtime_record_name(record.kind, record.job_ref, record.identity),
+        or _runtime_record_name(
+            record.kind, record.job_ref, record.identity, resource_prefix
+        ),
         "labels": {
             MANAGED_BY_LABEL: MANAGED_BY_VALUE,
             RECORD_KIND_LABEL: f"runtime-{record.kind}",
@@ -969,12 +1001,14 @@ def _runtime_record_from_config_map(config_map: Any) -> RuntimeRecord:
     )
 
 
-def _catalog_config_map_body(record: CatalogRecord) -> dict[str, object]:
+def _catalog_config_map_body(
+    record: CatalogRecord, *, resource_prefix: str = "kcs-v2"
+) -> dict[str, object]:
     return {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
-            "name": _catalog_record_name(record.kind, record.identity),
+            "name": _catalog_record_name(record.kind, record.identity, resource_prefix),
             "labels": {
                 MANAGED_BY_LABEL: MANAGED_BY_VALUE,
                 RECORD_KIND_LABEL: f"catalog-{record.kind}",

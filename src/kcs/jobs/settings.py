@@ -15,6 +15,9 @@ _SELECTOR_NAME = re.compile(r"^[A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?$")
 _SELECTOR_VALUE = re.compile(r"^(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?)?$")
 
 DEFAULT_NAMESPACE = "researchcosmos-v2"
+DEFAULT_RESOURCE_PREFIX = "kcs-v2"
+DEFAULT_WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
+DEFAULT_API_SELECTOR_NAME = "kcs-v2-api"
 DEFAULT_NODE_SELECTOR = "researchcosmos.io/pool=gpu"
 DEFAULT_WORKSPACE_STORAGE_CLASS = "kcs-workspace"
 DEFAULT_PROMETHEUS_URL = "http://kcs-prometheus.kcs-monitoring.svc.cluster.local:9090"
@@ -25,6 +28,8 @@ DEFAULT_NATIVE_FINALIZE_SECONDS = 300
 DEFAULT_PROJECT_WORKSPACE_IDLE_SECONDS = 6 * 60 * 60
 DEFAULT_PROJECT_WORKSPACES_PER_TENANT = 20
 DEFAULT_PROJECT_WORKSPACE_GIB_PER_TENANT = 200
+DEFAULT_MAX_GPU_PER_JOB = 8
+DEFAULT_MAX_JOB_DEADLINE_SECONDS = 86400
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +40,13 @@ class V2RuntimeSettings:
     node_selector: Mapping[str, str]
     api_mode: str
     service_token: str | None = field(repr=False)
+    platform_ca_secret: str | None = None
+    resource_prefix: str = DEFAULT_RESOURCE_PREFIX
+    workload_service_account: str = DEFAULT_WORKLOAD_SERVICE_ACCOUNT
+    api_selector_name: str = DEFAULT_API_SELECTOR_NAME
+    workload_priority_class: str | None = None
+    max_gpu_per_job: int = DEFAULT_MAX_GPU_PER_JOB
+    max_job_deadline_seconds: int = DEFAULT_MAX_JOB_DEADLINE_SECONDS
     workspace_storage_class: str = DEFAULT_WORKSPACE_STORAGE_CLASS
     prometheus_url: str = DEFAULT_PROMETHEUS_URL
     prometheus_timeout_seconds: float = 3.0
@@ -69,6 +81,36 @@ class V2RuntimeSettings:
         if len(namespace) > 63 or _DNS_LABEL.fullmatch(namespace) is None:
             raise ValueError("KCS_V2_NAMESPACE must be a Kubernetes DNS label")
 
+        resource_prefix = _dns_label(
+            environ.get("KCS_V2_RESOURCE_PREFIX", DEFAULT_RESOURCE_PREFIX),
+            "KCS_V2_RESOURCE_PREFIX",
+        )
+        workload_service_account = _dns_label(
+            environ.get("KCS_V2_WORKLOAD_SERVICE_ACCOUNT", DEFAULT_WORKLOAD_SERVICE_ACCOUNT),
+            "KCS_V2_WORKLOAD_SERVICE_ACCOUNT",
+        )
+        api_selector_name = _dns_label(
+            environ.get("KCS_V2_API_SELECTOR_NAME", DEFAULT_API_SELECTOR_NAME),
+            "KCS_V2_API_SELECTOR_NAME",
+        )
+        priority_raw = environ.get("KCS_V2_WORKLOAD_PRIORITY_CLASS")
+        workload_priority_class = (
+            None
+            if priority_raw is None
+            else _dns_label(priority_raw, "KCS_V2_WORKLOAD_PRIORITY_CLASS")
+        )
+        max_gpu_per_job = _bounded_integer(
+            environ.get("KCS_V2_MAX_GPU_PER_JOB", str(DEFAULT_MAX_GPU_PER_JOB)),
+            "KCS_V2_MAX_GPU_PER_JOB",
+            maximum=8,
+        )
+        max_job_deadline_seconds = _bounded_seconds(
+            environ.get(
+                "KCS_V2_MAX_JOB_DEADLINE_SECONDS", str(DEFAULT_MAX_JOB_DEADLINE_SECONDS)
+            ),
+            "KCS_V2_MAX_JOB_DEADLINE_SECONDS",
+        )
+
         selector = _parse_selector(environ.get("KCS_V2_NODE_SELECTOR", DEFAULT_NODE_SELECTOR))
         workspace_storage_class = environ.get(
             "KCS_V2_WORKSPACE_STORAGE_CLASS", DEFAULT_WORKSPACE_STORAGE_CLASS
@@ -81,6 +123,12 @@ class V2RuntimeSettings:
         service_token = environ.get("KCS_V2_SERVICE_TOKEN") or None
         if environ.get("KCS_ENV") != "test" and service_token is None:
             raise ValueError("KCS_V2_SERVICE_TOKEN is required outside tests")
+        platform_ca_raw = environ.get("KCS_V2_PLATFORM_CA_SECRET")
+        platform_ca_secret = (
+            None
+            if platform_ca_raw is None
+            else _dns_label(platform_ca_raw, "KCS_V2_PLATFORM_CA_SECRET")
+        )
 
         prometheus_url = environ.get("KCS_V2_PROMETHEUS_URL", DEFAULT_PROMETHEUS_URL)
         parsed_prometheus = urlsplit(prometheus_url)
@@ -218,6 +266,13 @@ class V2RuntimeSettings:
             node_selector=MappingProxyType(selector),
             api_mode=api_mode,
             service_token=service_token,
+            platform_ca_secret=platform_ca_secret,
+            resource_prefix=resource_prefix,
+            workload_service_account=workload_service_account,
+            api_selector_name=api_selector_name,
+            workload_priority_class=workload_priority_class,
+            max_gpu_per_job=max_gpu_per_job,
+            max_job_deadline_seconds=max_job_deadline_seconds,
             workspace_storage_class=workspace_storage_class,
             prometheus_url=prometheus_url.rstrip("/"),
             prometheus_timeout_seconds=prometheus_timeout_seconds,
@@ -264,6 +319,12 @@ def _platform_egress_cidrs(raw: str | None) -> tuple[str, ...]:
     if len(set(parsed)) != len(parsed):
         raise ValueError("KCS_V2_PLATFORM_EGRESS_CIDRS must not contain duplicates")
     return tuple(parsed)
+
+
+def _dns_label(value: str, name: str) -> str:
+    if len(value) > 63 or _DNS_LABEL.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a Kubernetes DNS label")
+    return value
 
 
 def _optional_https_urls(raw: str | None, name: str) -> tuple[str, ...]:

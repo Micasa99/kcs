@@ -49,7 +49,6 @@ OPENVSCODE_VOLUME = "rc-openvscode"
 WORKSPACE_EXTENSION_VOLUME = "rc-workspace-extension"
 SESSION_VOLUME = "project-session"
 CONTROL_SOCKET_VOLUME = "workspace-control"
-WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
 MAX_PROJECT_BUNDLE_BYTES = 128 * 1024 * 1024
 ACCESS_TOUCH_SECONDS = 300
 
@@ -318,22 +317,22 @@ def _short_hash(value: str, length: int = 20) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
 
-def project_deployment_name(workspace_ref: str) -> str:
-    return f"kcs-v2-project-{_short_hash(workspace_ref)}"
+def project_deployment_name(workspace_ref: str, resource_prefix: str = "kcs-v2") -> str:
+    return f"{resource_prefix}-project-{_short_hash(workspace_ref)}"
 
 
-def project_pvc_name(workspace_ref: str) -> str:
-    return f"kcs-v2-project-data-{_short_hash(workspace_ref)}"
+def project_pvc_name(workspace_ref: str, resource_prefix: str = "kcs-v2") -> str:
+    return f"{resource_prefix}-project-data-{_short_hash(workspace_ref)}"
 
 
-def project_session_secret_name(workspace_ref: str) -> str:
+def project_session_secret_name(workspace_ref: str, resource_prefix: str = "kcs-v2") -> str:
     """Stable internal credential mounted by the Project relay."""
-    return f"kcs-v2-project-session-{_short_hash(workspace_ref)}"
+    return f"{resource_prefix}-project-session-{_short_hash(workspace_ref)}"
 
 
-def project_browser_secret_name(workspace_ref: str) -> str:
+def project_browser_secret_name(workspace_ref: str, resource_prefix: str = "kcs-v2") -> str:
     """KCS-only browser-session credential slot."""
-    return f"kcs-v2-project-browser-{_short_hash(workspace_ref)}"
+    return f"{resource_prefix}-project-browser-{_short_hash(workspace_ref)}"
 
 
 class ProjectWorkspaceRenderer:
@@ -347,7 +346,7 @@ class ProjectWorkspaceRenderer:
             api_version="v1",
             kind="PersistentVolumeClaim",
             metadata=client.V1ObjectMeta(
-                name=project_pvc_name(workspace_ref),
+                name=project_pvc_name(workspace_ref, self._settings.resource_prefix),
                 namespace=self._settings.namespace,
                 labels=self._labels(workspace_ref),
             ),
@@ -362,7 +361,7 @@ class ProjectWorkspaceRenderer:
 
     def deployment(self, workspace_ref: str, conversation_ref: str) -> client.V1Deployment:
         control_image, openvscode, relay, extension_image, extension_sha256 = self._images()
-        name = project_deployment_name(workspace_ref)
+        name = project_deployment_name(workspace_ref, self._settings.resource_prefix)
         labels = self._labels(workspace_ref)
         workspace_mount = client.V1VolumeMount(
             name=WORKSPACE_VOLUME, mount_path="/workspace", read_only=False
@@ -392,7 +391,8 @@ class ProjectWorkspaceRenderer:
             seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
         pod = client.V1PodSpec(
-            service_account_name=WORKLOAD_SERVICE_ACCOUNT,
+            service_account_name=self._settings.workload_service_account,
+            priority_class_name=self._settings.workload_priority_class,
             automount_service_account_token=False,
             restart_policy="Always",
             node_selector=dict(self._settings.node_selector),
@@ -592,7 +592,7 @@ class ProjectWorkspaceRenderer:
                 client.V1Volume(
                     name=WORKSPACE_VOLUME,
                     persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                        claim_name=project_pvc_name(workspace_ref)
+                        claim_name=project_pvc_name(workspace_ref, self._settings.resource_prefix)
                     ),
                 ),
                 client.V1Volume(
@@ -614,7 +614,9 @@ class ProjectWorkspaceRenderer:
                 client.V1Volume(
                     name=SESSION_VOLUME,
                     secret=client.V1SecretVolumeSource(
-                        secret_name=project_session_secret_name(workspace_ref),
+                        secret_name=project_session_secret_name(
+                            workspace_ref, self._settings.resource_prefix
+                        ),
                         optional=False,
                         default_mode=0o400,
                     ),
@@ -705,7 +707,9 @@ class ProjectWorkspaceService:
         if record.values.get("identityDigest") != request.request_digest:
             raise IdentityDigestConflict()
         self._touch(ref, force=True)
-        if self._kube.read_persistent_volume_claim(project_pvc_name(ref)) is None:
+        if self._kube.read_persistent_volume_claim(
+            project_pvc_name(ref, self._settings.resource_prefix)
+        ) is None:
             try:
                 self._kube.create_persistent_volume_claim(
                     self._renderer.pvc(ref, request.spec.storage_gib)
@@ -713,12 +717,14 @@ class ProjectWorkspaceService:
             except Exception as error:
                 if getattr(error, "status", None) != 409:
                     raise
-        relay_secret_name = project_session_secret_name(ref)
+        relay_secret_name = project_session_secret_name(ref, self._settings.resource_prefix)
         if self._relay_credential(ref) is None:
             self._kube.upsert_secret(
                 relay_secret_name, self._relay_secret(ref, secrets.token_urlsafe(32))
             )
-        if self._kube.read_deployment(project_deployment_name(ref)) is None:
+        if self._kube.read_deployment(
+            project_deployment_name(ref, self._settings.resource_prefix)
+        ) is None:
             try:
                 self._kube.create_deployment(
                     self._renderer.deployment(ref, request.spec.conversation_ref)
@@ -784,7 +790,9 @@ class ProjectWorkspaceService:
         )
         all_ready = service.control_ready and service.ide_ready and service.relay_ready
         state = "ready" if all_ready else "degraded" if terminal_failure else "provisioning"
-        pvc = self._kube.read_persistent_volume_claim(project_pvc_name(workspace_ref))
+        pvc = self._kube.read_persistent_volume_claim(
+            project_pvc_name(workspace_ref, self._settings.resource_prefix)
+        )
         allocated = int(values["storageGiB"]) if pvc is not None else None
         return ProjectWorkspaceSnapshot(
             workspaceRef=workspace_ref,
@@ -860,7 +868,7 @@ class ProjectWorkspaceService:
         credential = secrets.token_urlsafe(32)
         values["credentialSha256"] = hashlib.sha256(credential.encode()).hexdigest()
         self._kube.upsert_secret(
-            project_browser_secret_name(workspace_ref),
+            project_browser_secret_name(workspace_ref, self._settings.resource_prefix),
             self._session_secret(workspace_ref, credential, expires),
         )
         record = self._store.update_runtime(
@@ -893,7 +901,7 @@ class ProjectWorkspaceService:
         rotated = secrets.token_urlsafe(32)
         expires = self._now() + timedelta(seconds=request.spec.ttl_seconds)
         self._kube.upsert_secret(
-            project_browser_secret_name(workspace_ref),
+            project_browser_secret_name(workspace_ref, self._settings.resource_prefix),
             self._session_secret(workspace_ref, rotated, expires),
         )
         values.update(
@@ -1129,25 +1137,33 @@ class ProjectWorkspaceService:
                 or self._has_active_session(record.job_ref, now)
             ):
                 continue
-            if self._kube.delete_deployment(project_deployment_name(record.job_ref)):
+            if self._kube.delete_deployment(
+                project_deployment_name(record.job_ref, self._settings.resource_prefix)
+            ):
                 hibernated += 1
             secret = self._kube.read_secret(
-                project_session_secret_name(record.job_ref)
+                project_session_secret_name(record.job_ref, self._settings.resource_prefix)
             )
             secret_uid = str(_field(_field(secret, "metadata", {}), "uid") or "")
             if secret_uid:
                 self._kube.delete_secret(
-                    project_session_secret_name(record.job_ref), secret_uid
+                    project_session_secret_name(
+                        record.job_ref, self._settings.resource_prefix
+                    ),
+                    secret_uid,
                 )
             browser_secret = self._kube.read_secret(
-                project_browser_secret_name(record.job_ref)
+                project_browser_secret_name(record.job_ref, self._settings.resource_prefix)
             )
             browser_uid = str(
                 _field(_field(browser_secret, "metadata", {}), "uid") or ""
             )
             if browser_uid:
                 self._kube.delete_secret(
-                    project_browser_secret_name(record.job_ref), browser_uid
+                    project_browser_secret_name(
+                        record.job_ref, self._settings.resource_prefix
+                    ),
+                    browser_uid,
                 )
             if not values.get("hibernatedAt"):
                 values.update(hibernatedAt=now.isoformat(), observedAt=now.isoformat())
@@ -1253,7 +1269,9 @@ class ProjectWorkspaceService:
             raise StaleBindingError()
         if not values.get("podName") or not values.get("podUid"):
             raise StaleBindingError()
-        deployment = self._kube.read_deployment(project_deployment_name(workspace_ref))
+        deployment = self._kube.read_deployment(
+            project_deployment_name(workspace_ref, self._settings.resource_prefix)
+        )
         deployment_uid = str(_field(_field(deployment, "metadata", {}), "uid") or "")
         return {
             "runtimeLane": "project",
@@ -1371,7 +1389,9 @@ class ProjectWorkspaceService:
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": project_browser_secret_name(workspace_ref),
+                "name": project_browser_secret_name(
+                    workspace_ref, self._settings.resource_prefix
+                ),
                 "labels": {
                     "researchcosmos.io/managed-by": MANAGED_BY,
                     "researchcosmos.io/project-workspace-hash": _short_hash(workspace_ref, 16),
@@ -1387,7 +1407,9 @@ class ProjectWorkspaceService:
         }
 
     def _secret_credential(self, workspace_ref: str) -> str | None:
-        secret = self._kube.read_secret(project_browser_secret_name(workspace_ref))
+        secret = self._kube.read_secret(
+            project_browser_secret_name(workspace_ref, self._settings.resource_prefix)
+        )
         data = _field(secret, "data", {}) if secret is not None else {}
         raw = data.get("credential") if isinstance(data, Mapping) else None
         if not isinstance(raw, str):
@@ -1404,7 +1426,9 @@ class ProjectWorkspaceService:
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": project_session_secret_name(workspace_ref),
+                "name": project_session_secret_name(
+                    workspace_ref, self._settings.resource_prefix
+                ),
                 "labels": {
                     "researchcosmos.io/managed-by": MANAGED_BY,
                     "researchcosmos.io/project-workspace-hash": _short_hash(
@@ -1419,7 +1443,9 @@ class ProjectWorkspaceService:
         }
 
     def _relay_credential(self, workspace_ref: str) -> str | None:
-        secret = self._kube.read_secret(project_session_secret_name(workspace_ref))
+        secret = self._kube.read_secret(
+            project_session_secret_name(workspace_ref, self._settings.resource_prefix)
+        )
         data = _field(secret, "data", {}) if secret is not None else {}
         raw = data.get("credential") if isinstance(data, Mapping) else None
         if not isinstance(raw, str):

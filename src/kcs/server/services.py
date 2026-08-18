@@ -98,7 +98,7 @@ def get_v2_provider(settings: V2RuntimeSettings | None = None) -> V2JobProvider:
             recipes,
             NativeCapabilityRegistry(settings.native_capability_registry_path),
         )
-        store = V2JobStore(kube)
+        store = V2JobStore(kube, resource_prefix=settings.resource_prefix)
         workspace_transport = ExecWorkspaceRpcTransport(kube.exec_workspace_rpc)
         project_workspaces = ProjectWorkspaceService(
             store, kube, workspace_transport, settings

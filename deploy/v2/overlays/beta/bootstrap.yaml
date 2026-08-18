@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: researchcosmos-v2-beta
+  labels:
+    app.kubernetes.io/part-of: kcs-v2-beta
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kcs-v2-beta-quota
+  namespace: researchcosmos-v2-beta
+spec:
+  hard:
+    pods: "12"
+    persistentvolumeclaims: "8"
+    count/jobs.batch: "4"
+    requests.cpu: "8"
+    requests.memory: 32Gi
+    requests.storage: 200Gi
+    requests.nvidia.com/gpu: "1"
+    limits.nvidia.com/gpu: "1"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: kcs-v2-beta-limits
+  namespace: researchcosmos-v2-beta
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      default:
+        cpu: "2"
+        memory: 4Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+      max:
+        cpu: "8"
+        memory: 32Gi
+    - type: PersistentVolumeClaim
+      min:
+        storage: 1Gi
+      max:
+        storage: 100Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kcs-v2-beta-api
+  namespace: researchcosmos-v2-beta
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kcs-v2-beta-workload
+  namespace: researchcosmos-v2-beta
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kcs-v2-beta-api
+  namespace: researchcosmos-v2-beta
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kcs-v2-beta-api
+  namespace: researchcosmos-v2-beta
+subjects:
+  - kind: ServiceAccount
+    name: kcs-v2-beta-api
+    namespace: researchcosmos-v2-beta
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kcs-v2-beta-api
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kcs-v2-beta-api-state
+  namespace: researchcosmos-v2-beta
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kcs-v2-beta-workload-deny-ingress
+  namespace: researchcosmos-v2-beta
+spec:
+  podSelector:
+    matchLabels:
+      researchcosmos.io/managed-by: v2-attempt-runtime
+  policyTypes: ["Ingress"]
+  ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kcs-v2-beta-project-workspace-ingress
+  namespace: researchcosmos-v2-beta
+spec:
+  podSelector:
+    matchLabels:
+      researchcosmos.io/managed-by: v2-project-workspace
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kcs-v2-beta-api
+      ports:
+        - protocol: TCP
+          port: 8080

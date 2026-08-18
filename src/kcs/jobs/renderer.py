@@ -24,6 +24,8 @@ CREDENTIAL_MOUNT_PATH = "/var/run/kcs/credential"
 MODEL_GATEWAY_CREDENTIAL_VOLUME = "model-gateway-credential"
 MODEL_GATEWAY_CREDENTIAL_MOUNT_PATH = "/var/run/rc/model-gateway"
 PLATFORM_VOLUME = "rc-platform"
+PLATFORM_CA_VOLUME = "platform-ca"
+PLATFORM_CA_MOUNT_PATH = "/var/run/rc-platform-ca/ca.crt"
 RUNNER_VOLUME = "rc-runner"
 CONTROL_VOLUME = "rc-control"
 USER_HOME_VOLUME = "rc-user-home"
@@ -32,9 +34,6 @@ TERMINAL_HOME_VOLUME = "rc-terminal-home"
 TERMINAL_TMP_VOLUME = "rc-terminal-tmp"
 OPENVSCODE_VOLUME = "rc-openvscode"
 DEV_SESSION_CREDENTIAL_VOLUME = "rc-dev-session-credential"
-WORKLOAD_SERVICE_ACCOUNT = "kcs-v2-workload"
-
-
 def _short_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
@@ -58,13 +57,20 @@ def _native_control_volume_mib(ephemeral_storage_mib: int) -> int:
     return max(128, min(8192, ephemeral_storage_mib // 4))
 
 
-def job_ref_for_provider_request(provider_request_id: str) -> str:
+def job_ref_for_provider_request(provider_request_id: str, resource_prefix: str = "kcs-v2") -> str:
     """Return the stable Kubernetes Job name without exposing the opaque request ref."""
-    return f"kcs-v2-{_short_hash(provider_request_id, 24)}"
+    return f"{resource_prefix}-{_short_hash(provider_request_id, 24)}"
+
+
+def _resource_prefix(job_ref: str) -> str:
+    prefix, separator, digest = job_ref.rpartition("-")
+    if not separator or len(digest) != 24:
+        raise ValueError("Job reference has no resource prefix")
+    return prefix
 
 
 def network_policy_ref(job_ref: str) -> str:
-    return f"kcs-v2-network-{_short_hash(job_ref, 24)}"
+    return f"{_resource_prefix(job_ref)}-network-{_short_hash(job_ref, 24)}"
 
 
 def network_policy_spec_digest(policy: object) -> str:
@@ -76,22 +82,22 @@ def network_policy_spec_digest(policy: object) -> str:
 
 def credential_secret_name(job_ref: str) -> str:
     """Return the predeclared deterministic Secret slot for one Job."""
-    return f"kcs-v2-credential-{_short_hash(job_ref, 24)}"
+    return f"{_resource_prefix(job_ref)}-credential-{_short_hash(job_ref, 24)}"
 
 
 def runner_credential_secret_name(job_ref: str) -> str:
     """Return the independent native model-gateway Secret slot."""
-    return f"kcs-v2-runner-credential-{_short_hash(job_ref, 24)}"
+    return f"{_resource_prefix(job_ref)}-runner-credential-{_short_hash(job_ref, 24)}"
 
 
 def dev_session_secret_name(job_ref: str) -> str:
     """Return the stable internal credential mounted by the relay sidecar."""
-    return f"kcs-v2-dev-session-{_short_hash(job_ref, 24)}"
+    return f"{_resource_prefix(job_ref)}-dev-session-{_short_hash(job_ref, 24)}"
 
 
 def dev_session_browser_secret_name(job_ref: str) -> str:
     """Return the KCS-only browser-session Secret slot."""
-    return f"kcs-v2-dev-browser-{_short_hash(job_ref, 24)}"
+    return f"{_resource_prefix(job_ref)}-dev-browser-{_short_hash(job_ref, 24)}"
 
 
 class V2JobRenderer:
@@ -106,7 +112,9 @@ class V2JobRenderer:
         )
 
     def job_ref(self, request: CreateJobRequest | NativeCreateJobRequest) -> str:
-        return job_ref_for_provider_request(request.provider_request_id)
+        return job_ref_for_provider_request(
+            request.provider_request_id, self._settings.resource_prefix
+        )
 
     def resolve_recipe(
         self, runner_ref: str, environment_profile_ref: str
@@ -137,7 +145,9 @@ class V2JobRenderer:
                     "from": [
                         {
                             "podSelector": {
-                                "matchLabels": {"app.kubernetes.io/name": "kcs-v2-api"}
+                                "matchLabels": {
+                                    "app.kubernetes.io/name": self._settings.api_selector_name
+                                }
                             }
                         }
                     ],
@@ -213,6 +223,10 @@ class V2JobRenderer:
                 activation_plan=activation_plan,
             )
         spec = request.spec
+        if spec.workspace.resources.gpu > self._settings.max_gpu_per_job:
+            raise PolicyViolationError("requested GPU count exceeds the configured maximum")
+        if spec.active_deadline_seconds > self._settings.max_job_deadline_seconds:
+            raise PolicyViolationError("requested deadline exceeds the configured maximum")
         node_selector = spec.node_selector.as_mapping()
         if node_selector != dict(self._settings.node_selector):
             raise PolicyViolationError(
@@ -302,7 +316,8 @@ class V2JobRenderer:
             volumes=volumes,
             restart_policy="Never",
             automount_service_account_token=False,
-            service_account_name=WORKLOAD_SERVICE_ACCOUNT,
+            service_account_name=self._settings.workload_service_account,
+            priority_class_name=self._settings.workload_priority_class,
             node_selector=node_selector,
             host_network=False,
             host_pid=False,
@@ -371,6 +386,16 @@ class V2JobRenderer:
             + self._settings.native_capture_seconds
             + self._settings.native_finalize_seconds
         )
+        accelerator = native["resources"]["accelerator"]
+        gpu_count = (
+            int(accelerator["count"])
+            if isinstance(accelerator, dict) and accelerator.get("kind") == "nvidia-gpu"
+            else 0
+        )
+        if gpu_count > self._settings.max_gpu_per_job:
+            raise PolicyViolationError("requested GPU count exceeds the configured maximum")
+        if hard_deadline > self._settings.max_job_deadline_seconds:
+            raise PolicyViolationError("requested deadline exceeds the configured maximum")
         annotations = {
             "researchcosmos.io/provider-request-id": request.provider_request_id,
             "researchcosmos.io/subject-ref": str(spec["subjectRef"]),
@@ -417,6 +442,24 @@ class V2JobRenderer:
             client.V1VolumeMount(name=TERMINAL_HOME_VOLUME, mount_path="/run/rc-terminal/home"),
             client.V1VolumeMount(name=TERMINAL_TMP_VOLUME, mount_path="/run/rc-terminal/tmp"),
         ]
+        control_mounts = [
+            client.V1VolumeMount(name=WORKSPACE_VOLUME, mount_path="/workspace"),
+            client.V1VolumeMount(name=CONTROL_VOLUME, mount_path="/run/rc-control"),
+        ]
+        platform_ca_env: dict[str, str] = {}
+        if self._settings.platform_ca_secret is not None:
+            platform_ca_mount = client.V1VolumeMount(
+                name=PLATFORM_CA_VOLUME,
+                mount_path=PLATFORM_CA_MOUNT_PATH,
+                sub_path="ca.crt",
+                read_only=True,
+            )
+            runtime_mounts.append(platform_ca_mount)
+            control_mounts.append(platform_ca_mount)
+            platform_ca_env = {
+                "SSL_CERT_FILE": PLATFORM_CA_MOUNT_PATH,
+                "NODE_EXTRA_CA_CERTS": PLATFORM_CA_MOUNT_PATH,
+            }
         if delivery["mode"] == "assembled":
             runtime_mounts.append(
                 client.V1VolumeMount(
@@ -443,6 +486,7 @@ class V2JobRenderer:
         product_base = _product_base_from_gateway(model_env.get("OPENAI_BASE_URL", ""))
         launcher_env = {
             **model_env,
+            **platform_ca_env,
             "COSMOS_INPUTS_DIR": "/workspace/inputs",
             "RC_NATIVE_RUNNER_ENTRYPOINT_JSON": json.dumps(
                 recipe.root["runnerEntrypoint"], separators=(",", ":")
@@ -500,6 +544,7 @@ class V2JobRenderer:
                 command=list(recipe.root["controlCommand"]),
                 env=self._environment(
                     {
+                        **platform_ca_env,
                         "KCS_WORKSPACE": "/workspace",
                         "KCS_WORKSPACE_SOCKET": "/run/rc-control/workspace.sock",
                         "KCS_NATIVE_LAUNCHER_SOCKET": str(recipe.root["launcherSocketPath"]),
@@ -522,10 +567,7 @@ class V2JobRenderer:
                     },
                 ),
                 security_context=self._native_control_security_context(),
-                volume_mounts=[
-                    client.V1VolumeMount(name=WORKSPACE_VOLUME, mount_path="/workspace"),
-                    client.V1VolumeMount(name=CONTROL_VOLUME, mount_path="/run/rc-control"),
-                ],
+                volume_mounts=control_mounts,
             ),
         ]
         dev_sidecars = (
@@ -539,7 +581,8 @@ class V2JobRenderer:
             volumes=volumes,
             restart_policy="Never",
             automount_service_account_token=False,
-            service_account_name=WORKLOAD_SERVICE_ACCOUNT,
+            service_account_name=self._settings.workload_service_account,
+            priority_class_name=self._settings.workload_priority_class,
             node_selector=dict(self._settings.node_selector),
             host_network=False,
             host_pid=False,
@@ -650,6 +693,18 @@ class V2JobRenderer:
                 empty_dir=client.V1EmptyDirVolumeSource(size_limit="64Mi"),
             ),
         ]
+        if self._settings.platform_ca_secret is not None:
+            volumes.append(
+                client.V1Volume(
+                    name=PLATFORM_CA_VOLUME,
+                    secret=client.V1SecretVolumeSource(
+                        secret_name=self._settings.platform_ca_secret,
+                        optional=False,
+                        default_mode=0o444,
+                        items=[client.V1KeyToPath(key="ca.crt", path="ca.crt", mode=0o444)],
+                    ),
+                )
+            )
         if delivery["mode"] == "assembled":
             volumes.append(
                 client.V1Volume(
