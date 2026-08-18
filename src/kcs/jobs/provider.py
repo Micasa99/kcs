@@ -221,6 +221,9 @@ _START_MATERIAL_BINDINGS_DIGEST_KEY = "startMaterialBindingsDigest"
 class V2JobRendererProtocol(Protocol):
     """The pure renderer seam used by orchestration."""
 
+    @property
+    def platform_ca_mount_enabled(self) -> bool: ...
+
     def job_ref(self, request: CreateJobRequest | NativeCreateJobRequest) -> str: ...
 
     def render(
@@ -5571,7 +5574,7 @@ class V2JobProvider:
         expected_mounts = {
             (str(item["mountPath"]), bool(item["readOnly"])) for item in recipe.root["mounts"]
         }
-        if self._settings.platform_ca_secret is not None:
+        if self._renderer.platform_ca_mount_enabled:
             expected_mounts.add((PLATFORM_CA_MOUNT_PATH, True))
         activation_plan = self._native_activation_plan_for_spec(native_spec)
         if activation_plan is not None:

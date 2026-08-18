@@ -111,6 +111,10 @@ class V2JobRenderer:
             settings.native_recipe_registry_path
         )
 
+    @property
+    def platform_ca_mount_enabled(self) -> bool:
+        return self._settings.platform_ca_secret is not None
+
     def job_ref(self, request: CreateJobRequest | NativeCreateJobRequest) -> str:
         return job_ref_for_provider_request(
             request.provider_request_id, self._settings.resource_prefix
