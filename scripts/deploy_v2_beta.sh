@@ -200,6 +200,7 @@ expected = {
     ("apps/v1", "Deployment", "kcs-v2-beta-api"),
     ("discovery.k8s.io/v1", "EndpointSlice", "kcs-v2-beta-model-gateway-relay"),
     ("networking.k8s.io/v1", "Ingress", "kcs-v2-beta-model-gateway"),
+    ("traefik.io/v1alpha1", "Middleware", "kcs-v2-beta-model-gateway-strip-prefix"),
     ("v1", "LimitRange", "kcs-v2-beta-limits"),
     ("v1", "Namespace", "researchcosmos-v2-beta"),
     ("networking.k8s.io/v1", "NetworkPolicy", "kcs-v2-beta-project-workspace-ingress"),
@@ -236,7 +237,7 @@ if [[ $MODE == render ]]; then
   exit 0
 fi
 
-printf '{"event":"kcs_beta_render_check","objects":22,"ok":true}\n'
+printf '{"event":"kcs_beta_render_check","objects":23,"ok":true}\n'
 [[ $MODE == check ]] && exit 0
 
 server_validate() {
