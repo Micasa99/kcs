@@ -7,7 +7,7 @@ metadata:
     researchcosmos.io/managed-by: kcs-v2-beta
 spec:
   ports:
-    - {name: http, port: 80, targetPort: 18791, protocol: TCP}
+    - {name: http, port: 80, targetPort: 8789, protocol: TCP}
 ---
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
@@ -19,7 +19,7 @@ metadata:
     researchcosmos.io/managed-by: kcs-v2-beta
 addressType: IPv4
 ports:
-  - {name: http, port: 18791, protocol: TCP}
+  - {name: http, port: 8789, protocol: TCP}
 endpoints:
   - addresses: [10.255.250.1]
     conditions: {ready: true, serving: true, terminating: false}
