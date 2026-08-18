@@ -893,9 +893,9 @@ class V2JobRenderer:
             "ephemeral-storage": f"{ephemeral}Mi",
         }
         limits = {
-            "cpu": f"{min(cpu * 2, 64000)}m",
-            "memory": f"{min(memory * 2, 262144)}Mi",
-            "ephemeral-storage": f"{min(ephemeral * 2, 262144)}Mi",
+            "cpu": f"{cpu}m",
+            "memory": f"{memory}Mi",
+            "ephemeral-storage": f"{ephemeral}Mi",
         }
         accelerator = resources["accelerator"]
         if isinstance(accelerator, dict) and accelerator.get("kind") == "nvidia-gpu":
