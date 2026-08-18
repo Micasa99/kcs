@@ -905,6 +905,11 @@ func childEnvironment(adapter runnerAdapter, token string) ([]string, error) {
 			values = append(values, name+"="+value)
 		}
 	}
+	for _, name := range []string{"SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
+		if value := os.Getenv(name); value != "" {
+			values = append(values, name+"="+value)
+		}
+	}
 	values = append(values, adapter.environment()...)
 	protocol := os.Getenv("RC_NATIVE_SELECTED_MODEL_PROTOCOL")
 	if strings.HasPrefix(protocol, "anthropic-") {
