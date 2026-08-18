@@ -149,3 +149,27 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kcs-v2-beta-native-gateway-internal-egress
+  namespace: researchcosmos-v2-beta
+spec:
+  podSelector:
+    matchLabels:
+      researchcosmos.io/managed-by: v2-attempt-runtime
+      researchcosmos.io/runtime-lane: native
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: traefik-kube-system
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8443
