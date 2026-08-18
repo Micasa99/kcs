@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kcs-v2-beta-model-gateway-relay
+  namespace: researchcosmos-v2-beta
+  labels:
+    researchcosmos.io/managed-by: kcs-v2-beta
+spec:
+  ports:
+    - {name: http, port: 80, targetPort: 18791, protocol: TCP}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kcs-v2-beta-model-gateway-relay
+  namespace: researchcosmos-v2-beta
+  labels:
+    kubernetes.io/service-name: kcs-v2-beta-model-gateway-relay
+    researchcosmos.io/managed-by: kcs-v2-beta
+addressType: IPv4
+ports:
+  - {name: http, port: 18791, protocol: TCP}
+endpoints:
+  - addresses: [10.255.250.1]
+    conditions: {ready: true, serving: true, terminating: false}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kcs-v2-beta-model-gateway
+  namespace: researchcosmos-v2-beta
+  labels:
+    researchcosmos.io/managed-by: kcs-v2-beta
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: 10-255-250-1.sslip.io
+      http:
+        paths:
+          - path: /ai4sci/cosmos/
+            pathType: Prefix
+            backend:
+              service:
+                name: kcs-v2-beta-model-gateway-relay
+                port: {name: http}
+  tls:
+    - hosts: [10-255-250-1.sslip.io]
+      secretName: kcs-v2-beta-tls

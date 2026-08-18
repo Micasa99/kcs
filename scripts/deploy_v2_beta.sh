@@ -63,6 +63,7 @@ ssl.match_hostname(certificate, sys.argv[2])
 PY
 }
 check_certificate_host "$KCS_BETA_TLS_CERT_FILE" "kcs-v2-beta-api.${NAMESPACE}.svc.cluster.local"
+check_certificate_host "$KCS_BETA_TLS_CERT_FILE" "10-255-250-1.sslip.io"
 
 if [[ $MODE == render ]]; then
   [[ $OUTPUT_DIR != / && -n $OUTPUT_DIR ]] || { echo "unsafe render directory" >&2; exit 2; }
@@ -83,11 +84,10 @@ escape_sed() {
   sed 's/[\\&|]/\\&/g'
 }
 api_image_escaped=$(printf '%s' "$KCS_BETA_API_IMAGE" | escape_sed)
-sed "s|__KCS_BETA_API_IMAGE__|$api_image_escaped|" \
-  "$ROOT/deploy/v2/overlays/beta/api.yaml" >"$STAGE/api.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/namespace.yaml" "$STAGE/namespace.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/bootstrap.yaml" "$STAGE/bootstrap.yaml"
 install -m 0600 "$ROOT/deploy/v2/overlays/beta/cluster.yaml" "$STAGE/cluster.yaml"
+install -m 0600 "$ROOT/deploy/v2/overlays/beta/model-gateway.yaml" "$STAGE/model-gateway.yaml"
 
 runtime_files=(
   recipes.json capabilities.json openvscode-image-volume dev-session-relay-image
@@ -140,12 +140,14 @@ done
   echo "Beta runtime config VSIX digest must be nonzero lowercase SHA-256" >&2
   exit 2
 }
-[[ $(read_scalar openai-base-url) == https://10.255.250.1/ai4sci/cosmos/model-gateway/openai/v1 && \
-   $(read_scalar anthropic-base-url) == https://10.255.250.1/ai4sci/cosmos/model-gateway/anthropic && \
+[[ $(read_scalar openai-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/openai/v1 && \
+   $(read_scalar anthropic-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/anthropic && \
    $(read_scalar platform-egress-cidrs) == 10.255.250.1/32 ]] || {
   echo "Beta runtime config must use only the approved private Test gateway and CIDR" >&2
   exit 2
 }
+sed "s|__KCS_BETA_API_IMAGE__|$api_image_escaped|" \
+  "$ROOT/deploy/v2/overlays/beta/api.yaml" >"$STAGE/api.yaml"
 kubectl -n "$NAMESPACE" create configmap kcs-v2-beta-native-runtime-config \
   --from-file=recipes.json="$KCS_BETA_RUNTIME_CONFIG_DIR/recipes.json" \
   --from-file=capabilities.json="$KCS_BETA_RUNTIME_CONFIG_DIR/capabilities.json" \
@@ -172,7 +174,7 @@ kubectl -n "$NAMESPACE" create secret generic kcs-v2-beta-backend-ca \
 rendered=(
   "$STAGE/namespace.yaml" "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml" "$STAGE/api-tls.yaml"
   "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml" "$STAGE/api.yaml"
-  "$STAGE/cluster.yaml"
+  "$STAGE/model-gateway.yaml" "$STAGE/cluster.yaml"
 )
 file_args() {
   FILE_ARGS=()
@@ -196,6 +198,8 @@ expected = {
     ("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", "kcs-v2-beta-capacity-reader"),
     ("v1", "ConfigMap", "kcs-v2-beta-native-runtime-config"),
     ("apps/v1", "Deployment", "kcs-v2-beta-api"),
+    ("discovery.k8s.io/v1", "EndpointSlice", "kcs-v2-beta-model-gateway-relay"),
+    ("networking.k8s.io/v1", "Ingress", "kcs-v2-beta-model-gateway"),
     ("v1", "LimitRange", "kcs-v2-beta-limits"),
     ("v1", "Namespace", "researchcosmos-v2-beta"),
     ("networking.k8s.io/v1", "NetworkPolicy", "kcs-v2-beta-project-workspace-ingress"),
@@ -209,6 +213,7 @@ expected = {
     ("v1", "Secret", "kcs-v2-beta-service-token"),
     ("v1", "Secret", "kcs-v2-beta-tls"),
     ("v1", "Service", "kcs-v2-beta-api"),
+    ("v1", "Service", "kcs-v2-beta-model-gateway-relay"),
     ("v1", "ServiceAccount", "kcs-v2-beta-api"),
     ("v1", "ServiceAccount", "kcs-v2-beta-workload"),
 }
@@ -231,7 +236,7 @@ if [[ $MODE == render ]]; then
   exit 0
 fi
 
-printf '{"event":"kcs_beta_render_check","objects":19,"ok":true}\n'
+printf '{"event":"kcs_beta_render_check","objects":22,"ok":true}\n'
 [[ $MODE == check ]] && exit 0
 
 server_validate() {
@@ -246,7 +251,7 @@ client_validate() {
 server_diff() {
   file_args "$@"
   set +e
-  kubectl diff --server-side "${FILE_ARGS[@]}"
+  kubectl diff --server-side --field-manager=kcs-v2-beta-deployer "${FILE_ARGS[@]}"
   status=$?
   set -e
   [[ $status -le 1 ]] || return "$status"
@@ -255,7 +260,11 @@ apply_phase() {
   file_args "$@"
   client_validate "$@"
   server_validate "$@"
-  server_diff "$@"
+  # Secret bytes are already constrained by the object allowlist and server
+  # dry-run. Never print their base64 payloads through kubectl diff.
+  if ! grep -Eq '^kind: Secret$' "$@"; then
+    server_diff "$@"
+  fi
   kubectl apply --server-side --field-manager=kcs-v2-beta-deployer "${FILE_ARGS[@]}"
 }
 
@@ -265,6 +274,8 @@ apply_phase() {
 apply_phase "$STAGE/namespace.yaml"
 apply_phase "$STAGE/bootstrap.yaml" "$STAGE/runtime-config.yaml"
 apply_phase "$STAGE/api-tls.yaml" "$STAGE/service-token.yaml" "$STAGE/backend-ca.yaml"
+apply_phase "$STAGE/model-gateway.yaml"
 apply_phase "$STAGE/api.yaml"
+kubectl -n "$NAMESPACE" rollout restart deployment/kcs-v2-beta-api
 kubectl -n "$NAMESPACE" rollout status deployment/kcs-v2-beta-api --timeout=180s
 printf '{"event":"kcs_beta_apply","ok":true}\n'
