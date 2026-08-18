@@ -173,6 +173,7 @@ from .project_workspace import (
 )
 from .recipe_registry import runtime_recipe_digest
 from .renderer import (
+    PLATFORM_CA_MOUNT_PATH,
     activation_volume_name,
     credential_secret_name,
     network_policy_ref,
@@ -5570,6 +5571,8 @@ class V2JobProvider:
         expected_mounts = {
             (str(item["mountPath"]), bool(item["readOnly"])) for item in recipe.root["mounts"]
         }
+        if self._settings.platform_ca_secret is not None:
+            expected_mounts.add((PLATFORM_CA_MOUNT_PATH, True))
         activation_plan = self._native_activation_plan_for_spec(native_spec)
         if activation_plan is not None:
             expected_mounts.update(
