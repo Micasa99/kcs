@@ -5989,7 +5989,10 @@ class V2JobProvider:
             runtime_plan_digest=str(_field(spec_payload, "runtimePlanDigest")),
             spec_digest=str(_field(record, "spec_digest")),
             job_uid=UUID(str(_field(record, "job_uid"))),
-            pod_uid=_field(record, "pod_uid", None),
+            # The retained UID is historical once Kubernetes no longer exposes
+            # the Job.  Do not project it as a current Pod without a live
+            # incarnation observation.
+            pod_uid=None,
             resource_version=_optional_text(record, "resource_version"),
             node_name=None,
             binding_state=JobBindingState.INDETERMINATE,

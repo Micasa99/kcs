@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,6 +28,35 @@ from kcs.jobs.settings import V2RuntimeSettings
 from kcs.server.app import create_app
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_missing_legacy_job_does_not_project_a_current_pod() -> None:
+    now = datetime(2026, 8, 19, tzinfo=UTC)
+    provider = object.__new__(V2JobProvider)
+    provider._clock = lambda: now
+    provider._network_policy_observation = lambda _record, _observed_at: (None, None)
+    provider._runtime_records = lambda _kind, _job_ref: ()
+    record = SimpleNamespace(
+        job_ref="kcs-v2-legacy-missing-job",
+        provider_request_id="provider-request-legacy",
+        spec_payload={
+            "subjectRef": "subject-legacy",
+            "runtimePlanDigest": "1" * 64,
+        },
+        spec_digest="2" * 64,
+        job_uid="11111111-1111-4111-8111-111111111111",
+        pod_uid="22222222-2222-4222-8222-222222222222",
+        pod_incarnations_json='[{"podUid":"22222222-2222-4222-8222-222222222222"}]',
+        resource_version="7",
+        indeterminate_reason=None,
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    snapshot = provider._missing_job_snapshot(record)
+
+    assert snapshot.pod_uid is None
+    assert snapshot.pod_incarnations == []
 
 
 def _registry(tmp_path: Path) -> NativeRecipeRegistry:
