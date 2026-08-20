@@ -51,7 +51,7 @@ spec:
             - name: KCS_V2_MAX_GPU_PER_JOB
               value: "1"
             - name: KCS_V2_MAX_JOB_DEADLINE_SECONDS
-              value: "21600"
+              value: "86400"
             - name: KCS_V2_NODE_SELECTOR
               value: researchcosmos.io/pool=gpu
             - name: KCS_V2_WORKSPACE_STORAGE_CLASS
