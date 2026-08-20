@@ -1734,6 +1734,20 @@ class RuntimeControlSidecar:
         bulk_transfer = payload.get("bulk_transfer")
         if not isinstance(bulk_transfer, bool):
             raise _RpcRejectedError("INVALID_REQUEST", "workspace bulk-transfer marker is invalid")
+        requested_branch = payload.get("git_branch")
+        if requested_branch is not None and (
+            not isinstance(requested_branch, str)
+            or not requested_branch.startswith("rc/attempt/")
+            or len(requested_branch) > 128
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-._/"
+                for character in requested_branch
+            )
+            or ".." in requested_branch
+            or "//" in requested_branch
+            or requested_branch.endswith(("/", ".", ".lock"))
+        ):
+            raise _RpcRejectedError("INVALID_REQUEST", "workspace Git branch is invalid")
         inline_items = payload.get("inline_contents") or []
         if not isinstance(inline_items, list) or (bulk_transfer and inline_items):
             raise _RpcRejectedError(
@@ -1814,7 +1828,9 @@ class RuntimeControlSidecar:
             }
         )
         identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
-        branch, base_commit = self._initialize_attempt_git(identity, declared_tree_digest)
+        branch, base_commit = self._initialize_attempt_git(
+            identity, declared_tree_digest, requested_branch
+        )
         self._publish_workspace_context()
         return {
             "ok": True,
@@ -1830,11 +1846,16 @@ class RuntimeControlSidecar:
             "observations": [],
         }
 
-    def _initialize_attempt_git(self, identity: str, tree_digest: str) -> tuple[str, str]:
+    def _initialize_attempt_git(
+        self,
+        identity: str,
+        tree_digest: str,
+        requested_branch: str | None,
+    ) -> tuple[str, str]:
         """Create one isolated SCM base only after the staged tree passed its digest gate."""
 
         worktree = self.workspace / "worktree"
-        branch = f"rc/attempt/{identity}"
+        branch = requested_branch or f"rc/attempt/{identity}"
         git_dir = worktree / ".git"
         if git_dir.exists():
             self._exclude_platform_context_from_git(worktree)
@@ -1847,6 +1868,13 @@ class RuntimeControlSidecar:
             if not retained or recorded != tree_digest:
                 raise _RpcRejectedError(
                     "IDENTITY_CONFLICT", "Attempt Git base differs from the staged tree"
+                )
+            current_branch = self._git(
+                worktree, ["symbolic-ref", "--short", "HEAD"]
+            ).strip()
+            if current_branch != branch:
+                raise _RpcRejectedError(
+                    "IDENTITY_CONFLICT", "Attempt Git branch differs from the staged tree"
                 )
             return branch, retained
         self._git(worktree, ["init", "--shared=group", "-b", branch])

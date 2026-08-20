@@ -141,10 +141,10 @@ done
   echo "Beta runtime config VSIX digest must be nonzero lowercase SHA-256" >&2
   exit 2
 }
-[[ $(read_scalar openai-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/openai/v1 && \
-   $(read_scalar anthropic-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/anthropic && \
-   $(read_scalar platform-egress-cidrs) == 10.255.250.1/32 ]] || {
-  echo "Beta runtime config must use only the approved private Test gateway and CIDR" >&2
+[[ $(read_scalar openai-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/openai/v1,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/openai/v1 && \
+   $(read_scalar anthropic-base-url) == https://10-255-250-1.sslip.io/ai4sci/cosmos/model-gateway/anthropic,https://ai-cosmos.cn/ai4sci-local/cosmos/model-gateway/anthropic && \
+   $(read_scalar platform-egress-cidrs) == 10.255.250.1/32,124.70.64.81/32 ]] || {
+  echo "Beta runtime config must use only the approved Test and local Product gateways" >&2
   exit 2
 }
 sed "s|__KCS_BETA_API_IMAGE__|$api_image_escaped|" \
