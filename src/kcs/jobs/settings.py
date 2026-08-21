@@ -311,9 +311,9 @@ def _platform_egress_cidrs(raw: str | None) -> tuple[str, ...]:
                 "KCS_V2_PLATFORM_EGRESS_CIDRS must contain canonical CIDRs"
             ) from None
         canonical = str(network)
-        if canonical != value or network.prefixlen == 0:
+        if canonical != value:
             raise ValueError(
-                "KCS_V2_PLATFORM_EGRESS_CIDRS must contain canonical non-default CIDRs"
+                "KCS_V2_PLATFORM_EGRESS_CIDRS must contain canonical CIDRs"
             )
         parsed.append(canonical)
     if len(set(parsed)) != len(parsed):
