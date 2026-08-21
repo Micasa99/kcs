@@ -826,7 +826,7 @@ class WorkspaceRuntime:
                     },
                     identity_kind="operation",
                 )
-            except (StateConflictError, DependencyUnavailableError):
+            except KcsV2Error:
                 raise
             except Exception as error:
                 raise DependencyUnavailableError(

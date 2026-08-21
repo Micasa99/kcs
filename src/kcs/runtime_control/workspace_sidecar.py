@@ -2496,7 +2496,7 @@ class RuntimeControlSidecar:
                     directories[:] = [
                         name
                         for name in directories
-                        if name not in {".git", ".cosmos", ".kcs"}
+                        if name not in {".git", ".cosmos", ".kcs", ".venv"}
                     ]
                 for name in sorted(files):
                     path = root_path / name
