@@ -1963,7 +1963,6 @@ class RuntimeControlSidecar:
         self._git(worktree, ["bundle", "verify", str(bundle_path)])
         self._git(worktree, ["fetch", "--quiet", str(bundle_path), "refs/heads/base"])
         self._git(worktree, ["checkout", "--quiet", "--force", "-B", branch, "FETCH_HEAD"])
-        self._git(worktree, ["clean", "-fdx"])
         self._exclude_platform_context_from_git(worktree)
         self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
         self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])

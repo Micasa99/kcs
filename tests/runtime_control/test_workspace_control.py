@@ -648,6 +648,9 @@ def test_production_control_stages_one_git_bundle_with_empty_files(tmp_path: Pat
         "overwritePolicy": "forbid",
     }
     assert transport.rpc({}, stage, bundle).header["state"] == "completed"
+    trajectory = workspace / "worktree/.trajectory/session.jsonl"
+    trajectory.parent.mkdir(parents=True)
+    trajectory.write_text("platform-owned\n", encoding="utf-8")
     entries = [
         {
             "path": relative,
@@ -713,6 +716,7 @@ def test_production_control_stages_one_git_bundle_with_empty_files(tmp_path: Pat
     assert len(reply["inlineResult"]["git_base_commit"]) == 40
     assert (workspace / "worktree/src/main.py").read_bytes() == files["src/main.py"]
     assert (workspace / "worktree/src/__init__.py").read_bytes() == b""
+    assert trajectory.read_text(encoding="utf-8") == "platform-owned\n"
 
 
 def test_production_control_spools_large_tree_capture(tmp_path: Path) -> None:
