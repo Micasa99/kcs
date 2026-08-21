@@ -1774,16 +1774,68 @@ class RuntimeControlSidecar:
                 raise _RpcRejectedError(
                     "INVALID_REQUEST", "workspace inline entries do not close over the manifest"
                 )
+        bundle = payload.get("git_bundle")
+        if bundle is not None and (
+            not bulk_transfer
+            or not isinstance(bundle, dict)
+            or set(bundle) != {"path", "size", "sha256", "ref"}
+            or bundle.get("path") != ".aicosmos/workspace-base.bundle"
+            or type(bundle.get("size")) is not int
+            or bundle["size"] < 1
+            or not _is_hex_digest(bundle.get("sha256"))
+            or bundle.get("ref") != "refs/heads/base"
+        ):
+            raise _RpcRejectedError(
+                "INVALID_REQUEST", "workspace Git bundle descriptor is invalid"
+            )
 
         operation_id = frame.get("operation_id")
         if not isinstance(operation_id, str) or not operation_id:
             raise _RpcRejectedError("INVALID_REQUEST", "workspace operation id is absent")
         bulk_stem = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
         observed: list[dict[str, object]] = []
+        identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+        branch = base_commit = None
+        if isinstance(bundle, dict):
+            bundle_relative = (
+                f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{bundle['path']}"
+            )
+            bundle_path = self.workspace / bundle_relative
+            actual_size, actual_digest = _hash_nofollow(bundle_path)
+            if actual_size != bundle["size"] or actual_digest != bundle["sha256"]:
+                raise _RpcRejectedError(
+                    "DIGEST_MISMATCH", "workspace Git bundle failed integrity"
+                )
+            branch, base_commit = self._initialize_attempt_git_bundle(
+                identity,
+                declared_tree_digest,
+                requested_branch,
+                bundle_path,
+            )
         for item in entries:
             relative = str(item["path"])
             target = f"worktree/{relative}"
-            if bulk_transfer:
+            if isinstance(bundle, dict):
+                target_path = self.workspace / target
+                actual_size, actual_digest = _hash_nofollow(target_path)
+                if actual_size != item["size"] or actual_digest != item["sha256"]:
+                    raise _RpcRejectedError(
+                        "DIGEST_MISMATCH",
+                        f"Git bundle workspace entry {relative!r} failed integrity",
+                    )
+                os.chmod(
+                    target_path,
+                    _ENTRY_MODE_BITS[str(item["mode"])],
+                    follow_symlinks=False,
+                )
+                if os.geteuid() == 0:
+                    os.chown(
+                        target_path,
+                        _EXPERIMENT_UID,
+                        _EXPERIMENT_GID,
+                        follow_symlinks=False,
+                    )
+            elif bulk_transfer:
                 actual_size, actual_digest = self._copy_workspace_file(
                     f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{relative}",
                     target,
@@ -1827,10 +1879,10 @@ class RuntimeControlSidecar:
                 ],
             }
         )
-        identity = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
-        branch, base_commit = self._initialize_attempt_git(
-            identity, declared_tree_digest, requested_branch
-        )
+        if not isinstance(bundle, dict):
+            branch, base_commit = self._initialize_attempt_git(
+                identity, declared_tree_digest, requested_branch
+            )
         self._publish_workspace_context()
         return {
             "ok": True,
@@ -1892,22 +1944,49 @@ class RuntimeControlSidecar:
             },
         )
         commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
-        if os.geteuid() == 0:
-            # The control container intentionally runs without CAP_FOWNER.  Once a
-            # path is chowned to the experiment user, PID 1 can no longer chmod it.
-            # Walk bottom-up and apply mode before ownership so the whole repository
-            # is handed over atomically enough for the experiment process to use it.
-            for root, _directories, files in os.walk(git_dir, topdown=False):
-                for name in files:
-                    path = Path(root) / name
-                    mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
-                    os.chmod(path, mode | 0o060)
-                    os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
-                root_path = Path(root)
-                mode = stat.S_IMODE(os.stat(root_path, follow_symlinks=False).st_mode)
-                os.chmod(root_path, mode | 0o2070)
-                os.chown(root_path, _EXPERIMENT_UID, _EXPERIMENT_GID)
+        self._hand_off_git_directory(git_dir)
         return branch, commit
+
+    def _initialize_attempt_git_bundle(
+        self,
+        identity: str,
+        tree_digest: str,
+        requested_branch: str | None,
+        bundle_path: Path,
+    ) -> tuple[str, str]:
+        worktree = self.workspace / "worktree"
+        worktree.mkdir(mode=0o2775, parents=True, exist_ok=True)
+        branch = requested_branch or f"rc/attempt/{identity}"
+        if (worktree / ".git").exists():
+            return self._initialize_attempt_git(identity, tree_digest, branch)
+        self._git(worktree, ["init", "--shared=group", "-b", branch])
+        self._git(worktree, ["bundle", "verify", str(bundle_path)])
+        self._git(worktree, ["fetch", "--quiet", str(bundle_path), "refs/heads/base"])
+        self._git(worktree, ["checkout", "--quiet", "--force", "-B", branch, "FETCH_HEAD"])
+        self._git(worktree, ["clean", "-fdx"])
+        self._exclude_platform_context_from_git(worktree)
+        self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
+        self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
+        self._git(worktree, ["config", "rc.baseTreeDigest", tree_digest])
+        commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
+        self._hand_off_git_directory(worktree / ".git")
+        return branch, commit
+
+    @staticmethod
+    def _hand_off_git_directory(git_dir: Path) -> None:
+        if os.geteuid() != 0:
+            return
+        # Apply mode before ownership: the control container lacks CAP_FOWNER.
+        for root, _directories, files in os.walk(git_dir, topdown=False):
+            for name in files:
+                path = Path(root) / name
+                mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+                os.chmod(path, mode | 0o060)
+                os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
+            root_path = Path(root)
+            mode = stat.S_IMODE(os.stat(root_path, follow_symlinks=False).st_mode)
+            os.chmod(root_path, mode | 0o2070)
+            os.chown(root_path, _EXPERIMENT_UID, _EXPERIMENT_GID)
 
     def _create_project_workspace_snapshot(
         self, request: Mapping[str, Any]
@@ -3392,7 +3471,13 @@ def _serve_connection(connection: socket.socket, sidecar: RuntimeControlSidecar)
                 while chunk := response.read(_COPY_CHUNK):
                     connection.sendall(chunk)
             return
-        if body_size:
+        # A stage request has a body even when that body is the empty file.
+        # Preserve presence separately from length so zero-byte Git blobs do
+        # not become an absent-body TRANSFER_BYTES_MISMATCH.
+        if body_size or header.get("action") in {
+            "stage",
+            "importProjectWorkspaceRevision",
+        }:
             body_path = _private_path("kcs-sidecar-body-")
             with body_path.open("wb") as output:
                 remaining = body_size

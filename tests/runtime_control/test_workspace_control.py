@@ -5,14 +5,18 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import threading
 import uuid
 from pathlib import Path
 
 from kcs.conformance.workspace_sidecar import WorkspaceSidecar
 from kcs.jobs.canonical import canonical_digest
-from kcs.jobs.transport import LocalWorkspaceRpcTransport
-from kcs.runtime_control.workspace_sidecar import RuntimeControlSidecar
+from kcs.jobs.transport import LocalWorkspaceRpcTransport, workspace_header_frame
+from kcs.runtime_control.workspace_sidecar import (
+    RuntimeControlSidecar,
+    _serve_connection,
+)
 
 
 def _serve_launcher_once(
@@ -476,6 +480,45 @@ def test_production_control_owns_transfer_and_pty_transport(tmp_path: Path, monk
     launcher_socket.unlink(missing_ok=True)
 
 
+def test_unix_control_preserves_an_empty_stage_body(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sidecar = RuntimeControlSidecar(workspace, tmp_path / "control-state")
+    body = tmp_path / "empty.bin"
+    body.write_bytes(b"")
+    request = {
+        "action": "stage",
+        "transferRef": "empty-stage",
+        "requestDigest": "e" * 64,
+        "direction": "stage_input",
+        "path": "worktree/empty.py",
+        "declaredSizeBytes": 0,
+        "authorizedMaxSizeBytes": 0,
+        "contentSha256": hashlib.sha256(b"").hexdigest(),
+        "overwritePolicy": "forbid",
+    }
+    client, server = socket.socketpair()
+
+    def serve_once() -> None:
+        with server:
+            _serve_connection(server, sidecar)
+
+    thread = threading.Thread(target=serve_once)
+    thread.start()
+    with client:
+        client.sendall(workspace_header_frame(request, body))
+        client.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while chunk := client.recv(64 * 1024):
+            response.extend(chunk)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    header_size = struct.unpack(">I", response[:4])[0]
+    header = json.loads(response[4 : 4 + header_size])
+    assert header["state"] == "completed"
+    assert (workspace / "worktree/empty.py").read_bytes() == b""
+
+
 def test_production_control_stages_exact_workspace_tree(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
@@ -545,12 +588,131 @@ def test_production_control_stages_exact_workspace_tree(tmp_path: Path) -> None:
         "frame": frame,
     }
     reply = transport.rpc({}, request).header
+    assert reply.get("ok") is True, reply
     assert reply["state"] == "succeeded"
     assert reply["inlineResult"]["staged_tree_digest"] == tree_digest
     assert reply["inlineResult"]["entry_count"] == 1
     target = workspace / "worktree/src/main.py"
     assert target.read_bytes() == content
-    assert target.stat().st_mode & 0o777 == 0o755
+    assert target.stat().st_mode & 0o777 == 0o775
+
+
+def test_production_control_stages_one_git_bundle_with_empty_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
+    transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
+    operation_id = "workspace-stage-tree:bundle-envelope"
+    source = tmp_path / "source"
+    source.mkdir()
+    files = {"src/main.py": b"print('bundle')\n", "src/__init__.py": b""}
+    for relative, content in files.items():
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    subprocess.run(["git", "init", "-q", "-b", "base"], cwd=source, check=True)
+    subprocess.run(["git", "add", "--all", "--force"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Cosmos Test",
+            "-c",
+            "user.email=test@cosmos.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=source,
+        check=True,
+    )
+    bundle = tmp_path / "workspace.bundle"
+    subprocess.run(
+        ["git", "bundle", "create", str(bundle), "refs/heads/base"],
+        cwd=source,
+        check=True,
+    )
+    bundle_bytes = bundle.read_bytes()
+    bulk_stem = hashlib.sha256(operation_id.encode()).hexdigest()[:24]
+    bundle_relative = ".aicosmos/workspace-base.bundle"
+    bulk_path = f".cosmos/bulk-staging/job_{bulk_stem}/inputs/{bundle_relative}"
+    stage = {
+        "action": "stage",
+        "transferRef": "bundle-stage",
+        "requestDigest": "1" * 64,
+        "direction": "stage_input",
+        "path": bulk_path,
+        "declaredSizeBytes": len(bundle_bytes),
+        "authorizedMaxSizeBytes": len(bundle_bytes),
+        "contentSha256": hashlib.sha256(bundle_bytes).hexdigest(),
+        "overwritePolicy": "forbid",
+    }
+    assert transport.rpc({}, stage, bundle).header["state"] == "completed"
+    entries = [
+        {
+            "path": relative,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mode": "read_write",
+        }
+        for relative, content in sorted(files.items())
+    ]
+    tree_digest = canonical_digest(
+        {
+            "schema": "cosmos.workspace-tree/1",
+            "entries": [
+                {
+                    "path": item["path"],
+                    "blobDigest": item["sha256"],
+                    "size": item["size"],
+                    "mode": item["mode"],
+                }
+                for item in entries
+            ],
+        }
+    )
+    payload = {
+        "base_manifest": {
+            "manifest_ref": {"kind": "workspace_base_manifest", "id": "bundle-base"},
+            "tree_digest": tree_digest,
+            "entries": entries,
+        },
+        "compute_lease_ref": {"kind": "compute_lease", "id": "lease-bundle"},
+        "bulk_transfer": True,
+        "git_branch": "rc/attempt/bundle/1",
+        "git_bundle": {
+            "path": bundle_relative,
+            "size": len(bundle_bytes),
+            "sha256": hashlib.sha256(bundle_bytes).hexdigest(),
+            "ref": "refs/heads/base",
+        },
+    }
+    frame = {
+        "protocol": "cosmos.workspace/1",
+        "action": "stage_tree",
+        "operation_id": operation_id,
+        "request_digest": "2" * 64,
+        "frame_digest": canonical_digest(payload),
+        "payload": payload,
+    }
+    reply = transport.rpc(
+        {},
+        {
+            "action": "invoke",
+            "operationRef": "operation-bundle",
+            "requestDigest": "3" * 64,
+            "dispatchToken": "4" * 32,
+            "frame": frame,
+        },
+    ).header
+
+    assert reply.get("ok") is True, reply
+    assert reply["state"] == "succeeded"
+    assert reply["inlineResult"]["staged_tree_digest"] == tree_digest
+    assert reply["inlineResult"]["git_branch"] == "rc/attempt/bundle/1"
+    assert len(reply["inlineResult"]["git_base_commit"]) == 40
+    assert (workspace / "worktree/src/main.py").read_bytes() == files["src/main.py"]
+    assert (workspace / "worktree/src/__init__.py").read_bytes() == b""
 
 
 def test_production_control_spools_large_tree_capture(tmp_path: Path) -> None:
