@@ -461,7 +461,6 @@ class V2JobRenderer:
             runtime_mounts.append(platform_ca_mount)
             control_mounts.append(platform_ca_mount)
             platform_ca_env = {
-                "SSL_CERT_FILE": PLATFORM_CA_MOUNT_PATH,
                 "NODE_EXTRA_CA_CERTS": PLATFORM_CA_MOUNT_PATH,
             }
         if delivery["mode"] == "assembled":
