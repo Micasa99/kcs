@@ -10,10 +10,14 @@ import threading
 import uuid
 from pathlib import Path
 
+import pytest
+
 from kcs.conformance.workspace_sidecar import WorkspaceSidecar
 from kcs.jobs.canonical import canonical_digest
 from kcs.jobs.transport import LocalWorkspaceRpcTransport, workspace_header_frame
 from kcs.runtime_control.workspace_sidecar import (
+    _EXPERIMENT_GID,
+    _EXPERIMENT_UID,
     RuntimeControlSidecar,
     _serve_connection,
 )
@@ -597,8 +601,18 @@ def test_production_control_stages_exact_workspace_tree(tmp_path: Path) -> None:
     assert target.stat().st_mode & 0o777 == 0o775
 
 
-def test_production_control_stages_one_git_bundle_with_empty_files(tmp_path: Path) -> None:
+def test_production_control_stages_one_git_bundle_with_empty_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "workspace"
+    handed_off: list[tuple[Path, int, int]] = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fchown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        os,
+        "chown",
+        lambda path, uid, gid, **_kwargs: handed_off.append((Path(path), uid, gid)),
+    )
     control = RuntimeControlSidecar(workspace, tmp_path / "control-state")
     transport = LocalWorkspaceRpcTransport(control.dispatch, temp_dir=tmp_path)
     operation_id = "workspace-stage-tree:bundle-envelope"
@@ -717,6 +731,12 @@ def test_production_control_stages_one_git_bundle_with_empty_files(tmp_path: Pat
     assert (workspace / "worktree/src/main.py").read_bytes() == files["src/main.py"]
     assert (workspace / "worktree/src/__init__.py").read_bytes() == b""
     assert trajectory.read_text(encoding="utf-8") == "platform-owned\n"
+    assert (
+        workspace / "worktree/src",
+        _EXPERIMENT_UID,
+        _EXPERIMENT_GID,
+    ) in handed_off
+    assert (workspace / "worktree/src").stat().st_mode & 0o7777 == 0o2775
 
 
 def test_production_control_spools_large_tree_capture(tmp_path: Path) -> None:

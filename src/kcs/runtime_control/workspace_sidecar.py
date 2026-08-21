@@ -1964,12 +1964,28 @@ class RuntimeControlSidecar:
         self._git(worktree, ["fetch", "--quiet", str(bundle_path), "refs/heads/base"])
         self._git(worktree, ["checkout", "--quiet", "--force", "-B", branch, "FETCH_HEAD"])
         self._exclude_platform_context_from_git(worktree)
+        self._hand_off_worktree_directories(worktree)
         self._git(worktree, ["config", "user.name", "ResearchCosmos Platform"])
         self._git(worktree, ["config", "user.email", "platform@researchcosmos.invalid"])
         self._git(worktree, ["config", "rc.baseTreeDigest", tree_digest])
         commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
         self._hand_off_git_directory(worktree / ".git")
         return branch, commit
+
+    @staticmethod
+    def _hand_off_worktree_directories(worktree: Path) -> None:
+        if os.geteuid() != 0:
+            return
+        for root, directories, _files in os.walk(worktree):
+            root_path = Path(root)
+            if root_path == worktree:
+                directories[:] = [
+                    name for name in directories if name not in {".git", ".trajectory"}
+                ]
+            for name in directories:
+                path = root_path / name
+                os.chmod(path, 0o2775)
+                os.chown(path, _EXPERIMENT_UID, _EXPERIMENT_GID)
 
     @staticmethod
     def _hand_off_git_directory(git_dir: Path) -> None:
