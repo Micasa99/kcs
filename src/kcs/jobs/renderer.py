@@ -34,6 +34,24 @@ TERMINAL_HOME_VOLUME = "rc-terminal-home"
 TERMINAL_TMP_VOLUME = "rc-terminal-tmp"
 OPENVSCODE_VOLUME = "rc-openvscode"
 DEV_SESSION_CREDENTIAL_VOLUME = "rc-dev-session-credential"
+PUBLIC_EGRESS_EXCEPT = {
+    "0.0.0.0/0": [
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ],
+    "::/0": ["::/128", "::1/128", "fc00::/7", "fe80::/10"],
+}
+
+
 def _short_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
@@ -174,13 +192,22 @@ class V2JobRenderer:
                 ],
             }
         ]
-        if self._settings.platform_egress_cidrs:
+        ip_blocks = []
+        for cidr in self._settings.platform_egress_cidrs:
+            public_exclusions = PUBLIC_EGRESS_EXCEPT.get(cidr)
+            if (
+                public_exclusions is not None
+                and requested_class != NetworkClass.RESTRICTED.value
+            ):
+                continue
+            block: dict[str, object] = {"cidr": cidr}
+            if public_exclusions is not None:
+                block["except"] = public_exclusions
+            ip_blocks.append({"ipBlock": block})
+        if ip_blocks:
             egress.append(
                 {
-                    "to": [
-                        {"ipBlock": {"cidr": cidr}}
-                        for cidr in self._settings.platform_egress_cidrs
-                    ],
+                    "to": ip_blocks,
                     "ports": [{"protocol": "TCP", "port": 443}],
                 }
             )
