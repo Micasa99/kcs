@@ -397,10 +397,7 @@ func (l *launcher) start(frame request) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	prompt := "Begin the work now and continue autonomously until the task is complete or a concrete blocker is proven. Use your native shell and file tools; do not stop after describing what you intend to do. First read and follow the task book at " + os.Getenv("RC_NATIVE_TASK_PATH") + ", then inspect the actual workspace, implement the work, run relevant verification, and leave all requested outputs in the workspace. Report observed results and blockers honestly."
-	if os.Getenv("RC_NATIVE_CAPABILITY_PLAN_DIGEST") != "" {
-		prompt += " Platform-curated Skill and Tool materials are mounted read-only; inspect the exact paths declared in RC_NATIVE_SKILL_DISCOVERY_PATHS_JSON and RC_NATIVE_TOOL_DISCOVERY_PATHS_JSON when they are relevant."
-	}
+	prompt := "Read TASK.md and complete it in the current worktree."
 	argv = adapter.withPrompt(argv, prompt)
 	childEnv, err := childEnvironment(adapter, string(token))
 	if err != nil {
